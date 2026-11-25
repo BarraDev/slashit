@@ -807,24 +807,14 @@ fn a_file_created_after_the_export_check_is_never_replaced() {
         // The race window: the existence check has passed, the publication has not run.
         fs::write(&destination, b"someone else's file").unwrap();
     });
-    assert!(
-        result.is_err(),
-        "the export must refuse, not publish: {result:?}"
-    );
+    assert!(result.is_err(), "the export must refuse, not publish: {result:?}");
     assert_eq!(
         fs::read(&destination).unwrap(),
         b"someone else's file",
         "the competing file is unchanged"
     );
-    let entries: Vec<_> = fs::read_dir(tmp.path())
-        .unwrap()
-        .map(|e| e.unwrap().file_name())
-        .collect();
-    assert_eq!(
-        entries.len(),
-        1,
-        "no staging file is left behind: {entries:?}"
-    );
+    let entries: Vec<_> = fs::read_dir(tmp.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(entries.len(), 1, "no staging file is left behind: {entries:?}");
 }
 
 #[tokio::test]
@@ -1063,10 +1053,7 @@ async fn an_export_refuses_a_dependency_missing_from_the_export() {
     let path = tmp.path().join("dangling.json");
 
     let answer = export_to(&ctx, &path).await;
-    assert!(
-        !answer.ok,
-        "a dangling dependency must be refused: {answer:?}"
-    );
+    assert!(!answer.ok, "a dangling dependency must be refused: {answer:?}");
     assert!(!path.exists(), "nothing is written for a refused export");
 }
 
@@ -1080,10 +1067,7 @@ async fn an_export_refuses_a_remote_that_decode_would_refuse() {
     let path = tmp.path().join("spaced.json");
 
     let answer = export_to(&ctx, &path).await;
-    assert!(
-        !answer.ok,
-        "a remote with a space must be refused: {answer:?}"
-    );
+    assert!(!answer.ok, "a remote with a space must be refused: {answer:?}");
     assert!(!path.exists());
 }
 
@@ -1111,10 +1095,7 @@ fn an_import_refuses_a_task_web_address_that_carries_user_information() {
     let plain = seal(&payload_json(|v| {
         v["tasks"][0]["pr_url"] = Value::from("https://github.com:443/acme/app/pull/1");
     }));
-    assert!(
-        bundle::decode(&plain).is_ok(),
-        "a plain address with a port still imports"
-    );
+    assert!(bundle::decode(&plain).is_ok(), "a plain address with a port still imports");
     // Spellings the `://` sanitizer does not reach must be refused too.
     for address in [
         "https:///user:pw@github.com/acme/app/pull/1",
@@ -1145,20 +1126,14 @@ async fn an_export_never_writes_a_credential_in_a_task_web_address() {
     let answer = export_to(&ctx, &stripped).await;
     assert!(answer.ok, "{answer:?}");
     let written = fs::read_to_string(&stripped).unwrap();
-    assert!(
-        !written.contains("PR_TOKEN"),
-        "the user information must not be exported"
-    );
+    assert!(!written.contains("PR_TOKEN"), "the user information must not be exported");
     assert!(written.contains("https://github.com/acme/app/pull/1"));
 
     tasks[0].pr_url = Some("https:///user:PR_TOKEN@github.com/acme/app/pull/1".into());
     seed(&ctx, None, &tasks).await;
     let refused = tmp.path().join("refused.json");
     let answer = export_to(&ctx, &refused).await;
-    assert!(
-        !answer.ok,
-        "a spelling the sanitizer cannot strip is refused: {answer:?}"
-    );
+    assert!(!answer.ok, "a spelling the sanitizer cannot strip is refused: {answer:?}");
     assert!(!format!("{answer:?}").contains("PR_TOKEN"));
     assert!(!refused.exists());
 }
@@ -1197,10 +1172,7 @@ async fn an_export_refuses_an_scp_remote_that_carries_a_credential() {
     let answer = export_to(&ctx, &query).await;
     assert!(answer.ok, "{answer:?}");
     let written = fs::read_to_string(&query).unwrap();
-    assert!(
-        !written.contains("QUERY_SECRET"),
-        "the query must not be exported"
-    );
+    assert!(!written.contains("QUERY_SECRET"), "the query must not be exported");
 
     let sealed = seal(&payload_json(|v| {
         v["repository"]["remote_url"] = Value::from("deploy:SCP_SECRET@github.com:acme/app.git");

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 use crate::commands::gui_admission::GuiMutation;
 use crate::domain::AgentLogEntry;
-use crate::queue::workflow::WorkflowConfig;
 use crate::queue::workflow::{Workflow, WorkflowMode};
+use crate::queue::workflow::WorkflowConfig;
 use uuid::Uuid;
 
 #[tauri::command]

@@ -433,24 +433,8 @@ async fn build_fixture(name: &str) -> (Fixture, AppState) {
     // A bare `origin` whose `HEAD` is recorded locally, so that the task's
     // checkout has a default base to start from.
     let origin = tmp.path().join("origin.git");
-    git(
-        &repo_dir,
-        &[
-            "init",
-            "-q",
-            "--bare",
-            origin.to_str().expect("utf-8 origin path"),
-        ],
-    );
-    git(
-        &repo_dir,
-        &[
-            "remote",
-            "add",
-            "origin",
-            origin.to_str().expect("utf-8 origin path"),
-        ],
-    );
+    git(&repo_dir, &["init", "-q", "--bare", origin.to_str().expect("utf-8 origin path")]);
+    git(&repo_dir, &["remote", "add", "origin", origin.to_str().expect("utf-8 origin path")]);
     git(&repo_dir, &["push", "-q", "origin", "main"]);
     git(&repo_dir, &["remote", "set-head", "origin", "main"]);
     let repo_path = repo_dir.to_str().expect("utf-8 repo path").to_string();
@@ -642,8 +626,7 @@ fn a_reactivated_task_does_not_become_executable_while_its_cleanup_can_still_des
         //     Not awaited to exhaustion here: an implementation is free to hold
         //     this open until its cleanup has finished, and this test must not
         //     require it to answer early.
-        let terminal = slashit_ui_lib::commands::task::update_task_status(
-            GuiMutation::untracked(),
+        let terminal = slashit_ui_lib::commands::task::update_task_status(GuiMutation::untracked(), 
             app.state(),
             fixture.task_id.to_string(),
             TaskStatus::Done,
@@ -724,8 +707,7 @@ fn a_reactivated_task_does_not_become_executable_while_its_cleanup_can_still_des
 
         // (4b) Ask for the task to be reactivated, the same way a card dragged
         //      back out of Done does.
-        let reactivation = slashit_ui_lib::commands::task::update_task_status(
-            GuiMutation::untracked(),
+        let reactivation = slashit_ui_lib::commands::task::update_task_status(GuiMutation::untracked(), 
             app.state(),
             fixture.task_id.to_string(),
             TaskStatus::InProgress,
@@ -756,8 +738,7 @@ fn a_reactivated_task_does_not_become_executable_while_its_cleanup_can_still_des
         //      answer.
         let successor_checkout = tokio::time::timeout(
             DESIGN_MAY_WAIT,
-            slashit_ui_lib::commands::worktree::create_worktree(
-                GuiMutation::untracked(),
+            slashit_ui_lib::commands::worktree::create_worktree(GuiMutation::untracked(), 
                 app.state(),
                 fixture.task_id.to_string(),
             ),
@@ -772,8 +753,7 @@ fn a_reactivated_task_does_not_become_executable_while_its_cleanup_can_still_des
             .write_all(b"release\n")
             .await
             .expect("release the boundary");
-        let removal_status =
-            announcement_within(&mut barrier.finished, "the removal finished").await;
+        let removal_status = announcement_within(&mut barrier.finished, "the removal finished").await;
 
         // (6) What the code actually does, recorded rather than assumed.
         let checkout_survived = Path::new(&fixture.worktree_path).exists();
@@ -878,8 +858,7 @@ fn a_terminal_transition_whose_cleanup_did_not_happen_is_not_reported_as_done() 
             "the fixture must start in a non-terminal state"
         );
 
-        let terminal = slashit_ui_lib::commands::task::update_task_status(
-            GuiMutation::untracked(),
+        let terminal = slashit_ui_lib::commands::task::update_task_status(GuiMutation::untracked(), 
             app.state(),
             fixture.task_id.to_string(),
             TaskStatus::Done,
@@ -1028,7 +1007,8 @@ fn a_terminal_drag_commits_column_positions_computed_after_its_cleanup() {
         // and an off-by-one is visible rather than absorbed.
         let mut settled = Vec::new();
         for (index, name) in ["already done A", "already done B"].iter().enumerate() {
-            let mut task = create_test_task_full(name, project_id, TaskStatus::Done, index as i32);
+            let mut task =
+                create_test_task_full(name, project_id, TaskStatus::Done, index as i32);
             task.phase = TaskPhase::Complete;
             settled.push(task.id);
             state.task.tasks.write().await.insert(task.id, task);
@@ -1037,8 +1017,7 @@ fn a_terminal_drag_commits_column_positions_computed_after_its_cleanup() {
         // Dropped between them. The cleanup is real and succeeds -- the
         // fixture's checkout is clean -- so this is the ordinary terminal drag,
         // with a `git worktree remove` between the drop and the commit.
-        let moved = slashit_ui_lib::commands::task::reorder_task(
-            GuiMutation::untracked(),
+        let moved = slashit_ui_lib::commands::task::reorder_task(GuiMutation::untracked(), 
             app.state(),
             fixture.task_id.to_string(),
             Some(TaskStatus::Done),
@@ -1051,10 +1030,7 @@ fn a_terminal_drag_commits_column_positions_computed_after_its_cleanup() {
         .expect("the task must still exist");
 
         assert_eq!(moved.status, TaskStatus::Done);
-        assert_eq!(
-            moved.worktree_path, None,
-            "the terminal move cleaned up first"
-        );
+        assert_eq!(moved.worktree_path, None, "the terminal move cleaned up first");
         assert_eq!(moved.position, 1, "the card lands where it was dropped");
         assert!(
             !Path::new(&fixture.worktree_path).exists(),
@@ -1144,8 +1120,7 @@ fn a_drag_that_waited_for_the_lease_is_classified_against_the_task_it_finds() {
 
         // Dropped onto `Done`, from `Done`. Whatever the command samples now is
         // what it must not still be acting on after it has waited.
-        let drag = slashit_ui_lib::commands::task::reorder_task(
-            GuiMutation::untracked(),
+        let drag = slashit_ui_lib::commands::task::reorder_task(GuiMutation::untracked(), 
             app.state(),
             fixture.task_id.to_string(),
             Some(TaskStatus::Done),

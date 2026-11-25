@@ -73,10 +73,7 @@ impl std::fmt::Display for TaskDiffError {
 /// `working_dir` since `base_commit`, whether committed, staged, unstaged, or
 /// untracked. Read-only: never stages, commits, or otherwise mutates the
 /// repository it inspects.
-pub async fn task_diff(
-    working_dir: &str,
-    base_commit: Option<&str>,
-) -> Result<TaskDiff, TaskDiffError> {
+pub async fn task_diff(working_dir: &str, base_commit: Option<&str>) -> Result<TaskDiff, TaskDiffError> {
     let Some(base) = base_commit else {
         return Err(TaskDiffError::UnknownBoundary);
     };
@@ -126,9 +123,7 @@ fn require_full_oid(oid: &str) -> Result<(), TaskDiffError> {
     if matches!(oid.len(), 40 | 64) && oid.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Ok(());
     }
-    Err(TaskDiffError::Failed(
-        "the recorded diff commit is not a full Git object ID".into(),
-    ))
+    Err(TaskDiffError::Failed("the recorded diff commit is not a full Git object ID".into()))
 }
 
 async fn jj_task_diff(working_dir: &str) -> Option<TaskDiff> {
@@ -145,12 +140,8 @@ async fn jj_task_diff(working_dir: &str) -> Option<TaskDiff> {
     if !Path::new(working_dir).join(".jj").exists() {
         return None;
     }
-    let patch = run_output("jj", &["diff", "--git"], working_dir)
-        .await
-        .ok()?;
-    let stat = run_output("jj", &["diff", "--stat"], working_dir)
-        .await
-        .ok()?;
+    let patch = run_output("jj", &["diff", "--git"], working_dir).await.ok()?;
+    let stat = run_output("jj", &["diff", "--stat"], working_dir).await.ok()?;
     Some(TaskDiff { patch, stat })
 }
 
@@ -171,10 +162,7 @@ async fn git_task_diff(working_dir: &str, base: &str) -> Result<TaskDiff, TaskDi
     let mut full_stat = stat;
     append_section(&mut full_stat, &untracked_stat);
 
-    Ok(TaskDiff {
-        patch: full_patch,
-        stat: full_stat,
-    })
+    Ok(TaskDiff { patch: full_patch, stat: full_stat })
 }
 
 fn append_section(into: &mut String, section: &str) {
@@ -241,11 +229,7 @@ async fn untracked_diff(working_dir: &str, base: &str) -> Result<(String, String
     // one to report; the on-disk leftover self-corrects the next time
     // `commit_changes` runs `git add -A`. Excluding it here avoids reporting
     // the same file as both removed and newly added.
-    let deleted = run_git(
-        working_dir,
-        &["diff", "--name-only", "--diff-filter=D", base],
-    )
-    .await?;
+    let deleted = run_git(working_dir, &["diff", "--name-only", "--diff-filter=D", base]).await?;
     let deleted_paths: HashSet<Vec<u8>> = deleted.lines().map(|l| l.as_bytes().to_vec()).collect();
 
     let mut patch = String::new();
@@ -262,13 +246,8 @@ async fn untracked_diff(working_dir: &str, base: &str) -> Result<(String, String
         match diff_one_untracked_file(working_dir, &full_path, &rel_path).await? {
             UntrackedFile::Diff(content) => {
                 append_section(&mut patch, &content);
-                let added = content
-                    .lines()
-                    .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
-                    .count();
-                stat.push_str(&format!(
-                    " {display_path} | new file, {added} lines added\n"
-                ));
+                let added = content.lines().filter(|l| l.starts_with('+') && !l.starts_with("+++")).count();
+                stat.push_str(&format!(" {display_path} | new file, {added} lines added\n"));
             }
             UntrackedFile::Empty => {
                 stat.push_str(&format!(" {display_path} | new empty file\n"));
@@ -333,9 +312,10 @@ async fn diff_one_untracked_file(
     let mut chunk = [0u8; 64 * 1024];
     let mut oversized = false;
     loop {
-        let n = stdout.read(&mut chunk).await.map_err(|e| {
-            TaskDiffError::Failed(format!("failed to read git diff --no-index output: {e}"))
-        })?;
+        let n = stdout
+            .read(&mut chunk)
+            .await
+            .map_err(|e| TaskDiffError::Failed(format!("failed to read git diff --no-index output: {e}")))?;
         if n == 0 {
             break;
         }
@@ -359,9 +339,10 @@ async fn diff_one_untracked_file(
         return Ok(UntrackedFile::Oversized);
     }
 
-    let status = child.wait().await.map_err(|e| {
-        TaskDiffError::Failed(format!("failed to wait on git diff --no-index: {e}"))
-    })?;
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| TaskDiffError::Failed(format!("failed to wait on git diff --no-index: {e}")))?;
     // `--no-index` exit codes: 0 = files identical (an empty new file vs
     // /dev/null), 1 = a difference was found (the ordinary case for any
     // non-empty new file), >=2 = a real error (unreadable file, etc).
@@ -473,9 +454,7 @@ mod tests {
         commit_all(dir.path(), "base");
         let base = head(dir.path());
 
-        let diff = task_diff(dir.path().to_str().unwrap(), Some(&base))
-            .await
-            .unwrap();
+        let diff = task_diff(dir.path().to_str().unwrap(), Some(&base)).await.unwrap();
         assert!(diff.patch.is_empty());
         assert!(diff.stat.is_empty());
     }
@@ -491,9 +470,7 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
         commit_all(dir.path(), "task change");
 
-        let diff = task_diff(dir.path().to_str().unwrap(), Some(&base))
-            .await
-            .unwrap();
+        let diff = task_diff(dir.path().to_str().unwrap(), Some(&base)).await.unwrap();
         assert!(diff.patch.contains("+two"), "patch was: {}", diff.patch);
     }
 
@@ -510,15 +487,9 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\n").unwrap();
         // second edit left uncommitted on purpose
 
-        let diff = task_diff(dir.path().to_str().unwrap(), Some(&base))
-            .await
-            .unwrap();
+        let diff = task_diff(dir.path().to_str().unwrap(), Some(&base)).await.unwrap();
         let header_count = diff.patch.matches("diff --git a/a.txt b/a.txt").count();
-        assert_eq!(
-            header_count, 1,
-            "a.txt must appear exactly once: {}",
-            diff.patch
-        );
+        assert_eq!(header_count, 1, "a.txt must appear exactly once: {}", diff.patch);
         assert!(diff.patch.contains("+two"));
         assert!(diff.patch.contains("+three"));
     }
@@ -532,9 +503,7 @@ mod tests {
 
         std::fs::write(dir.path().join("new.txt"), "hello\n").unwrap();
 
-        let diff = task_diff(dir.path().to_str().unwrap(), Some(&base))
-            .await
-            .unwrap();
+        let diff = task_diff(dir.path().to_str().unwrap(), Some(&base)).await.unwrap();
         assert!(diff.patch.contains("new.txt"), "patch was: {}", diff.patch);
         assert!(diff.patch.contains("+hello"), "patch was: {}", diff.patch);
         assert!(diff.stat.contains("new.txt"));
@@ -546,10 +515,7 @@ mod tests {
             .output()
             .unwrap();
         let status_text = String::from_utf8_lossy(&status.stdout);
-        assert!(
-            status_text.contains("?? new.txt"),
-            "status was: {status_text}"
-        );
+        assert!(status_text.contains("?? new.txt"), "status was: {status_text}");
     }
 
     #[tokio::test]
@@ -562,15 +528,10 @@ mod tests {
         let big = "x".repeat(UNTRACKED_FILE_LIMIT_BYTES + 1024);
         std::fs::write(dir.path().join("big.txt"), &big).unwrap();
 
-        let diff = task_diff(dir.path().to_str().unwrap(), Some(&base))
-            .await
-            .unwrap();
+        let diff = task_diff(dir.path().to_str().unwrap(), Some(&base)).await.unwrap();
         assert!(diff.patch.contains("big.txt"));
         assert!(diff.patch.contains("exceeds"));
-        assert!(
-            diff.patch.len() < big.len(),
-            "content should have been omitted, not embedded"
-        );
+        assert!(diff.patch.len() < big.len(), "content should have been omitted, not embedded");
         assert!(diff.stat.contains("content omitted"));
     }
 
@@ -584,9 +545,7 @@ mod tests {
 
         std::fs::write(dir.path().join("ignored.txt"), "secret\n").unwrap();
 
-        let diff = task_diff(dir.path().to_str().unwrap(), Some(&base))
-            .await
-            .unwrap();
+        let diff = task_diff(dir.path().to_str().unwrap(), Some(&base)).await.unwrap();
         assert!(!diff.patch.contains("ignored.txt"));
         assert!(!diff.stat.contains("ignored.txt"));
     }
@@ -597,15 +556,8 @@ mod tests {
         init_repo(dir.path());
         commit_all(dir.path(), "base");
 
-        let result = task_diff(
-            dir.path().to_str().unwrap(),
-            Some("0000000000000000000000000000000000000000"),
-        )
-        .await;
-        assert!(
-            matches!(result, Err(TaskDiffError::Failed(_))),
-            "got: {result:?}"
-        );
+        let result = task_diff(dir.path().to_str().unwrap(), Some("0000000000000000000000000000000000000000")).await;
+        assert!(matches!(result, Err(TaskDiffError::Failed(_))), "got: {result:?}");
     }
 
     #[tokio::test]
@@ -625,14 +577,8 @@ mod tests {
         std::fs::write(dir.path().join("child.txt"), "child work\n").unwrap();
         commit_all(dir.path(), "child task work");
 
-        let diff = task_diff(dir.path().to_str().unwrap(), Some(&child_base))
-            .await
-            .unwrap();
+        let diff = task_diff(dir.path().to_str().unwrap(), Some(&child_base)).await.unwrap();
         assert!(diff.patch.contains("child.txt"));
-        assert!(
-            !diff.patch.contains("parent.txt"),
-            "parent work leaked into child diff: {}",
-            diff.patch
-        );
+        assert!(!diff.patch.contains("parent.txt"), "parent work leaked into child diff: {}", diff.patch);
     }
 }

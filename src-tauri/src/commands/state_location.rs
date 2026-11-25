@@ -99,9 +99,9 @@ async fn resolve_project_root(
         return Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string());
     }
 
-    let repository_id = project.repository_id.ok_or_else(|| {
-        "This project has no repository, so it has no folder to store state in.".to_string()
-    })?;
+    let repository_id = project
+        .repository_id
+        .ok_or_else(|| "This project has no repository, so it has no folder to store state in.".to_string())?;
 
     let root = {
         let repositories = repositories.read().await;
@@ -281,9 +281,7 @@ pub(crate) async fn apply_state_migration_committed(
     let (project, root) = resolve_project_root(ctx.projects, ctx.repositories, id).await?;
 
     let key = ProjectKey::for_path(&root).key;
-    let from = ctx
-        .paths
-        .project_state_dir(&key, project.id, &root, project.state_location);
+    let from = ctx.paths.project_state_dir(&key, project.id, &root, project.state_location);
     let to = ctx.paths.project_state_dir(&key, project.id, &root, target);
 
     let report = StateMigrator::migrate(&from, &to, policy.unwrap_or_default())
@@ -519,13 +517,8 @@ mod tests {
         let mut projects = HashMap::new();
         projects.insert(id, test_project(id));
 
-        record_migrated_location(
-            &mut projects,
-            id,
-            StateLocation::InProject,
-            Path::new("/tmp/to"),
-        )
-        .expect("project exists, this must succeed");
+        record_migrated_location(&mut projects, id, StateLocation::InProject, Path::new("/tmp/to"))
+            .expect("project exists, this must succeed");
 
         assert_eq!(projects[&id].state_location, StateLocation::InProject);
     }
@@ -540,12 +533,8 @@ mod tests {
         let id = Uuid::new_v4();
         let mut projects: HashMap<Uuid, Project> = HashMap::new();
 
-        let result = record_migrated_location(
-            &mut projects,
-            id,
-            StateLocation::InProject,
-            Path::new("/tmp/to"),
-        );
+        let result =
+            record_migrated_location(&mut projects, id, StateLocation::InProject, Path::new("/tmp/to"));
 
         assert!(
             result.is_err(),
@@ -585,8 +574,7 @@ mod tests {
 
         let _guard_a = locks.acquire(a).await;
 
-        let guard_b =
-            tokio::time::timeout(std::time::Duration::from_millis(500), locks.acquire(b)).await;
+        let guard_b = tokio::time::timeout(std::time::Duration::from_millis(500), locks.acquire(b)).await;
         assert!(
             guard_b.is_ok(),
             "a different project must be acquirable without waiting on an unrelated project's guard"
@@ -670,12 +658,7 @@ mod tests {
         .expect("migration should succeed");
 
         assert_eq!(
-            projects
-                .read()
-                .await
-                .get(&project_id)
-                .unwrap()
-                .state_location,
+            projects.read().await.get(&project_id).unwrap().state_location,
             StateLocation::InProject,
             "the migration must be recorded"
         );
@@ -698,12 +681,7 @@ mod tests {
             "a request based on a stale observation must not overwrite a newer decision"
         );
         assert_eq!(
-            projects
-                .read()
-                .await
-                .get(&project_id)
-                .unwrap()
-                .state_location,
+            projects.read().await.get(&project_id).unwrap().state_location,
             StateLocation::InProject,
             "the winning transition's location must survive a stale overwrite attempt"
         );
@@ -746,12 +724,7 @@ mod tests {
         .expect("a known_updated_at matching the authoritative record must be accepted");
 
         assert_eq!(
-            projects
-                .read()
-                .await
-                .get(&project_id)
-                .unwrap()
-                .state_location,
+            projects.read().await.get(&project_id).unwrap().state_location,
             StateLocation::InProject
         );
     }
@@ -772,22 +745,13 @@ mod tests {
             "config.toml",
         );
         let error = set_state_location_committed(
-            &locks,
-            &gate,
-            &projects,
-            &storage,
-            project_id,
-            StateLocation::InProject,
-            current,
+            &locks, &gate, &projects, &storage, project_id, StateLocation::InProject, current,
         )
         .await
         .expect_err("the durability is unconfirmed");
 
         assert!(error.contains("could not confirm"), "{error}");
-        assert_eq!(
-            projects.read().await[&project_id].state_location,
-            StateLocation::InProject
-        );
+        assert_eq!(projects.read().await[&project_id].state_location, StateLocation::InProject);
         let restarted = Storage::with_paths(storage.paths().clone());
         assert_eq!(
             restarted.load_config().unwrap().projects[&project_id.to_string()].state_location,
@@ -813,21 +777,12 @@ mod tests {
             "config.toml",
         );
         let error = set_state_location_committed(
-            &locks,
-            &gate,
-            &projects,
-            &storage,
-            project_id,
-            StateLocation::InProject,
-            current,
+            &locks, &gate, &projects, &storage, project_id, StateLocation::InProject, current,
         )
         .await
         .unwrap_err();
 
-        assert!(
-            error.starts_with("Failed to save the storage location"),
-            "{error}"
-        );
+        assert!(error.starts_with("Failed to save the storage location"), "{error}");
         assert_eq!(projects.read().await[&project_id].state_location, before);
     }
 

@@ -118,13 +118,7 @@ async fn run(dir: &Path, args: &[&str]) -> Result<Ran, String> {
 async fn run_env(dir: &Path, args: &[&str], envs: &[(&str, String)]) -> Result<Ran, String> {
     let mut all = vec![("GIT_TERMINAL_PROMPT", "0".to_string())];
     all.extend(envs.iter().map(|(k, v)| (*k, v.clone())));
-    let output = run_git_with(
-        "git".into(),
-        &dir.to_string_lossy(),
-        args,
-        &all,
-        Input::None,
-    )
+    let output = run_git_with("git".into(), &dir.to_string_lossy(), args, &all, Input::None)
     .await
     .map_err(|e| format!("Failed to run git: {e}"))?
     .output;
@@ -145,13 +139,7 @@ async fn git_raw(dir: &Path, args: &[&str]) -> Result<String, String> {
 async fn git_raw_env(dir: &Path, args: &[&str], envs: &[(&str, String)]) -> Result<String, String> {
     let mut all = vec![("GIT_TERMINAL_PROMPT", "0".to_string())];
     all.extend(envs.iter().map(|(k, v)| (*k, v.clone())));
-    let output = run_git_with(
-        "git".into(),
-        &dir.to_string_lossy(),
-        args,
-        &all,
-        Input::None,
-    )
+    let output = run_git_with("git".into(), &dir.to_string_lossy(), args, &all, Input::None)
     .await
     .map_err(|e| format!("Failed to run git: {e}"))?
     .output;
@@ -168,11 +156,7 @@ async fn git_raw_env(dir: &Path, args: &[&str], envs: &[(&str, String)]) -> Resu
 async fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     let ran = run(dir, args).await?;
     if ran.code != Some(0) {
-        return Err(format!(
-            "git {} failed: {}",
-            args.first().unwrap_or(&""),
-            ran.stderr
-        ));
+        return Err(format!("git {} failed: {}", args.first().unwrap_or(&""), ran.stderr));
     }
     Ok(ran.stdout)
 }
@@ -188,10 +172,7 @@ pub async fn checked_out_at(repo_path: &str, branch: &str) -> Result<Option<Stri
     let listing = WorktreeManager::worktree_listing(repo_path).await?;
     let wanted = head_ref(branch);
     let records = ListedWorktree::parse(&listing);
-    if let Some(record) = records
-        .iter()
-        .find(|record| record.branch == Some(wanted.as_str()))
-    {
+    if let Some(record) = records.iter().find(|record| record.branch == Some(wanted.as_str())) {
         return Ok(Some(record.path.to_string()));
     }
     // Git reports a checkout in the middle of a rebase or bisect as detached,
@@ -212,20 +193,10 @@ pub async fn checked_out_at(repo_path: &str, branch: &str) -> Result<Option<Stri
 
 /// Whether the detached checkout at `dir` is rebasing or bisecting `wanted`.
 async fn holds_branch_under_way(dir: &Path, wanted: &str) -> Result<bool, String> {
-    for name in [
-        "rebase-merge/head-name",
-        "rebase-apply/head-name",
-        "BISECT_START",
-    ] {
+    for name in ["rebase-merge/head-name", "rebase-apply/head-name", "BISECT_START"] {
         let located = git(dir, &["rev-parse", "--git-path", name]).await?;
-        let located = if Path::new(&located).is_absolute() {
-            Path::new(&located).to_path_buf()
-        } else {
-            dir.join(&located)
-        };
-        let Ok(contents) = std::fs::read_to_string(&located) else {
-            continue;
-        };
+        let located = if Path::new(&located).is_absolute() { Path::new(&located).to_path_buf() } else { dir.join(&located) };
+        let Ok(contents) = std::fs::read_to_string(&located) else { continue };
         let named = contents.trim();
         if named == wanted || named == wanted.trim_start_matches("refs/heads/") {
             return Ok(true);
@@ -256,15 +227,7 @@ pub async fn plan(
     message: &str,
     write_commit: bool,
 ) -> Result<Plan, PlanError> {
-    plan_with(
-        repo,
-        target_branch,
-        approved_tip,
-        message,
-        write_commit,
-        &[],
-    )
-    .await
+    plan_with(repo, target_branch, approved_tip, message, write_commit, &[]).await
 }
 
 /// [`plan`] with `envs` added to the environment of the `git` that creates
@@ -279,9 +242,7 @@ pub async fn plan_with(
 ) -> Result<Plan, PlanError> {
     super::checked_base_branch(target_branch).map_err(PlanError::Refused)?;
     let target_old = branch_tip(repo, target_branch).await?.ok_or_else(|| {
-        PlanError::Refused(format!(
-            "The target branch {target_branch} does not exist in this repository."
-        ))
+        PlanError::Refused(format!("The target branch {target_branch} does not exist in this repository."))
     })?;
     if !has_commit(repo, approved_tip).await? {
         return Err(PlanError::Refused(format!(
@@ -297,29 +258,13 @@ pub async fn plan_with(
         merge_tree: None,
     };
     if is_ancestor(repo, approved_tip, &target_old).await? {
-        return Ok(plan(
-            target_old.clone(),
-            IntegrationStrategy::AlreadyContained,
-        ));
+        return Ok(plan(target_old.clone(), IntegrationStrategy::AlreadyContained));
     }
     if is_ancestor(repo, &target_old, approved_tip).await? {
-        return Ok(plan(
-            approved_tip.to_string(),
-            IntegrationStrategy::FastForward,
-        ));
+        return Ok(plan(approved_tip.to_string(), IntegrationStrategy::FastForward));
     }
 
-    let merged = run(
-        repo,
-        &[
-            "merge-tree",
-            "--write-tree",
-            "--name-only",
-            &target_old,
-            approved_tip,
-        ],
-    )
-    .await?;
+    let merged = run(repo, &["merge-tree", "--write-tree", "--name-only", &target_old, approved_tip]).await?;
     let tree = match merged.code {
         Some(0) => merged.stdout.lines().next().unwrap_or_default().to_string(),
         Some(1) => {
@@ -343,28 +288,14 @@ pub async fn plan_with(
         }
     };
     if !super::restack::is_full_object_id(&tree) {
-        return Err(PlanError::Refused(format!(
-            "Git returned {tree:?} instead of a merge tree."
-        )));
+        return Err(PlanError::Refused(format!("Git returned {tree:?} instead of a merge tree.")));
     }
     if !write_commit {
-        return Ok(Plan {
-            merge_tree: Some(tree),
-            ..plan(String::new(), IntegrationStrategy::MergeCommit)
-        });
+        return Ok(Plan { merge_tree: Some(tree), ..plan(String::new(), IntegrationStrategy::MergeCommit) });
     }
     let commit = run_env(
         repo,
-        &[
-            "commit-tree",
-            &tree,
-            "-p",
-            &target_old,
-            "-p",
-            approved_tip,
-            "-m",
-            message,
-        ],
+        &["commit-tree", &tree, "-p", &target_old, "-p", approved_tip, "-m", message],
         envs,
     )
     .await?;
@@ -382,18 +313,14 @@ pub async fn plan_with(
 /// The branch of origin's default (`D` of `origin/D`), when the repository
 /// names one, for a project that has no local base branch of its own.
 pub async fn remote_default_branch(repo_path: &str) -> Result<Option<String>, String> {
-    Ok(
-        super::default_base::resolve_remote_base(Path::new(repo_path), repo_path)
-            .await?
-            .map(|base| base.branch),
-    )
+    Ok(super::default_base::resolve_remote_base(Path::new(repo_path), repo_path)
+        .await?
+        .map(|base| base.branch))
 }
 
 /// Pin `result` for task `task_id` so the commit outlives garbage collection.
 pub async fn pin(repo: &Path, task_id: impl std::fmt::Display, result: &str) -> Result<(), String> {
-    git(repo, &["update-ref", &pin_ref(task_id), result])
-        .await
-        .map(|_| ())
+    git(repo, &["update-ref", &pin_ref(task_id), result]).await.map(|_| ())
 }
 
 /// Remove the pin for `task_id`. A pin that is not there is not an error.
@@ -408,11 +335,7 @@ pub async fn unpin(repo: &Path, task_id: impl std::fmt::Display) -> Result<(), S
 /// The task ids that have a pin in this repository.
 pub async fn pinned(repo: &Path) -> Result<Vec<String>, String> {
     let listed = git(repo, &["for-each-ref", "--format=%(refname)", PIN_PREFIX]).await?;
-    Ok(listed
-        .lines()
-        .filter_map(|line| line.strip_prefix(PIN_PREFIX))
-        .map(str::to_string)
-        .collect())
+    Ok(listed.lines().filter_map(|line| line.strip_prefix(PIN_PREFIX)).map(str::to_string).collect())
 }
 
 /// Record that SlashIt integrates into local branch `branch` here. Never
@@ -434,10 +357,7 @@ pub async fn has_marker(repo: &Path, branch: &str) -> Result<bool, String> {
 /// treats specially are left as they are.
 pub fn shell_quote(text: &str) -> String {
     let plain = !text.is_empty()
-        && text.chars().all(|c| {
-            c.is_ascii_alphanumeric()
-                || matches!(c, '/' | '.' | '_' | '-' | ':' | '+' | '=' | '@' | '%' | ',')
-        });
+        && text.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | ':' | '+' | '=' | '@' | '%' | ','));
     if plain {
         return text.to_string();
     }
@@ -455,21 +375,13 @@ pub fn shell_quote(text: &str) -> String {
 /// [`advance_checked_out`]). Any other checked-out branch is refused,
 /// whatever the plan. An [`IntegrationStrategy::AlreadyContained`] plan
 /// moves nothing.
-pub async fn advance(
-    repo_path: &str,
-    plan: &Plan,
-    consented_checkout: Option<&str>,
-) -> Result<(), String> {
+pub async fn advance(repo_path: &str, plan: &Plan, consented_checkout: Option<&str>) -> Result<(), String> {
     if plan.strategy == IntegrationStrategy::AlreadyContained {
         return Ok(());
     }
     if let Some(path) = checked_out_at(repo_path, &plan.target_branch).await? {
         if consented_checkout != Some(path.as_str()) {
-            return Err(checked_out_message(
-                &plan.target_branch,
-                &path,
-                &manual_merge(plan.strategy, &plan.approved_tip),
-            ));
+            return Err(checked_out_message(&plan.target_branch, &path, &manual_merge(plan.strategy, &plan.approved_tip)));
         }
         return advance_checked_out(&path, plan).await;
     }
@@ -477,25 +389,11 @@ pub async fn advance(
 }
 
 async fn update_ref(repo: &Path, plan: &Plan) -> Result<(), String> {
-    let message = format!(
-        "slashit: integrate {} into {}",
-        short(&plan.approved_tip),
-        plan.target_branch
-    );
-    git(
-        repo,
-        &[
-            "update-ref",
-            "-m",
-            &message,
-            &head_ref(&plan.target_branch),
-            &plan.result,
-            &plan.target_old,
-        ],
-    )
-    .await
-    .map(|_| ())
-    .map_err(|e| format!("The branch {} was not moved: {e}", plan.target_branch))
+    let message = format!("slashit: integrate {} into {}", short(&plan.approved_tip), plan.target_branch);
+    git(repo, &["update-ref", "-m", &message, &head_ref(&plan.target_branch), &plan.result, &plan.target_old])
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("The branch {} was not moved: {e}", plan.target_branch))
 }
 
 /// What a checkout that has the target branch checked out allows.
@@ -518,12 +416,7 @@ pub enum CheckoutReadiness {
 const LISTED_PATHS: usize = 8;
 
 fn listed(paths: &[String]) -> String {
-    let mut text = paths
-        .iter()
-        .take(LISTED_PATHS)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(", ");
+    let mut text = paths.iter().take(LISTED_PATHS).cloned().collect::<Vec<_>>().join(", ");
     if paths.len() > LISTED_PATHS {
         text.push_str(&format!(" and {} more", paths.len() - LISTED_PATHS));
     }
@@ -536,19 +429,10 @@ const UNDER_WAY: &[(&str, &str)] = &[
     ("CHERRY_PICK_HEAD", "a cherry-pick is in progress"),
     ("REVERT_HEAD", "a revert is in progress"),
     ("rebase-merge", "a rebase is in progress"),
-    (
-        "rebase-apply",
-        "a rebase or patch application is in progress",
-    ),
-    (
-        "sequencer",
-        "a cherry-pick or revert sequence is in progress",
-    ),
+    ("rebase-apply", "a rebase or patch application is in progress"),
+    ("sequencer", "a cherry-pick or revert sequence is in progress"),
     ("BISECT_LOG", "a bisect is in progress"),
-    (
-        "index.lock",
-        "another Git command is using this checkout (index.lock exists)",
-    ),
+    ("index.lock", "another Git command is using this checkout (index.lock exists)"),
 ];
 
 /// Whether the checkout at `path`, which has the plan's target branch
@@ -582,11 +466,7 @@ pub async fn inspect_checkout(path: &str, plan: &Plan) -> Result<CheckoutReadine
     }
     for (name, meaning) in UNDER_WAY {
         let located = git(dir, &["rev-parse", "--git-path", name]).await?;
-        let located = if Path::new(&located).is_absolute() {
-            Path::new(&located).to_path_buf()
-        } else {
-            dir.join(&located)
-        };
+        let located = if Path::new(&located).is_absolute() { Path::new(&located).to_path_buf() } else { dir.join(&located) };
         if located.exists() {
             blocked.push(format!("In {path}, {meaning}. Finish or abort it first."));
         }
@@ -598,41 +478,15 @@ pub async fn inspect_checkout(path: &str, plan: &Plan) -> Result<CheckoutReadine
     // Every tracked path that differs from `HEAD`, in the index or in the
     // files, including paths with an unresolved conflict.
     let scratch = ScratchIndex::of(dir).await?;
-    let differing = git_raw_env(
-        dir,
-        &[
-            "diff",
-            "--name-only",
-            "-z",
-            "--ignore-submodules=none",
-            "HEAD",
-        ],
-        &scratch.env(),
-    )
-    .await?;
-    let changed: Vec<String> = differing
-        .split('\0')
-        .filter(|p| !p.is_empty())
-        .map(str::to_string)
-        .collect();
+    let differing =
+        git_raw_env(dir, &["diff", "--name-only", "-z", "--ignore-submodules=none", "HEAD"], &scratch.env()).await?;
+    let changed: Vec<String> = differing.split('\0').filter(|p| !p.is_empty()).map(str::to_string).collect();
     if !changed.is_empty() {
-        let result_tree_in_index = run_env(
-            dir,
-            &["diff", "--cached", "--quiet", plan.resulting_tree_ish()],
-            &scratch.env(),
-        )
-        .await?
-        .code
-            == Some(0);
-        let files_match_index = run_env(dir, &["diff", "--quiet"], &scratch.env())
-            .await?
-            .code
-            == Some(0);
-        if result_tree_in_index
-            && files_match_index
-            && !plan.result.is_empty()
-            && plan.result != plan.target_old
-        {
+        let result_tree_in_index =
+            run_env(dir, &["diff", "--cached", "--quiet", plan.resulting_tree_ish()], &scratch.env()).await?.code
+                == Some(0);
+        let files_match_index = run_env(dir, &["diff", "--quiet"], &scratch.env()).await?.code == Some(0);
+        if result_tree_in_index && files_match_index && !plan.result.is_empty() && plan.result != plan.target_old {
             return Ok(CheckoutReadiness::FilesAlreadyUpdated);
         }
         return Ok(CheckoutReadiness::Blocked(vec![format!(
@@ -642,19 +496,7 @@ pub async fn inspect_checkout(path: &str, plan: &Plan) -> Result<CheckoutReadine
         )]));
     }
 
-    let added = git_raw(
-        dir,
-        &[
-            "diff",
-            "--no-renames",
-            "--name-only",
-            "-z",
-            "--diff-filter=A",
-            &plan.target_old,
-            plan.resulting_tree_ish(),
-        ],
-    )
-    .await?;
+    let added = git_raw(dir, &["diff", "--no-renames", "--name-only", "-z", "--diff-filter=A", &plan.target_old, plan.resulting_tree_ish()]).await?;
     let mut in_the_way: Vec<String> = Vec::new();
     for path in added.split('\0').filter(|p| !p.is_empty()) {
         if is_in_the_way(dir, path).await? {
@@ -685,13 +527,7 @@ pub async fn uncommitted_paths(path: &str) -> Result<Vec<String>, String> {
     Ok(parse_status(&out))
 }
 
-const STATUS_ARGS: [&str; 5] = [
-    "status",
-    "--porcelain=v1",
-    "-z",
-    "--untracked-files=normal",
-    "--ignore-submodules=none",
-];
+const STATUS_ARGS: [&str; 5] = ["status", "--porcelain=v1", "-z", "--untracked-files=normal", "--ignore-submodules=none"];
 
 /// [`uncommitted_paths`], given up after `limit`. A read that times out ends
 /// its `git` (and, on Unix, the process group it leads), so the timeout
@@ -701,18 +537,11 @@ const STATUS_ARGS: [&str; 5] = [
 /// a status that stalls must not hold that lock for every other Git call on
 /// the repository. The read takes no optional lock and writes nothing, so it
 /// needs none.
-pub async fn uncommitted_paths_within(
-    path: &str,
-    limit: std::time::Duration,
-) -> Result<Vec<String>, String> {
+pub async fn uncommitted_paths_within(path: &str, limit: std::time::Duration) -> Result<Vec<String>, String> {
     uncommitted_paths_with_program("git", path, limit).await
 }
 
-async fn uncommitted_paths_with_program(
-    program: &str,
-    path: &str,
-    limit: std::time::Duration,
-) -> Result<Vec<String>, String> {
+async fn uncommitted_paths_with_program(program: &str, path: &str, limit: std::time::Duration) -> Result<Vec<String>, String> {
     use std::process::Stdio;
     use tokio::io::AsyncReadExt;
     let mut command = crate::host_process::tokio_command(program);
@@ -727,9 +556,7 @@ async fn uncommitted_paths_with_program(
         .kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("Failed to run git: {e}"))?;
+    let mut child = command.spawn().map_err(|e| format!("Failed to run git: {e}"))?;
     let pid = child.id();
     let mut stdout_pipe = child.stdout.take();
     // Stderr is drained by its own task, so Git never blocks on a full stderr
@@ -739,10 +566,7 @@ async fn uncommitted_paths_with_program(
     let stderr_task = child.stderr.take().map(|mut pipe| {
         tokio::spawn(async move {
             let mut buf = Vec::new();
-            (&mut pipe)
-                .take(STATUS_OUTPUT_LIMIT)
-                .read_to_end(&mut buf)
-                .await?;
+            (&mut pipe).take(STATUS_OUTPUT_LIMIT).read_to_end(&mut buf).await?;
             tokio::io::copy(&mut pipe, &mut tokio::io::sink()).await?;
             Ok(buf)
         })
@@ -755,11 +579,7 @@ async fn uncommitted_paths_with_program(
     let finished = tokio::time::timeout(limit, async {
         let mut stdout = Vec::new();
         let read_out = match stdout_pipe.as_mut() {
-            Some(pipe) => pipe
-                .take(STATUS_OUTPUT_LIMIT + 1)
-                .read_to_end(&mut stdout)
-                .await
-                .map(|_| ()),
+            Some(pipe) => pipe.take(STATUS_OUTPUT_LIMIT + 1).read_to_end(&mut stdout).await.map(|_| ()),
             None => Ok(()),
         };
         if stdout.len() as u64 > STATUS_OUTPUT_LIMIT {
@@ -802,10 +622,7 @@ async fn uncommitted_paths_with_program(
     match finished {
         Err(_) => {
             stop_git(&mut child);
-            Err(format!(
-                "reading the checkout's status timed out after {} seconds",
-                limit.as_secs()
-            ))
+            Err(format!("reading the checkout's status timed out after {} seconds", limit.as_secs()))
         }
         // A cut-short listing is not the complete set of uncommitted paths,
         // so it is reported as an error rather than a partial list.
@@ -864,29 +681,16 @@ struct ScratchIndex {
 
 impl ScratchIndex {
     async fn of(checkout: &Path) -> Result<Self, String> {
-        let original = git(
-            checkout,
-            &["rev-parse", "--path-format=absolute", "--git-path", "index"],
-        )
-        .await?;
-        let dir = tempfile::TempDir::new()
-            .map_err(|e| format!("Could not make a scratch directory: {e}"))?;
+        let original = git(checkout, &["rev-parse", "--path-format=absolute", "--git-path", "index"]).await?;
+        let dir = tempfile::TempDir::new().map_err(|e| format!("Could not make a scratch directory: {e}"))?;
         let copy = dir.path().join("index");
         match std::fs::copy(&original, &copy) {
             Ok(_) => {}
             // No index yet: Git reads that as empty, and so will the copy.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(format!(
-                    "Could not read the index of {}: {e}",
-                    checkout.display()
-                ))
-            }
+            Err(e) => return Err(format!("Could not read the index of {}: {e}", checkout.display())),
         }
-        Ok(Self {
-            file: copy.to_string_lossy().into_owned(),
-            _dir: dir,
-        })
+        Ok(Self { file: copy.to_string_lossy().into_owned(), _dir: dir })
     }
 
     fn env(&self) -> [(&'static str, String); 1] {
@@ -941,9 +745,7 @@ async fn is_in_the_way(checkout: &Path, relative: &str) -> Result<bool, String> 
 async fn advance_checked_out(path: &str, plan: &Plan) -> Result<(), String> {
     let dir = Path::new(path);
     match inspect_checkout(path, plan).await? {
-        CheckoutReadiness::Blocked(why) => {
-            return Err(format!("{} Nothing was changed.", why.join(" ")))
-        }
+        CheckoutReadiness::Blocked(why) => return Err(format!("{} Nothing was changed.", why.join(" "))),
         CheckoutReadiness::FilesAlreadyUpdated => return update_ref(dir, plan).await,
         CheckoutReadiness::Ready => {}
     }
@@ -955,22 +757,14 @@ async fn advance_checked_out(path: &str, plan: &Plan) -> Result<(), String> {
     .await?;
     // What matters is where the branch is, not Git's exit code: a hook that
     // fails after the move does not undo it.
-    if branch_tip(Path::new(path), &plan.target_branch)
-        .await?
-        .as_deref()
-        == Some(plan.result.as_str())
-    {
+    if branch_tip(Path::new(path), &plan.target_branch).await?.as_deref() == Some(plan.result.as_str()) {
         return Ok(());
     }
     Err(format!(
         "Git did not fast-forward {} in {path}: {}. If it left changes in that checkout, they are \
          still there and were not discarded; run git status in it to see them.",
         plan.target_branch,
-        if merged.stderr.is_empty() {
-            "it reported no reason"
-        } else {
-            merged.stderr.as_str()
-        }
+        if merged.stderr.is_empty() { "it reported no reason" } else { merged.stderr.as_str() }
     ))
 }
 
@@ -1019,9 +813,7 @@ pub async fn observe(repo: &Path, plan: &Plan) -> Result<Observed, String> {
         return Ok(Observed::Missing);
     };
     let held = match plan.strategy {
-        IntegrationStrategy::AlreadyContained => {
-            is_ancestor(repo, &plan.approved_tip, &now).await?
-        }
+        IntegrationStrategy::AlreadyContained => is_ancestor(repo, &plan.approved_tip, &now).await?,
         _ => has_commit(repo, &plan.result).await? && is_ancestor(repo, &plan.result, &now).await?,
     };
     Ok(if held {
@@ -1051,9 +843,7 @@ pub enum RemoteRelation {
 /// How local `branch` relates to `origin/<branch>`, or `None` when there is
 /// no such pair to compare.
 pub async fn remote_relation(repo: &Path, branch: &str) -> Result<Option<RemoteRelation>, String> {
-    let Some(local) = branch_tip(repo, branch).await? else {
-        return Ok(None);
-    };
+    let Some(local) = branch_tip(repo, branch).await? else { return Ok(None) };
     let Some(remote) = exact_ref(repo, &format!("refs/remotes/origin/{branch}")).await? else {
         return Ok(None);
     };
@@ -1078,11 +868,7 @@ pub async fn remote_relation(repo: &Path, branch: &str) -> Result<Option<RemoteR
 /// integrating into it never touches origin. The divergence is reported by
 /// [`remote_relation`] instead. A Project that uses the remote as its base
 /// keeps the refusal.
-pub async fn not_behind_origin(
-    repo: &Path,
-    branch: &str,
-    local_is_base: bool,
-) -> Result<Option<String>, String> {
+pub async fn not_behind_origin(repo: &Path, branch: &str, local_is_base: bool) -> Result<Option<String>, String> {
     if local_is_base {
         return Ok(None);
     }
@@ -1099,9 +885,7 @@ pub async fn not_behind_origin(
 
 /// Whether the repository has a remote named origin. Nothing is contacted.
 pub async fn has_origin(repo: &Path) -> bool {
-    run(repo, &["remote", "get-url", "origin"])
-        .await
-        .is_ok_and(|ran| ran.code == Some(0))
+    run(repo, &["remote", "get-url", "origin"]).await.is_ok_and(|ran| ran.code == Some(0))
 }
 
 /// What `origin/<branch>` named when the repository last saw it, if it does.
@@ -1116,48 +900,23 @@ pub fn short(oid: &str) -> &str {
 
 /// The subject lines of the commits in `from..to`, oldest first, at most
 /// `limit` of them.
-pub async fn subjects(
-    repo: &Path,
-    from: &str,
-    to: &str,
-    limit: usize,
-) -> Result<Vec<String>, String> {
+pub async fn subjects(repo: &Path, from: &str, to: &str, limit: usize) -> Result<Vec<String>, String> {
     let range = format!("{from}..{to}");
-    let listed = git(
-        repo,
-        &[
-            "log",
-            "--reverse",
-            "--format=%h %s",
-            &format!("-n{limit}"),
-            &range,
-        ],
-    )
-    .await?;
+    let listed = git(repo, &["log", "--reverse", "--format=%h %s", &format!("-n{limit}"), &range]).await?;
     Ok(listed.lines().map(str::to_string).collect())
 }
 
 /// The paths `to` changes relative to `from`, each as `<status> <path>`
 /// (`A` added, `M` modified, `D` deleted), at most `limit` of them.
-pub async fn changed_files(
-    repo: &Path,
-    from: &str,
-    to: &str,
-    limit: usize,
-) -> Result<Vec<String>, String> {
+pub async fn changed_files(repo: &Path, from: &str, to: &str, limit: usize) -> Result<Vec<String>, String> {
     let listed = git(repo, &["diff", "--no-renames", "--name-status", from, to]).await?;
-    Ok(listed
-        .lines()
-        .take(limit)
-        .map(|line| line.replacen('\t', " ", 1))
-        .collect())
+    Ok(listed.lines().take(limit).map(|line| line.replacen('\t', " ", 1)).collect())
 }
 
 /// How many commits `to` has that `from` does not.
 pub async fn count_between(repo: &Path, from: &str, to: &str) -> Result<u32, String> {
     let n = git(repo, &["rev-list", "--count", &format!("{from}..{to}")]).await?;
-    n.parse()
-        .map_err(|_| format!("git rev-list --count answered {n:?}"))
+    n.parse().map_err(|_| format!("git rev-list --count answered {n:?}"))
 }
 
 #[cfg(test)]
@@ -1174,11 +933,7 @@ mod tests {
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .output()
             .expect("run git");
-        assert!(
-            out.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
@@ -1212,27 +967,17 @@ mod tests {
         git_in(repo, &["add", "."]);
         git_in(repo, &["commit", "-q", "-m", "init"]);
         let path = repo.to_str().unwrap();
-        assert!(
-            uncommitted_paths(path).await.unwrap().is_empty(),
-            "a clean checkout"
-        );
+        assert!(uncommitted_paths(path).await.unwrap().is_empty(), "a clean checkout");
 
         std::fs::write(repo.join("ignored.log"), "noise\n").unwrap();
-        assert!(
-            uncommitted_paths(path).await.unwrap().is_empty(),
-            "ignored files do not block removal"
-        );
+        assert!(uncommitted_paths(path).await.unwrap().is_empty(), "ignored files do not block removal");
 
         std::fs::write(repo.join("tracked.txt"), "two\n").unwrap();
         std::fs::write(repo.join("untracked.txt"), "new\n").unwrap();
         git_in(repo, &["mv", "moved.txt", "renamed.txt"]);
         let mut found = uncommitted_paths(path).await.unwrap();
         found.sort();
-        assert_eq!(
-            found,
-            ["renamed.txt", "tracked.txt", "untracked.txt"],
-            "a rename is one entry, named by its new path"
-        );
+        assert_eq!(found, ["renamed.txt", "tracked.txt", "untracked.txt"], "a rename is one entry, named by its new path");
     }
 
     /// A stand-in `git` that records its pid and then sleeps far longer than
@@ -1240,10 +985,7 @@ mod tests {
     #[cfg(unix)]
     fn hanging_git(dir: &Path) -> String {
         let fake = dir.join("fake-git");
-        crate::test_helpers::write_executable(
-            &fake,
-            "#!/bin/sh\necho $$ > \"$(dirname \"$0\")/pid\"\nexec sleep 60\n",
-        );
+        crate::test_helpers::write_executable(&fake, "#!/bin/sh\necho $$ > \"$(dirname \"$0\")/pid\"\nexec sleep 60\n");
         fake.to_string_lossy().into_owned()
     }
 
@@ -1252,11 +994,7 @@ mod tests {
     /// happens in the background; this polls for it, bounded.
     #[cfg(unix)]
     async fn process_is_gone(dir: &Path) -> bool {
-        let pid: i32 = std::fs::read_to_string(dir.join("pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        let pid: i32 = std::fs::read_to_string(dir.join("pid")).unwrap().trim().parse().unwrap();
         for _ in 0..200 {
             let gone = unsafe { libc::kill(pid, 0) } == -1
                 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
@@ -1277,28 +1015,12 @@ mod tests {
         std::fs::write(repo.join("kept.txt"), "work\n").unwrap();
         let fake = hanging_git(dir.path());
         let started = std::time::Instant::now();
-        let result = uncommitted_paths_with_program(
-            &fake,
-            repo.to_str().unwrap(),
-            std::time::Duration::from_secs(1),
-        )
-        .await;
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(10),
-            "bounded: {:?}",
-            started.elapsed()
-        );
+        let result = uncommitted_paths_with_program(&fake, repo.to_str().unwrap(), std::time::Duration::from_secs(1)).await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "bounded: {:?}", started.elapsed());
         let message = result.expect_err("a stalled status is an unreadable status");
         assert!(message.contains("timed out"), "{message}");
-        assert!(
-            process_is_gone(dir.path()).await,
-            "the git started for the read was killed and reaped"
-        );
-        assert_eq!(
-            std::fs::read_to_string(repo.join("kept.txt")).unwrap(),
-            "work\n",
-            "the checkout is untouched"
-        );
+        assert!(process_is_gone(dir.path()).await, "the git started for the read was killed and reaped");
+        assert_eq!(std::fs::read_to_string(repo.join("kept.txt")).unwrap(), "work\n", "the checkout is untouched");
     }
 
     /// A listing larger than the cap must fail as incomplete, never return
@@ -1310,8 +1032,7 @@ mod tests {
         let repo = dir.path().join("checkout");
         std::fs::create_dir_all(&repo).unwrap();
         let fake = dir.path().join("fake-git");
-        let script =
-            "#!/bin/sh\necho $$ > \"$(dirname \"$0\")/pid\"\nexec head -c 2097152 /dev/zero\n";
+        let script = "#!/bin/sh\necho $$ > \"$(dirname \"$0\")/pid\"\nexec head -c 2097152 /dev/zero\n";
         crate::test_helpers::write_executable(&fake, script);
         let result = uncommitted_paths_with_program(
             &fake.to_string_lossy(),
@@ -1321,10 +1042,7 @@ mod tests {
         .await;
         let message = result.expect_err("a cut-short listing is not a complete list");
         assert!(message.contains("incomplete"), "{message}");
-        assert!(
-            process_is_gone(dir.path()).await,
-            "the oversized git was killed and reaped"
-        );
+        assert!(process_is_gone(dir.path()).await, "the oversized git was killed and reaped");
     }
 
     #[tokio::test]
@@ -1339,13 +1057,7 @@ mod tests {
         git_in(repo, &["commit", "-q", "-m", "init"]);
         let path = repo.to_str().unwrap();
         let limit = std::time::Duration::from_secs(30);
-        assert!(
-            uncommitted_paths_within(path, limit)
-                .await
-                .unwrap()
-                .is_empty(),
-            "a clean checkout"
-        );
+        assert!(uncommitted_paths_within(path, limit).await.unwrap().is_empty(), "a clean checkout");
         std::fs::write(repo.join("tracked.txt"), "two\n").unwrap();
         std::fs::write(repo.join("untracked file.txt"), "new\n").unwrap();
         let mut bounded = uncommitted_paths_within(path, limit).await.unwrap();
@@ -1367,21 +1079,14 @@ mod tests {
                 .current_dir(dir.path())
                 .output()
                 .unwrap();
-            assert_eq!(
-                String::from_utf8_lossy(&out.stdout),
-                *text,
-                "{text:?} quoted as {quoted}"
-            );
+            assert_eq!(String::from_utf8_lossy(&out.stdout), *text, "{text:?} quoted as {quoted}");
         }
         assert!(!dir.path().join("pwned").exists(), "no quoted word was run");
     }
 
     #[test]
     fn plain_words_are_left_alone() {
-        assert_eq!(
-            shell_quote("/home/me/repo-1.0/a_b"),
-            "/home/me/repo-1.0/a_b"
-        );
+        assert_eq!(shell_quote("/home/me/repo-1.0/a_b"), "/home/me/repo-1.0/a_b");
         assert_eq!(shell_quote("deadbeef"), "deadbeef");
         assert_eq!(shell_quote(""), "''");
     }
@@ -1395,20 +1100,7 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
         git_in(&repo, &["init", "-q", "-b", "main"]);
         let commit = |msg: &str| {
-            git_in(
-                &repo,
-                &[
-                    "-c",
-                    "user.name=t",
-                    "-c",
-                    "user.email=t@example.com",
-                    "commit",
-                    "-q",
-                    "--allow-empty",
-                    "-m",
-                    msg,
-                ],
-            );
+            git_in(&repo, &["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", msg]);
             git_in(&repo, &["rev-parse", "HEAD"])
         };
         commit("init");
@@ -1416,16 +1108,8 @@ mod tests {
         let tip = commit("work");
         git_in(&repo, &["checkout", "-q", "main"]);
 
-        let message = checked_out_message(
-            "main",
-            repo.to_str().unwrap(),
-            &manual_merge(IntegrationStrategy::FastForward, &tip),
-        );
-        let command = message
-            .rsplit_once("run: ")
-            .expect("the message ends with the command")
-            .1
-            .to_string();
+        let message = checked_out_message("main", repo.to_str().unwrap(), &manual_merge(IntegrationStrategy::FastForward, &tip));
+        let command = message.rsplit_once("run: ").expect("the message ends with the command").1.to_string();
         assert!(command.starts_with("git -C '"), "{command}");
 
         let out = std::process::Command::new("sh")
@@ -1435,20 +1119,9 @@ mod tests {
             .current_dir(tmp.path())
             .output()
             .unwrap();
-        assert!(
-            out.status.success(),
-            "{command}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert_eq!(
-            git_in(&repo, &["rev-parse", "main"]),
-            tip,
-            "the command merged the work"
-        );
-        assert!(
-            !tmp.path().join("pwned").exists() && !repo.join("pwned").exists(),
-            "the path was not executed"
-        );
+        assert!(out.status.success(), "{command}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(git_in(&repo, &["rev-parse", "main"]), tip, "the command merged the work");
+        assert!(!tmp.path().join("pwned").exists() && !repo.join("pwned").exists(), "the path was not executed");
     }
 
     /// A merge commit needs an identity. With none configured, in an
@@ -1465,19 +1138,7 @@ mod tests {
         let commit = |file: &str| {
             std::fs::write(repo.join(file), file).unwrap();
             git_in(&repo, &["add", "."]);
-            git_in(
-                &repo,
-                &[
-                    "-c",
-                    "user.name=t",
-                    "-c",
-                    "user.email=t@example.com",
-                    "commit",
-                    "-q",
-                    "-m",
-                    file,
-                ],
-            );
+            git_in(&repo, &["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", file]);
             git_in(&repo, &["rev-parse", "HEAD"])
         };
         let base = commit("base.txt");
@@ -1498,38 +1159,20 @@ mod tests {
             ("GIT_COMMITTER_NAME", String::new()),
             ("GIT_COMMITTER_EMAIL", String::new()),
         ];
-        let refused = plan_with(&repo, "main", &task, "merge", true, &isolated)
-            .await
-            .unwrap_err();
-        let PlanError::Refused(why) = refused else {
-            panic!("expected a refusal, not a conflict")
-        };
+        let refused = plan_with(&repo, "main", &task, "merge", true, &isolated).await.unwrap_err();
+        let PlanError::Refused(why) = refused else { panic!("expected a refusal, not a conflict") };
         assert!(why.contains("merge commit could not be created"), "{why}");
-        assert!(
-            why.contains("user.name")
-                && why.contains("user.email")
-                && why.contains("Nothing was changed"),
-            "{why}"
-        );
+        assert!(why.contains("user.name") && why.contains("user.email") && why.contains("Nothing was changed"), "{why}");
 
-        assert_eq!(
-            git_in(&repo, &["rev-parse", "main"]),
-            main,
-            "the target did not move"
-        );
+        assert_eq!(git_in(&repo, &["rev-parse", "main"]), main, "the target did not move");
         assert_eq!(git_in(&repo, &["rev-parse", "task"]), task);
         // The merge's tree may remain as an unreferenced object; a commit may not.
         let dangling = git_in(&repo, &["fsck", "--no-reflogs", "--lost-found"]);
-        assert!(
-            !dangling.contains("dangling commit"),
-            "no commit was created: {dangling}"
-        );
+        assert!(!dangling.contains("dangling commit"), "no commit was created: {dangling}");
         let _ = base;
 
         // A preview needs no identity: it creates no commit.
-        let preview = plan_with(&repo, "main", &task, "merge", false, &isolated)
-            .await
-            .unwrap();
+        let preview = plan_with(&repo, "main", &task, "merge", false, &isolated).await.unwrap();
         assert_eq!(preview.strategy, IntegrationStrategy::MergeCommit);
         assert!(preview.result.is_empty() && preview.merge_tree.is_some());
 
@@ -1537,9 +1180,7 @@ mod tests {
         git_in(&repo, &["config", "user.name", "Test"]);
         git_in(&repo, &["config", "user.email", "test@example.com"]);
         let configured = &isolated[..3];
-        let made = plan_with(&repo, "main", &task, "merge", true, configured)
-            .await
-            .unwrap();
+        let made = plan_with(&repo, "main", &task, "merge", true, configured).await.unwrap();
         assert!(!made.result.is_empty());
     }
 }

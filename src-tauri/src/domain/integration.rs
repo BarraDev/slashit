@@ -113,10 +113,7 @@ mod tests {
     #[test]
     fn a_record_written_before_completion_was_part_of_it_loads_as_not_completing() {
         let mut value = serde_json::to_value(record(false)).unwrap();
-        assert!(
-            value.get("completes_task").is_none(),
-            "an integration after completion writes no new key"
-        );
+        assert!(value.get("completes_task").is_none(), "an integration after completion writes no new key");
         value.as_object_mut().unwrap().remove("completes_task");
         let loaded: LocalIntegration = serde_json::from_value(value).unwrap();
         assert!(!loaded.completes_task);

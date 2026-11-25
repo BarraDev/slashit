@@ -63,9 +63,7 @@ impl ConversationDraft {
         }
         if let Some(pending) = &self.pending_send {
             if pending.message.len() > DRAFT_LIMIT {
-                return Err(format!(
-                    "A pending message can hold at most {DRAFT_LIMIT} bytes"
-                ));
+                return Err(format!("A pending message can hold at most {DRAFT_LIMIT} bytes"));
             }
         }
         Ok(())
@@ -78,10 +76,7 @@ mod tests {
 
     #[test]
     fn enter_inserts_a_newline_unless_the_setting_says_otherwise() {
-        assert_eq!(
-            ConversationsConfig::default().send_shortcut,
-            SendShortcut::ModifierEnter
-        );
+        assert_eq!(ConversationsConfig::default().send_shortcut, SendShortcut::ModifierEnter);
         let parsed: ConversationsConfig = toml::from_str("send_shortcut = \"enter\"\n").unwrap();
         assert_eq!(parsed.send_shortcut, SendShortcut::Enter);
         let absent: ConversationsConfig = toml::from_str("").unwrap();
@@ -90,20 +85,12 @@ mod tests {
 
     #[test]
     fn a_draft_round_trips_and_an_oversized_one_is_refused() {
-        let draft = ConversationDraft {
-            seq: 7,
-            text: "hello".into(),
-            pending_send: None,
-        };
+        let draft = ConversationDraft { seq: 7, text: "hello".into(), pending_send: None };
         let json = serde_json::to_string(&draft).unwrap();
         assert!(!json.contains("pendingSend"), "{json}");
         let back: ConversationDraft = serde_json::from_str(&json).unwrap();
         assert_eq!(back, draft);
-        let big = ConversationDraft {
-            seq: 1,
-            text: "x".repeat(DRAFT_LIMIT + 1),
-            pending_send: None,
-        };
+        let big = ConversationDraft { seq: 1, text: "x".repeat(DRAFT_LIMIT + 1), pending_send: None };
         assert!(big.validate().is_err());
         assert!(draft.validate().is_ok());
     }

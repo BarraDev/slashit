@@ -51,10 +51,7 @@ fn custom_root(root_path: Option<String>) -> Result<Option<WorkspaceRoot>, Strin
 fn ensure_managed_root(paths: &AppPaths, workspace_id: Uuid) -> Result<std::path::PathBuf, String> {
     let root = paths.workspace_managed_root(workspace_id);
     std::fs::create_dir_all(&root).map_err(|e| {
-        format!(
-            "Cannot create the Workspace's managed folder {}: {e}",
-            root.display()
-        )
+        format!("Cannot create the Workspace's managed folder {}: {e}", root.display())
     })?;
     Ok(root)
 }
@@ -193,9 +190,7 @@ pub(crate) async fn set_workspace_root_core(
     }
     workspace.root_path = root;
     workspace.updated_at = chrono::Utc::now();
-    registry
-        .upsert(workspace.clone())
-        .map_err(|e| e.describe("save the workspace root"))?;
+    registry.upsert(workspace.clone()).map_err(|e| e.describe("save the workspace root"))?;
     Ok(workspace)
 }
 
@@ -207,13 +202,7 @@ pub async fn set_workspace_root(
     root_path: Option<String>,
 ) -> Result<Workspace, String> {
     let workspace_id = Uuid::parse_str(&workspace_id).map_err(|e| e.to_string())?;
-    set_workspace_root_core(
-        &state.workspace.registry,
-        &state.paths,
-        workspace_id,
-        root_path,
-    )
-    .await
+    set_workspace_root_core(&state.workspace.registry, &state.paths, workspace_id, root_path).await
 }
 
 /// Renames a Workspace. Membership and the root are unchanged.
@@ -233,9 +222,7 @@ pub(crate) async fn rename_workspace_core(
         .ok_or_else(|| "Workspace not found".to_string())?;
     workspace.name = name;
     workspace.updated_at = chrono::Utc::now();
-    registry
-        .upsert(workspace.clone())
-        .map_err(|e| e.describe("rename the workspace"))?;
+    registry.upsert(workspace.clone()).map_err(|e| e.describe("rename the workspace"))?;
     Ok(workspace)
 }
 
@@ -356,20 +343,19 @@ pub async fn delete_workspace(
     // The "no project references it" check above read memory, which may follow
     // a detach that is published but unconfirmed. Removing the workspace is a
     // durable fact in another file, so it waits for that to be confirmed.
-    state.storage.confirm_config_durable().map_err(|e| {
-        e.describe("confirm the project configuration before removing the workspace")
-    })?;
+    state
+        .storage
+        .confirm_config_durable()
+        .map_err(|e| e.describe("confirm the project configuration before removing the workspace"))?;
     let mut registry = state.workspace.registry.write().await;
-    registry
-        .remove(&workspace_id)
-        .map_err(|e| e.describe("remove the workspace"))
+    registry.remove(&workspace_id).map_err(|e| e.describe("remove the workspace"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::paths::StateLocation;
     use crate::domain::{AgentConfig, AgentType, ProjectScope};
+    use crate::config::paths::StateLocation;
 
     fn project(name: &str, scope: ProjectScope) -> Project {
         Project {
@@ -403,10 +389,7 @@ mod tests {
         let mut projects = HashMap::new();
         projects.insert(removed.id, removed);
 
-        assert_eq!(
-            projects_referencing(&projects, workspace_id),
-            vec!["removed-member".to_string()]
-        );
+        assert_eq!(projects_referencing(&projects, workspace_id), vec!["removed-member".to_string()]);
     }
 
     #[test]
@@ -431,7 +414,10 @@ mod tests {
     fn projects_still_in_the_workspace_are_reported_by_name() {
         let workspace_id = Uuid::new_v4();
         let mut projects = HashMap::new();
-        let attached = project("board", ProjectScope::InWorkspace { workspace_id });
+        let attached = project(
+            "board",
+            ProjectScope::InWorkspace { workspace_id },
+        );
         projects.insert(attached.id, attached);
 
         let referencing = projects_referencing(&projects, workspace_id);
@@ -456,24 +442,14 @@ mod tests {
     async fn a_workspace_without_a_folder_gets_its_managed_root_at_creation() {
         let (_temp, paths, registry) = fixture();
 
-        let workspace = create_workspace_core(&registry, &paths, "  Client  ".into(), None)
-            .await
-            .unwrap();
+        let workspace = create_workspace_core(&registry, &paths, "  Client  ".into(), None).await.unwrap();
 
         assert_eq!(workspace.name, "Client");
-        assert!(
-            workspace.root_path.is_none(),
-            "the record keeps no custom root"
-        );
+        assert!(workspace.root_path.is_none(), "the record keeps no custom root");
         let managed = paths.workspace_managed_root(workspace.id);
-        assert!(
-            managed.is_dir(),
-            "the managed root exists at the application-owned location"
-        );
+        assert!(managed.is_dir(), "the managed root exists at the application-owned location");
         assert!(managed.starts_with(paths.data_dir()));
-        let info = workspace_root_core(&registry, &paths, workspace.id)
-            .await
-            .unwrap();
+        let info = workspace_root_core(&registry, &paths, workspace.id).await.unwrap();
         assert_eq!(info.path, managed.display().to_string());
         assert!(!info.custom && info.exists);
     }
@@ -483,34 +459,19 @@ mod tests {
         let (temp, paths, registry) = fixture();
         let folder = temp.path().join("shared");
         std::fs::create_dir_all(&folder).unwrap();
-        let workspace = create_workspace_core(&registry, &paths, "Shared".into(), None)
-            .await
-            .unwrap();
+        let workspace = create_workspace_core(&registry, &paths, "Shared".into(), None).await.unwrap();
         let managed = paths.workspace_managed_root(workspace.id);
 
-        let changed = set_workspace_root_core(
-            &registry,
-            &paths,
-            workspace.id,
-            Some(folder.display().to_string()),
-        )
-        .await
-        .unwrap();
+        let changed = set_workspace_root_core(&registry, &paths, workspace.id, Some(folder.display().to_string()))
+            .await
+            .unwrap();
 
         assert!(changed.root_path.is_some());
-        assert!(
-            managed.is_dir(),
-            "the previous managed folder is left in place"
-        );
+        assert!(managed.is_dir(), "the previous managed folder is left in place");
         let missing = temp.path().join("never-made");
-        let refusal = set_workspace_root_core(
-            &registry,
-            &paths,
-            workspace.id,
-            Some(missing.display().to_string()),
-        )
-        .await
-        .expect_err("a root that does not exist is refused");
+        let refusal = set_workspace_root_core(&registry, &paths, workspace.id, Some(missing.display().to_string()))
+            .await
+            .expect_err("a root that does not exist is refused");
         assert!(refusal.contains("Invalid workspace path"), "{refusal}");
         assert!(!missing.exists(), "a refused root is never created");
     }
@@ -520,43 +481,20 @@ mod tests {
         let (temp, paths, registry) = fixture();
         let folder = temp.path().join("shared");
         std::fs::create_dir_all(&folder).unwrap();
-        let first = create_workspace_core(
-            &registry,
-            &paths,
-            "First".into(),
-            Some(folder.display().to_string()),
-        )
-        .await
-        .unwrap();
-        let second = create_workspace_core(&registry, &paths, "Second".into(), None)
+        let first = create_workspace_core(&registry, &paths, "First".into(), Some(folder.display().to_string()))
             .await
             .unwrap();
+        let second = create_workspace_core(&registry, &paths, "Second".into(), None).await.unwrap();
 
-        let refusal = set_workspace_root_core(
-            &registry,
-            &paths,
-            second.id,
-            Some(folder.display().to_string()),
-        )
-        .await
-        .expect_err("one folder cannot be two Workspaces' roots");
-        assert!(refusal.contains("First"), "{refusal}");
-        assert!(registry
-            .read()
+        let refusal = set_workspace_root_core(&registry, &paths, second.id, Some(folder.display().to_string()))
             .await
-            .get(&first.id)
-            .unwrap()
-            .root_path
-            .is_some());
+            .expect_err("one folder cannot be two Workspaces' roots");
+        assert!(refusal.contains("First"), "{refusal}");
+        assert!(registry.read().await.get(&first.id).unwrap().root_path.is_some());
         // The owner may set its own root again without tripping over itself.
-        set_workspace_root_core(
-            &registry,
-            &paths,
-            first.id,
-            Some(folder.display().to_string()),
-        )
-        .await
-        .expect("re-setting a Workspace's own root is accepted");
+        set_workspace_root_core(&registry, &paths, first.id, Some(folder.display().to_string()))
+            .await
+            .expect("re-setting a Workspace's own root is accepted");
     }
 
     /// A Workspace without a custom root reads its managed folder, so that
@@ -564,53 +502,30 @@ mod tests {
     #[tokio::test]
     async fn a_folder_that_is_another_workspaces_managed_folder_is_refused() {
         let (temp, paths, registry) = fixture();
-        let owner = create_workspace_core(&registry, &paths, "Owner".into(), None)
-            .await
-            .unwrap();
+        let owner = create_workspace_core(&registry, &paths, "Owner".into(), None).await.unwrap();
         let managed = paths.workspace_managed_root(owner.id);
         // Refusals name the canonical folder (a Windows verbatim path differs from the raw one).
         let canonical = managed.canonicalize().unwrap().display().to_string();
-        let other = create_workspace_core(&registry, &paths, "Other".into(), None)
-            .await
-            .unwrap();
+        let other = create_workspace_core(&registry, &paths, "Other".into(), None).await.unwrap();
 
-        let refusal = set_workspace_root_core(
-            &registry,
-            &paths,
-            other.id,
-            Some(managed.display().to_string()),
-        )
-        .await
-        .expect_err("a managed folder read by another Workspace cannot become a custom root");
+        let refusal = set_workspace_root_core(&registry, &paths, other.id, Some(managed.display().to_string()))
+            .await
+            .expect_err("a managed folder read by another Workspace cannot become a custom root");
         assert!(refusal.contains("Owner"), "{refusal}");
         assert!(refusal.contains(&canonical), "{refusal}");
-        let refusal = create_workspace_core(
-            &registry,
-            &paths,
-            "Third".into(),
-            Some(managed.display().to_string()),
-        )
-        .await
-        .expect_err("creating over another Workspace's managed folder is refused");
-        assert!(
-            refusal.message.contains("already registered"),
-            "{}",
-            refusal.message
-        );
+        let refusal = create_workspace_core(&registry, &paths, "Third".into(), Some(managed.display().to_string()))
+            .await
+            .expect_err("creating over another Workspace's managed folder is refused");
+        assert!(refusal.message.contains("already registered"), "{}", refusal.message);
         assert!(refusal.message.contains(&canonical), "{}", refusal.message);
         assert!(refusal.workspace.is_none(), "nothing was created");
 
         // A distinct folder is still accepted for the same Workspace.
         let elsewhere = temp.path().join("elsewhere");
         std::fs::create_dir_all(&elsewhere).unwrap();
-        set_workspace_root_core(
-            &registry,
-            &paths,
-            other.id,
-            Some(elsewhere.display().to_string()),
-        )
-        .await
-        .expect("a folder no other Workspace reads is accepted");
+        set_workspace_root_core(&registry, &paths, other.id, Some(elsewhere.display().to_string()))
+            .await
+            .expect("a folder no other Workspace reads is accepted");
     }
 
     /// Whitespace is part of a folder name on Unix: a root whose name ends in a
@@ -621,23 +536,13 @@ mod tests {
         let (temp, paths, registry) = fixture();
         let spaced = temp.path().join("client ");
         std::fs::create_dir_all(&spaced).unwrap();
-        let workspace = create_workspace_core(&registry, &paths, "Spaced".into(), None)
-            .await
-            .unwrap();
+        let workspace = create_workspace_core(&registry, &paths, "Spaced".into(), None).await.unwrap();
 
-        let updated = set_workspace_root_core(
-            &registry,
-            &paths,
-            workspace.id,
-            Some(spaced.display().to_string()),
-        )
-        .await
-        .expect("a folder whose name ends in a space is a valid root");
+        let updated = set_workspace_root_core(&registry, &paths, workspace.id, Some(spaced.display().to_string()))
+            .await
+            .expect("a folder whose name ends in a space is a valid root");
         assert_eq!(
-            updated
-                .root_path
-                .as_ref()
-                .map(|root| root.as_path().to_path_buf()),
+            updated.root_path.as_ref().map(|root| root.as_path().to_path_buf()),
             Some(spaced.canonicalize().unwrap())
         );
     }
@@ -659,12 +564,8 @@ mod tests {
             temp.path().join("run"),
         );
         let registry = RwLock::new(WorkspaceRegistry::load_from(paths.workspaces_file()).unwrap());
-        let owner = create_workspace_core(&registry, &paths, "Owner".into(), None)
-            .await
-            .unwrap();
-        let other = create_workspace_core(&registry, &paths, "Other".into(), None)
-            .await
-            .unwrap();
+        let owner = create_workspace_core(&registry, &paths, "Owner".into(), None).await.unwrap();
+        let other = create_workspace_core(&registry, &paths, "Other".into(), None).await.unwrap();
         let canonical_managed = real_data.join("workspaces").join(owner.id.to_string());
 
         let refusal = set_workspace_root_core(
@@ -676,13 +577,7 @@ mod tests {
         .await
         .expect_err("the canonical spelling of a managed folder is the same folder");
         assert!(refusal.contains("Owner"), "{refusal}");
-        assert!(registry
-            .read()
-            .await
-            .get(&other.id)
-            .unwrap()
-            .root_path
-            .is_none());
+        assert!(registry.read().await.get(&other.id).unwrap().root_path.is_none());
     }
 
     #[tokio::test]
@@ -690,18 +585,11 @@ mod tests {
         let (temp, paths, registry) = fixture();
         let folder = temp.path().join("shared");
         std::fs::create_dir_all(&folder).unwrap();
-        let workspace = create_workspace_core(
-            &registry,
-            &paths,
-            "W".into(),
-            Some(folder.display().to_string()),
-        )
-        .await
-        .unwrap();
-
-        let cleared = set_workspace_root_core(&registry, &paths, workspace.id, None)
+        let workspace = create_workspace_core(&registry, &paths, "W".into(), Some(folder.display().to_string()))
             .await
             .unwrap();
+
+        let cleared = set_workspace_root_core(&registry, &paths, workspace.id, None).await.unwrap();
 
         assert!(cleared.root_path.is_none());
         assert!(paths.workspace_managed_root(workspace.id).is_dir());
@@ -716,27 +604,15 @@ mod tests {
         let (temp, paths, registry) = fixture();
         let custom = temp.path().join("custom");
         std::fs::create_dir_all(&custom).unwrap();
-        let w = create_workspace_core(
-            &registry,
-            &paths,
-            "W".into(),
-            Some(custom.display().to_string()),
-        )
-        .await
-        .unwrap();
-        let w_managed = paths.workspace_managed_root(w.id);
-        std::fs::create_dir_all(&w_managed).unwrap();
-        let other = create_workspace_core(&registry, &paths, "Other".into(), None)
+        let w = create_workspace_core(&registry, &paths, "W".into(), Some(custom.display().to_string()))
             .await
             .unwrap();
-        set_workspace_root_core(
-            &registry,
-            &paths,
-            other.id,
-            Some(w_managed.display().to_string()),
-        )
-        .await
-        .expect("W's managed folder is unowned while W uses a custom root");
+        let w_managed = paths.workspace_managed_root(w.id);
+        std::fs::create_dir_all(&w_managed).unwrap();
+        let other = create_workspace_core(&registry, &paths, "Other".into(), None).await.unwrap();
+        set_workspace_root_core(&registry, &paths, other.id, Some(w_managed.display().to_string()))
+            .await
+            .expect("W's managed folder is unowned while W uses a custom root");
 
         let refusal = set_workspace_root_core(&registry, &paths, w.id, None)
             .await
@@ -772,29 +648,17 @@ mod tests {
         let registry = RwLock::new(WorkspaceRegistry::load_from(paths.workspaces_file()).unwrap());
         let custom = temp.path().join("custom");
         std::fs::create_dir_all(&custom).unwrap();
-        let w = create_workspace_core(
-            &registry,
-            &paths,
-            "W".into(),
-            Some(custom.display().to_string()),
-        )
-        .await
-        .unwrap();
+        let w = create_workspace_core(&registry, &paths, "W".into(), Some(custom.display().to_string()))
+            .await
+            .unwrap();
         // Other claims W's managed folder through its canonical spelling; the data
         // directory alias names the same folder.
         let canonical_w_managed = real_data.join("workspaces").join(w.id.to_string());
         std::fs::create_dir_all(&canonical_w_managed).unwrap();
-        let other = create_workspace_core(&registry, &paths, "Other".into(), None)
+        let other = create_workspace_core(&registry, &paths, "Other".into(), None).await.unwrap();
+        set_workspace_root_core(&registry, &paths, other.id, Some(canonical_w_managed.display().to_string()))
             .await
-            .unwrap();
-        set_workspace_root_core(
-            &registry,
-            &paths,
-            other.id,
-            Some(canonical_w_managed.display().to_string()),
-        )
-        .await
-        .expect("W's managed folder is unowned while W uses a custom root");
+            .expect("W's managed folder is unowned while W uses a custom root");
 
         let refusal = set_workspace_root_core(&registry, &paths, w.id, None)
             .await
@@ -810,28 +674,19 @@ mod tests {
         std::fs::create_dir_all(&existing).unwrap();
         let expected = existing.canonicalize().unwrap().join("a").join("b");
 
-        assert_eq!(
-            canonical_with_missing_tail(&existing.join("a").join("b")),
-            expected
-        );
+        assert_eq!(canonical_with_missing_tail(&existing.join("a").join("b")), expected);
     }
 
     #[tokio::test]
     async fn renaming_keeps_membership_and_root_and_refuses_an_empty_name() {
         let (_temp, paths, registry) = fixture();
-        let workspace = create_workspace_core(&registry, &paths, "Old".into(), None)
-            .await
-            .unwrap();
+        let workspace = create_workspace_core(&registry, &paths, "Old".into(), None).await.unwrap();
 
-        let renamed = rename_workspace_core(&registry, workspace.id, " New name ".into())
-            .await
-            .unwrap();
+        let renamed = rename_workspace_core(&registry, workspace.id, " New name ".into()).await.unwrap();
 
         assert_eq!(renamed.name, "New name");
         assert_eq!(renamed.root_path, workspace.root_path);
-        assert!(rename_workspace_core(&registry, workspace.id, "  ".into())
-            .await
-            .is_err());
+        assert!(rename_workspace_core(&registry, workspace.id, "  ".into()).await.is_err());
     }
 
     #[tokio::test]

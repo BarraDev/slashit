@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MPL-2.0
 use crate::commands::gui_admission::GuiMutation;
-use crate::commands::task::Tasks;
 use crate::config::QueueConfig;
 use crate::domain::{Task, TaskStatus};
 use crate::queue::{PromotionChoice, PromotionOutcome, QueueManager};
+use crate::commands::task::Tasks;
+use uuid::Uuid;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use uuid::Uuid;
 
 /// The Queue's runtime state.
 ///
@@ -31,10 +31,7 @@ impl QueueState {
 
 impl Default for QueueState {
     fn default() -> Self {
-        Self::new(
-            Arc::new(RwLock::new(HashMap::new())),
-            QueueConfig::default(),
-        )
+        Self::new(Arc::new(RwLock::new(HashMap::new())), QueueConfig::default())
     }
 }
 
@@ -218,19 +215,9 @@ pub async fn promote_next_task(
 ) -> Result<Option<String>, String> {
     // Promotion asks the executor to start the task, so it waits while new
     // work is paused for disk space; the task stays queued.
-    state
-        .start_guard
-        .check()
-        .await
-        .map_err(|block| block.to_string())?;
-    let executor = state
-        .executor
-        .get()
-        .ok_or_else(|| NO_EXECUTOR_PROMOTION.to_string())?;
-    match executor
-        .promote_queued(PromotionChoice::Next, |_, _| {})
-        .await?
-    {
+    state.start_guard.check().await.map_err(|block| block.to_string())?;
+    let executor = state.executor.get().ok_or_else(|| NO_EXECUTOR_PROMOTION.to_string())?;
+    match executor.promote_queued(PromotionChoice::Next, |_, _| {}).await? {
         PromotionOutcome::Promoted(task) => Ok(Some(task.id.to_string())),
         PromotionOutcome::NothingEligible => Ok(None),
         refused @ PromotionOutcome::NoCapacity => {
@@ -245,7 +232,9 @@ pub(crate) const NO_EXECUTOR_PROMOTION: &str =
     "The task executor is not running, so nothing was promoted.";
 
 #[tauri::command]
-pub async fn get_queue_capacity(state: tauri::State<'_, crate::AppState>) -> Result<usize, String> {
+pub async fn get_queue_capacity(
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<usize, String> {
     let manager = state.queue.manager.read().await;
     Ok(manager.get_capacity_available().await)
 }
@@ -282,15 +271,8 @@ pub async fn run_queued_task(
     // A run asks for a new execution; while new work is paused for disk
     // space it is refused before anything is read or written, and the block
     // is what the user is shown.
-    state
-        .start_guard
-        .check()
-        .await
-        .map_err(|block| block.to_string())?;
-    let executor = state
-        .executor
-        .get()
-        .ok_or_else(|| NO_EXECUTOR_PROMOTION.to_string())?;
+    state.start_guard.check().await.map_err(|block| block.to_string())?;
+    let executor = state.executor.get().ok_or_else(|| NO_EXECUTOR_PROMOTION.to_string())?;
 
     let _lease = crate::commands::project::lease_active_task(&state, task_id).await?;
 
@@ -309,10 +291,7 @@ pub async fn run_queued_task(
         return Ok(state.task.tasks.read().await.get(&task_id).cloned());
     }
 
-    match executor
-        .promote_queued(PromotionChoice::Exact(task_id), |_, _| {})
-        .await?
-    {
+    match executor.promote_queued(PromotionChoice::Exact(task_id), |_, _| {}).await? {
         PromotionOutcome::Promoted(task) => Ok(Some(*task)),
         // Nothing was written. The task may have been deleted or moved in the
         // race before the write, so answer with where it stands; a task still
@@ -322,9 +301,7 @@ pub async fn run_queued_task(
             match current {
                 None => Ok(None),
                 Some(task) if task.status != TaskStatus::Queue => Ok(Some(task)),
-                Some(_) => Err(executor
-                    .queued_promotion_refusal(Some(task_id), &refused)
-                    .await),
+                Some(_) => Err(executor.queued_promotion_refusal(Some(task_id), &refused).await),
             }
         }
     }
@@ -391,9 +368,7 @@ mod lifecycle_ownership {
         let (_tmp, state) = test_state().await;
         let executor = attach_test_executor(&state);
         let task_id = seed(&state, TaskStatus::InProgress).await;
-        let cleaned_up = executor
-            .register_fake_running_execution_for_test(task_id)
-            .await;
+        let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
 
         let app = tauri::test::mock_app();
         app.manage(state);
@@ -419,9 +394,7 @@ mod lifecycle_ownership {
         let (_tmp, state) = test_state().await;
         let executor = attach_test_executor(&state);
         let task_id = seed(&state, TaskStatus::InProgress).await;
-        executor
-            .register_unkillable_running_execution_for_test(task_id)
-            .await;
+        executor.register_unkillable_running_execution_for_test(task_id).await;
 
         let app = tauri::test::mock_app();
         app.manage(state);
@@ -484,17 +457,13 @@ mod enqueue_parity {
                 tasks.insert(task.id, task.clone());
             }
         }
-        state
-            .storage
-            .save_project_tasks(project_id, &board)
-            .expect("seed the board");
+        state.storage.save_project_tasks(project_id, &board).expect("seed the board");
 
         let app = tauri::test::mock_app();
         app.manage(state);
         let live: &crate::AppState = app.state::<crate::AppState>().inner();
 
-        crate::commands::task::reorder_task(
-            GuiMutation::untracked(),
+        crate::commands::task::reorder_task(GuiMutation::untracked(), 
             app.state(),
             by_board.to_string(),
             Some(TaskStatus::Queue),
@@ -526,10 +495,7 @@ mod enqueue_parity {
         )
         .await
         .expect("lifecycle enqueue");
-        assert!(
-            matches!(verdict, crate::lifecycle::EnqueueVerdict::Queued(_)),
-            "{verdict:?}"
-        );
+        assert!(matches!(verdict, crate::lifecycle::EnqueueVerdict::Queued(_)), "{verdict:?}");
 
         let tasks = live.task.tasks.read().await;
         let after = &tasks[&by_lifecycle];
@@ -541,40 +507,16 @@ mod enqueue_parity {
         assert_eq!(tasks[&board[0].id].position, 1);
         assert_eq!(tasks[&board[1].id].position, 2);
         let kinds = |task: &Task| {
-            task.activity
-                .iter()
-                .map(|entry| format!("{:?}", entry.kind))
-                .collect::<Vec<_>>()
+            task.activity.iter().map(|entry| format!("{:?}", entry.kind)).collect::<Vec<_>>()
         };
         assert_eq!(
-            (
-                after.status.clone(),
-                after.position,
-                after.phase.clone(),
-                after.phase_progress,
-                after.overall_progress
-            ),
-            (
-                board_after.status.clone(),
-                board_after.position,
-                board_after.phase.clone(),
-                board_after.phase_progress,
-                board_after.overall_progress
-            ),
+            (after.status.clone(), after.position, after.phase.clone(), after.phase_progress, after.overall_progress),
+            (board_after.status.clone(), board_after.position, board_after.phase.clone(), board_after.phase_progress, board_after.overall_progress),
         );
         assert_eq!(after.error_message, board_after.error_message);
         assert_eq!(after.human_review, board_after.human_review);
-        assert_eq!(
-            kinds(after),
-            kinds(&board_after),
-            "both paths record the same activity"
-        );
-        assert_eq!(
-            kinds(after).len(),
-            1,
-            "one move is recorded: {:?}",
-            kinds(after)
-        );
+        assert_eq!(kinds(after), kinds(&board_after), "both paths record the same activity");
+        assert_eq!(kinds(after).len(), 1, "one move is recorded: {:?}", kinds(after));
         assert!(kinds(after)[0].contains("Moved"), "{:?}", kinds(after));
     }
 }
@@ -653,10 +595,7 @@ mod queue_settings {
         assert_eq!(applied, expected);
         assert_eq!(running(&state).await, expected, "the running Queue");
         assert_eq!(
-            Storage::with_paths((*paths).clone())
-                .load_config()
-                .unwrap()
-                .queue,
+            Storage::with_paths((*paths).clone()).load_config().unwrap().queue,
             expected,
             "the saved file"
         );
@@ -797,19 +736,9 @@ mod queue_settings {
 
         assert!(error.contains("could not confirm"), "{error}");
         let expected = queue.manager.read().await.config().clone();
-        assert_ne!(
-            expected,
-            QueueConfig::default(),
-            "memory follows the file the change is in"
-        );
+        assert_ne!(expected, QueueConfig::default(), "memory follows the file the change is in");
         // A restart reads the same settings the running queue uses.
-        assert_eq!(
-            Storage::with_paths((*paths).clone())
-                .load_config()
-                .unwrap()
-                .queue,
-            expected
-        );
+        assert_eq!(Storage::with_paths((*paths).clone()).load_config().unwrap().queue, expected);
     }
 
     #[tokio::test]
@@ -840,8 +769,7 @@ mod queue_settings {
     }
 
     #[tokio::test]
-    async fn a_config_written_before_queue_settings_existed_loads_the_defaults_and_keeps_its_other_sections(
-    ) {
+    async fn a_config_written_before_queue_settings_existed_loads_the_defaults_and_keeps_its_other_sections() {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = paths_in(tmp.path());
         std::fs::create_dir_all(paths.config_dir()).unwrap();
@@ -904,10 +832,7 @@ mod queue_settings {
         let state = launch(&paths).await;
 
         let config = running(&state).await;
-        assert!(
-            !config.auto_promote,
-            "paused promotion must not be forgotten"
-        );
+        assert!(!config.auto_promote, "paused promotion must not be forgotten");
         assert_eq!(config.parallel_task_limit, 2);
     }
 
@@ -923,24 +848,10 @@ mod queue_settings {
         let text = std::fs::read_to_string(paths.config_file()).unwrap();
         let table: toml::Value = toml::from_str(&text).unwrap();
         let queue = table.get("queue").expect("a [queue] section");
-        assert_eq!(
-            queue
-                .get("parallel_task_limit")
-                .and_then(|v| v.as_integer()),
-            Some(7)
-        );
-        assert_eq!(
-            queue.get("auto_promote").and_then(|v| v.as_bool()),
-            Some(false)
-        );
-        assert_eq!(
-            queue.get("fifo_ordering").and_then(|v| v.as_bool()),
-            Some(false)
-        );
-        assert_eq!(
-            queue.get("use_coderabbit").and_then(|v| v.as_bool()),
-            Some(false)
-        );
+        assert_eq!(queue.get("parallel_task_limit").and_then(|v| v.as_integer()), Some(7));
+        assert_eq!(queue.get("auto_promote").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(queue.get("fifo_ordering").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(queue.get("use_coderabbit").and_then(|v| v.as_bool()), Some(false));
     }
 
     #[tokio::test]
@@ -978,10 +889,7 @@ mod queue_settings {
         let config = running(&launch(&paths).await).await;
 
         assert_eq!(config.parallel_task_limit, 1);
-        assert!(
-            !config.auto_promote,
-            "repairing the limit must not re-enable promotion"
-        );
+        assert!(!config.auto_promote, "repairing the limit must not re-enable promotion");
         assert!(!config.fifo_ordering);
     }
 }
@@ -1094,17 +1002,8 @@ mod run_queued_task {
         .await
         .expect("the repeated click is answered, not failed");
 
-        assert_eq!(
-            second.expect("the task as it now stands").status,
-            TaskStatus::InProgress
-        );
-        let tasks = app
-            .state::<crate::AppState>()
-            .inner()
-            .task
-            .tasks
-            .read()
-            .await;
+        assert_eq!(second.expect("the task as it now stands").status, TaskStatus::InProgress);
+        let tasks = app.state::<crate::AppState>().inner().task.tasks.read().await;
         assert_eq!(tasks[&target.id].status, TaskStatus::InProgress);
     }
 
@@ -1125,13 +1024,7 @@ mod run_queued_task {
         .expect("answered with the task as it is");
 
         assert_eq!(answer.expect("task").status, TaskStatus::Backlog);
-        let tasks = app
-            .state::<crate::AppState>()
-            .inner()
-            .task
-            .tasks
-            .read()
-            .await;
+        let tasks = app.state::<crate::AppState>().inner().task.tasks.read().await;
         assert_eq!(tasks[&target.id].status, TaskStatus::Backlog);
     }
 
@@ -1145,15 +1038,7 @@ mod run_queued_task {
         }
         let app = app_with(state);
         let live: &crate::AppState = app.state::<crate::AppState>().inner();
-        assert_eq!(
-            live.queue
-                .manager
-                .read()
-                .await
-                .get_in_progress_count()
-                .await,
-            3
-        );
+        assert_eq!(live.queue.manager.read().await.get_in_progress_count().await, 3);
 
         let error = run_queued_task(
             GuiMutation::untracked(),
@@ -1165,10 +1050,7 @@ mod run_queued_task {
         .expect_err("the queue is full");
 
         assert!(error.contains("parallel limit of 3"), "{error}");
-        assert_eq!(
-            live.task.tasks.read().await[&target.id].status,
-            TaskStatus::Queue
-        );
+        assert_eq!(live.task.tasks.read().await[&target.id].status, TaskStatus::Queue);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1185,10 +1067,7 @@ mod run_queued_task {
         // from the set until the variable is removed again. It is taken after
         // the state is built, so the lock is not held across that await.
         let env_guard = crate::config::paths::ENV_LOCK.lock().await;
-        std::env::set_var(
-            crate::queue::start_guard::DEBUG_DISK_SPACE_FILE,
-            &space_file,
-        );
+        std::env::set_var(crate::queue::start_guard::DEBUG_DISK_SPACE_FILE, &space_file);
         state.start_guard = Arc::new(crate::queue::start_guard::StartGuard::for_data_dir(
             _tmp.path().join("data"),
         ));
@@ -1208,15 +1087,9 @@ mod run_queued_task {
         .await
         .expect_err("the paused board refuses the click");
 
-        assert!(
-            error.contains("New work paused") || error.to_lowercase().contains("disk"),
-            "{error}"
-        );
+        assert!(error.contains("New work paused") || error.to_lowercase().contains("disk"), "{error}");
         // Nothing was promoted: the guard runs before anything is read.
-        assert_eq!(
-            live.task.tasks.read().await[&target.id].status,
-            TaskStatus::Queue
-        );
+        assert_eq!(live.task.tasks.read().await[&target.id].status, TaskStatus::Queue);
     }
 
     #[tokio::test]
@@ -1228,20 +1101,17 @@ mod run_queued_task {
 
         let reason = crate::queue::queued_refusal_reason(
             &manager,
-            &crate::config::Storage::with_paths(crate::config::paths::AppPaths::with_roots(
-                std::path::PathBuf::from("unused-config-dir"),
-                std::path::PathBuf::from("unused-data-dir"),
-                std::path::PathBuf::from("unused-cache-dir"),
-                std::path::PathBuf::from("unused-runtime-dir"),
-            )),
-            &queued,
-        )
-        .await;
+                &crate::config::Storage::with_paths(crate::config::paths::AppPaths::with_roots(
+                    std::path::PathBuf::from("unused-config-dir"),
+                    std::path::PathBuf::from("unused-data-dir"),
+                    std::path::PathBuf::from("unused-cache-dir"),
+                    std::path::PathBuf::from("unused-runtime-dir"),
+                )),
+                &queued,
+            )
+            .await;
 
-        assert!(
-            reason.contains("the cleanup of its Task Checkout was interrupted"),
-            "{reason}"
-        );
+        assert!(reason.contains("the cleanup of its Task Checkout was interrupted"), "{reason}");
     }
 
     #[tokio::test]
@@ -1262,15 +1132,15 @@ mod run_queued_task {
 
         let reason = crate::queue::queued_refusal_reason(
             &manager,
-            &crate::config::Storage::with_paths(crate::config::paths::AppPaths::with_roots(
-                std::path::PathBuf::from("unused-config-dir"),
-                std::path::PathBuf::from("unused-data-dir"),
-                std::path::PathBuf::from("unused-cache-dir"),
-                std::path::PathBuf::from("unused-runtime-dir"),
-            )),
-            &queued,
-        )
-        .await;
+                &crate::config::Storage::with_paths(crate::config::paths::AppPaths::with_roots(
+                    std::path::PathBuf::from("unused-config-dir"),
+                    std::path::PathBuf::from("unused-data-dir"),
+                    std::path::PathBuf::from("unused-cache-dir"),
+                    std::path::PathBuf::from("unused-runtime-dir"),
+                )),
+                &queued,
+            )
+            .await;
 
         assert!(reason.contains("restack"), "{reason}");
     }
@@ -1337,13 +1207,9 @@ mod enqueue_front_doors {
         app.manage(state);
         let live: &crate::AppState = app.state::<crate::AppState>().inner();
 
-        add_to_queue(
-            GuiMutation::untracked(),
-            app.state(),
-            desktop_id.to_string(),
-        )
-        .await
-        .expect("the desktop enqueue");
+        add_to_queue(GuiMutation::untracked(), app.state(), desktop_id.to_string())
+            .await
+            .expect("the desktop enqueue");
         let verdict = crate::lifecycle::enqueue_current(
             &live.task.tasks,
             &live.storage,
@@ -1354,10 +1220,7 @@ mod enqueue_front_doors {
         )
         .await
         .expect("the lifecycle enqueue");
-        assert!(
-            matches!(verdict, crate::lifecycle::EnqueueVerdict::Queued(_)),
-            "{verdict:?}"
-        );
+        assert!(matches!(verdict, crate::lifecycle::EnqueueVerdict::Queued(_)), "{verdict:?}");
 
         let tasks = live.task.tasks.read().await;
         let desktop = queued_record(&tasks[&desktop_id]);
@@ -1367,14 +1230,7 @@ mod enqueue_front_doors {
         assert_eq!(desktop.4, None);
         assert_eq!(desktop.2, 0);
         assert_eq!(desktop.3, 0);
-        assert_eq!(
-            lifecycle,
-            (desktop.0.clone(), desktop.1.clone(), 0, 0, None, false, 0),
-            "the record of the second entry"
-        );
-        assert_eq!(
-            desktop.6, 1,
-            "the first Task is pushed down by the second entry, not left colliding"
-        );
+        assert_eq!(lifecycle, (desktop.0.clone(), desktop.1.clone(), 0, 0, None, false, 0), "the record of the second entry");
+        assert_eq!(desktop.6, 1, "the first Task is pushed down by the second entry, not left colliding");
     }
 }

@@ -11,8 +11,8 @@
 
 use crate::commands::gui_admission::GuiMutation;
 use crate::domain::{Project, ProjectBase};
-use crate::worktree::readiness::{readiness, Readiness};
 use crate::worktree::resolve_default_base;
+use crate::worktree::readiness::{readiness, Readiness};
 use crate::worktree::vcs_init::{self, InitPreview, VcsInitKind};
 use crate::worktree::{project_base, remote_head};
 use uuid::Uuid;
@@ -108,13 +108,8 @@ pub(crate) async fn set_project_base_core(
     let (project, path) = project_and_path(state, project_id).await?;
     // Choosing another branch keeps the choice between it and a remote
     // default as the person made it.
-    let prefer_local = project
-        .base
-        .as_ref()
-        .is_some_and(ProjectBase::prefers_local);
-    let base = project_base::validate_choice(&path, branch)
-        .await?
-        .choosing(prefer_local);
+    let prefer_local = project.base.as_ref().is_some_and(ProjectBase::prefers_local);
+    let base = project_base::validate_choice(&path, branch).await?.choosing(prefer_local);
     record_project_base(state, project_id, Some(base)).await?;
     report(state, project_id).await
 }
@@ -141,14 +136,12 @@ pub(crate) async fn set_project_base_source_core(
     prefer_local: bool,
 ) -> Result<Readiness, String> {
     let (project, path) = project_and_path(state, project_id).await?;
-    let current = project.base.ok_or(
-        "This project has no local base branch yet. Choose one in Settings > Repository first.",
-    )?;
+    let current = project
+        .base
+        .ok_or("This project has no local base branch yet. Choose one in Settings > Repository first.")?;
     let chosen = if prefer_local {
         // The branch must still be one tasks can start from.
-        project_base::validate_choice(&path, current.branch())
-            .await?
-            .choosing(true)
+        project_base::validate_choice(&path, current.branch()).await?.choosing(true)
     } else {
         current.choosing(false)
     };
@@ -187,10 +180,7 @@ pub(crate) async fn detect_remote_default_branch_core(
 /// files a first commit would hold, so it takes a [`GuiMutation`] like the
 /// commands that run Git for real: the drain waits for it.
 #[tauri::command]
-pub async fn preview_vcs_initialization(
-    _gui: GuiMutation,
-    path: String,
-) -> Result<InitPreview, String> {
+pub async fn preview_vcs_initialization(_gui: GuiMutation, path: String) -> Result<InitPreview, String> {
     vcs_init::preview(&path).await
 }
 
@@ -256,11 +246,7 @@ mod tests {
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .output()
             .expect("run git");
-        assert!(
-            out.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
@@ -293,19 +279,14 @@ mod tests {
         let no_jj = crate::test_helpers::FakeProgram::without(&["jj"]).await;
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = paths_in(tmp.path());
-        let (state, _) = crate::app_core::build_state_with_paths(paths.clone())
-            .await
-            .unwrap();
+        let (state, _) = crate::app_core::build_state_with_paths(paths.clone()).await.unwrap();
         let repo = tmp.path().join("repo");
         let origin = tmp.path().join("origin.git");
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-q", "-b", "trunk"]);
         git(&repo, &["commit", "-q", "--allow-empty", "-m", "first"]);
         git(&repo, &["init", "-q", "--bare", origin.to_str().unwrap()]);
-        git(
-            &repo,
-            &["remote", "add", "origin", origin.to_str().unwrap()],
-        );
+        git(&repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
         git(&repo, &["push", "-q", "origin", "trunk"]);
         git(&repo, &["remote", "set-head", "origin", "trunk"]);
 
@@ -329,9 +310,7 @@ mod tests {
                 repository_id: Some(repository_id),
                 scope: crate::domain::project::ProjectScope::Standalone,
                 state_location: crate::config::paths::StateLocation::External,
-                base: Some(ProjectBase::LocalBranch {
-                    branch: "trunk".to_string(),
-                }),
+                base: Some(ProjectBase::LocalBranch { branch: "trunk".to_string() }),
                 agent_type: crate::domain::AgentType::ClaudeCode,
                 agent_config: crate::domain::AgentConfig {
                     agent_type: crate::domain::AgentType::ClaudeCode,
@@ -381,17 +360,7 @@ mod tests {
     fn push_from_elsewhere(fx: &Fx, message: &str) {
         let other = fx.tmp.path().join("other");
         if !other.exists() {
-            git(
-                fx.tmp.path(),
-                &[
-                    "clone",
-                    "-q",
-                    "-b",
-                    "trunk",
-                    fx.tmp.path().join("origin.git").to_str().unwrap(),
-                    other.to_str().unwrap(),
-                ],
-            );
+            git(fx.tmp.path(), &["clone", "-q", "-b", "trunk", fx.tmp.path().join("origin.git").to_str().unwrap(), other.to_str().unwrap()]);
         }
         git(&other, &["pull", "-q", "--ff-only", "origin", "trunk"]);
         git(&other, &["commit", "-q", "--allow-empty", "-m", message]);
@@ -402,10 +371,7 @@ mod tests {
     #[tokio::test]
     async fn choosing_the_local_branch_is_saved_survives_a_restart_and_a_remote_moving() {
         let fx = fixture().await;
-        git(
-            &fx.repo,
-            &["commit", "-q", "--allow-empty", "-m", "local work"],
-        );
+        git(&fx.repo, &["commit", "-q", "--allow-empty", "-m", "local work"]);
         let local_tip = git(&fx.repo, &["rev-parse", "refs/heads/trunk"]);
         let origin_tip = git(&fx.repo, &["rev-parse", "refs/remotes/origin/trunk"]);
 
@@ -413,68 +379,34 @@ mod tests {
         let before = report(&fx.state, fx.project_id).await.unwrap();
         assert_eq!(source_of(&before), "Remote");
         assert_eq!(before.base.as_ref().unwrap().commit, origin_tip);
-        assert_eq!(
-            standing(&before).comparison,
-            BaseComparison::LocalAhead { commits: 1 }
-        );
+        assert_eq!(standing(&before).comparison, BaseComparison::LocalAhead { commits: 1 });
 
-        let chosen = set_project_base_source_core(&fx.state, fx.project_id, true)
-            .await
-            .unwrap();
+        let chosen = set_project_base_source_core(&fx.state, fx.project_id, true).await.unwrap();
         assert!(chosen.prefers_local);
         assert_eq!(source_of(&chosen), "Local");
-        assert_eq!(
-            chosen.base.as_ref().unwrap().commit,
-            local_tip,
-            "the exact local commit"
-        );
+        assert_eq!(chosen.base.as_ref().unwrap().commit, local_tip, "the exact local commit");
 
         // Restart: the choice is in the stored project, not in memory.
-        let (restarted, _) = crate::app_core::build_state_with_paths(fx.paths.clone())
-            .await
-            .unwrap();
-        let stored = restarted
-            .project
-            .projects
-            .read()
-            .await
-            .get(&fx.project_id)
-            .cloned()
-            .expect("stored project");
-        assert_eq!(
-            stored.base,
-            Some(ProjectBase::PreferredLocalBranch {
-                branch: "trunk".into()
-            })
-        );
+        let (restarted, _) = crate::app_core::build_state_with_paths(fx.paths.clone()).await.unwrap();
+        let stored = restarted.project.projects.read().await.get(&fx.project_id).cloned().expect("stored project");
+        assert_eq!(stored.base, Some(ProjectBase::PreferredLocalBranch { branch: "trunk".into() }));
 
         // Origin moves and is fetched: remote ahead, then diverged. The
         // choice stands; nothing silently switches to origin.
         push_from_elsewhere(&fx, "remote only");
         let diverged = report(&fx.state, fx.project_id).await.unwrap();
-        assert_eq!(
-            standing(&diverged).comparison,
-            BaseComparison::Diverged {
-                local_only: 1,
-                remote_only: 1
-            }
-        );
+        assert_eq!(standing(&diverged).comparison, BaseComparison::Diverged { local_only: 1, remote_only: 1 });
         assert_eq!(source_of(&diverged), "Local");
         assert_eq!(diverged.base.as_ref().unwrap().commit, local_tip);
         git(&fx.repo, &["reset", "-q", "--hard", &origin_tip]);
         let behind = report(&fx.state, fx.project_id).await.unwrap();
-        assert_eq!(
-            standing(&behind).comparison,
-            BaseComparison::RemoteAhead { commits: 1 }
-        );
+        assert_eq!(standing(&behind).comparison, BaseComparison::RemoteAhead { commits: 1 });
         assert_eq!(source_of(&behind), "Local");
         assert_eq!(behind.base.as_ref().unwrap().commit, origin_tip);
 
         // Choosing another local branch keeps the choice.
         git(&fx.repo, &["branch", "release"]);
-        let other = set_project_base_core(&fx.state, fx.project_id, "release")
-            .await
-            .unwrap();
+        let other = set_project_base_core(&fx.state, fx.project_id, "release").await.unwrap();
         assert!(other.prefers_local);
         assert_eq!(other.project_base.as_deref(), Some("release"));
     }
@@ -482,36 +414,15 @@ mod tests {
     #[tokio::test]
     async fn the_choice_can_be_withdrawn_and_origin_is_used_again() {
         let fx = fixture().await;
-        git(
-            &fx.repo,
-            &["commit", "-q", "--allow-empty", "-m", "local work"],
-        );
+        git(&fx.repo, &["commit", "-q", "--allow-empty", "-m", "local work"]);
         let origin_tip = git(&fx.repo, &["rev-parse", "refs/remotes/origin/trunk"]);
-        set_project_base_source_core(&fx.state, fx.project_id, true)
-            .await
-            .unwrap();
-        let back = set_project_base_source_core(&fx.state, fx.project_id, false)
-            .await
-            .unwrap();
+        set_project_base_source_core(&fx.state, fx.project_id, true).await.unwrap();
+        let back = set_project_base_source_core(&fx.state, fx.project_id, false).await.unwrap();
         assert!(!back.prefers_local);
         assert_eq!(source_of(&back), "Remote");
         assert_eq!(back.base.unwrap().commit, origin_tip);
-        let stored = fx
-            .state
-            .project
-            .projects
-            .read()
-            .await
-            .get(&fx.project_id)
-            .cloned()
-            .unwrap();
-        assert_eq!(
-            stored.base,
-            Some(ProjectBase::LocalBranch {
-                branch: "trunk".into()
-            }),
-            "the branch is kept"
-        );
+        let stored = fx.state.project.projects.read().await.get(&fx.project_id).cloned().unwrap();
+        assert_eq!(stored.base, Some(ProjectBase::LocalBranch { branch: "trunk".into() }), "the branch is kept");
     }
 
     #[tokio::test]
@@ -525,119 +436,47 @@ mod tests {
         // The local branch is gone.
         git(&fx.repo, &["checkout", "-q", "--detach"]);
         git(&fx.repo, &["branch", "-q", "-D", "trunk"]);
-        let refused = set_project_base_source_core(&fx.state, fx.project_id, true)
-            .await
-            .unwrap_err();
+        let refused = set_project_base_source_core(&fx.state, fx.project_id, true).await.unwrap_err();
         assert!(refused.contains("trunk"), "{refused}");
-        assert_eq!(
-            stored(&fx),
-            Some(ProjectBase::LocalBranch {
-                branch: "trunk".into()
-            })
-        );
-        git(
-            &fx.repo,
-            &["branch", "-q", "trunk", "refs/remotes/origin/trunk"],
-        );
+        assert_eq!(stored(&fx), Some(ProjectBase::LocalBranch { branch: "trunk".into() }));
+        git(&fx.repo, &["branch", "-q", "trunk", "refs/remotes/origin/trunk"]);
 
         // A project with no base branch has nothing to choose.
-        fx.state
-            .project
-            .projects
-            .write()
-            .await
-            .get_mut(&fx.project_id)
-            .unwrap()
-            .base = None;
-        let refused = set_project_base_source_core(&fx.state, fx.project_id, true)
-            .await
-            .unwrap_err();
+        fx.state.project.projects.write().await.get_mut(&fx.project_id).unwrap().base = None;
+        let refused = set_project_base_source_core(&fx.state, fx.project_id, true).await.unwrap_err();
         assert!(refused.contains("no local base branch"), "{refused}");
-        fx.state
-            .project
-            .projects
-            .write()
-            .await
-            .get_mut(&fx.project_id)
-            .unwrap()
-            .base = Some(ProjectBase::PreferredLocalBranch {
-            branch: "trunk".into(),
-        });
+        fx.state.project.projects.write().await.get_mut(&fx.project_id).unwrap().base =
+            Some(ProjectBase::PreferredLocalBranch { branch: "trunk".into() });
 
         // Origin's default is unusable: going back to it is refused, and the
         // person keeps the local choice.
-        git(
-            &fx.repo,
-            &["update-ref", "refs/remotes/upstream/x", "refs/heads/trunk"],
-        );
-        git(
-            &fx.repo,
-            &[
-                "symbolic-ref",
-                "refs/remotes/origin/HEAD",
-                "refs/remotes/upstream/x",
-            ],
-        );
-        let refused = set_project_base_source_core(&fx.state, fx.project_id, false)
-            .await
-            .unwrap_err();
+        git(&fx.repo, &["update-ref", "refs/remotes/upstream/x", "refs/heads/trunk"]);
+        git(&fx.repo, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/upstream/x"]);
+        let refused = set_project_base_source_core(&fx.state, fx.project_id, false).await.unwrap_err();
         assert!(refused.contains("The choice was not saved"), "{refused}");
-        assert_eq!(
-            stored(&fx),
-            Some(ProjectBase::PreferredLocalBranch {
-                branch: "trunk".into()
-            })
-        );
+        assert_eq!(stored(&fx), Some(ProjectBase::PreferredLocalBranch { branch: "trunk".into() }));
         // The chosen local branch still works with that origin/HEAD.
-        assert_eq!(
-            source_of(&report(&fx.state, fx.project_id).await.unwrap()),
-            "Local"
-        );
+        assert_eq!(source_of(&report(&fx.state, fx.project_id).await.unwrap()), "Local");
     }
 
     #[tokio::test]
     async fn recording_a_base_on_a_removed_project_is_refused_and_changes_nothing() {
         let fx = fixture().await;
-        let base = Some(ProjectBase::LocalBranch {
-            branch: "trunk".into(),
-        });
-        fx.state
-            .project
-            .projects
-            .write()
-            .await
-            .get_mut(&fx.project_id)
-            .unwrap()
-            .removed_at = Some(chrono::Utc::now());
+        let base = Some(ProjectBase::LocalBranch { branch: "trunk".into() });
+        fx.state.project.projects.write().await.get_mut(&fx.project_id).unwrap().removed_at =
+            Some(chrono::Utc::now());
         let removed = fx.state.project.projects.read().await[&fx.project_id].clone();
 
-        let refused = record_project_base(&fx.state, fx.project_id, base.clone())
-            .await
-            .unwrap_err();
+        let refused = record_project_base(&fx.state, fx.project_id, base.clone()).await.unwrap_err();
         assert_eq!(refused, crate::domain::project::PROJECT_REMOVED_REFUSAL);
         let after = fx.state.project.projects.read().await[&fx.project_id].clone();
         assert_eq!(after.base, removed.base, "a removed Project gains no base");
-        assert_eq!(
-            after.updated_at, removed.updated_at,
-            "a refused write leaves updated_at alone"
-        );
+        assert_eq!(after.updated_at, removed.updated_at, "a refused write leaves updated_at alone");
 
         // An active Project records the same base: the refusal is the removal, not the call.
-        fx.state
-            .project
-            .projects
-            .write()
-            .await
-            .get_mut(&fx.project_id)
-            .unwrap()
-            .removed_at = None;
-        record_project_base(&fx.state, fx.project_id, base.clone())
-            .await
-            .unwrap();
-        assert_eq!(
-            fx.state.project.projects.read().await[&fx.project_id].base,
-            base
-        );
+        fx.state.project.projects.write().await.get_mut(&fx.project_id).unwrap().removed_at = None;
+        record_project_base(&fx.state, fx.project_id, base.clone()).await.unwrap();
+        assert_eq!(fx.state.project.projects.read().await[&fx.project_id].base, base);
     }
 
     /// How long a parked side is given to finish. A side held by the gate cannot

@@ -231,9 +231,7 @@ pub async fn apply(
                 Ok(()) => {
                     *projects_w = original;
                     clear_import_record(live.storage, project_id);
-                    Err(ApplyError::Failed(format!(
-                        "{board_error}, so the import was reverted"
-                    )))
+                    Err(ApplyError::Failed(format!("{board_error}, so the import was reverted")))
                 }
                 // The revert is in place. The record stays until a start confirms
                 // the Project is gone.

@@ -83,12 +83,8 @@ async fn desktop_enqueue_refuses_to_publish_when_the_durable_write_fails() {
     let app = tauri::test::mock_app();
     app.manage(state);
 
-    let result = slashit_ui_lib::commands::queue::add_to_queue(
-        GuiMutation::untracked(),
-        app.state(),
-        task_id.to_string(),
-    )
-    .await;
+    let result =
+        slashit_ui_lib::commands::queue::add_to_queue(GuiMutation::untracked(), app.state(), task_id.to_string()).await;
 
     assert!(
         result.is_err(),
@@ -150,12 +146,8 @@ async fn desktop_requeue_refuses_to_publish_when_the_durable_write_fails() {
     let app = tauri::test::mock_app();
     app.manage(state);
 
-    let result = slashit_ui_lib::commands::queue::requeue_task(
-        GuiMutation::untracked(),
-        app.state(),
-        task_id.to_string(),
-    )
-    .await;
+    let result =
+        slashit_ui_lib::commands::queue::requeue_task(GuiMutation::untracked(), app.state(), task_id.to_string()).await;
 
     assert!(
         result.is_err(),
@@ -219,9 +211,7 @@ async fn desktop_promote_refuses_to_publish_when_the_durable_write_fails() {
     let app = tauri::test::mock_app();
     app.manage(state);
 
-    let result =
-        slashit_ui_lib::commands::queue::promote_next_task(GuiMutation::untracked(), app.state())
-            .await;
+    let result = slashit_ui_lib::commands::queue::promote_next_task(GuiMutation::untracked(), app.state()).await;
 
     assert!(
         result.is_err(),

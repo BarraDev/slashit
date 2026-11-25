@@ -233,10 +233,7 @@ pub fn parse_page(json: &[u8]) -> Result<(Vec<Candidate>, usize, usize), FeedErr
             .and_then(PlainVersion::parse)
             .filter(|version| tag_for(*version) == release.tag_name);
         candidates.push(Candidate {
-            has_manifest: release
-                .assets
-                .iter()
-                .any(|asset| asset.name == MANIFEST_ASSET),
+            has_manifest: release.assets.iter().any(|asset| asset.name == MANIFEST_ASSET),
             tag: release.tag_name,
             version,
             prerelease: release.prerelease,
@@ -299,17 +296,15 @@ fn transport(builder: reqwest::ClientBuilder, endpoints: &Endpoints) -> reqwest:
     if *endpoints == Endpoints::published() {
         return https_only_transport(builder);
     }
-    builder
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() > MAX_REDIRECTS {
-                attempt.error("too many redirects")
-            } else if test_endpoints::redirect_allowed(attempt.previous(), attempt.url()) {
-                attempt.follow()
-            } else {
-                attempt.error("the test build refuses a redirect it was not configured to follow")
-            }
-        }))
+    builder.no_proxy().redirect(reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() > MAX_REDIRECTS {
+            attempt.error("too many redirects")
+        } else if test_endpoints::redirect_allowed(attempt.previous(), attempt.url()) {
+            attempt.follow()
+        } else {
+            attempt.error("the test build refuses a redirect it was not configured to follow")
+        }
+    }))
 }
 
 /// The client policy for the updater plugin's own requests: the manifest, and
@@ -332,9 +327,7 @@ pub fn check_payload_location(endpoints: &Endpoints, payload: &str) -> Result<()
     if allowed {
         Ok(())
     } else {
-        Err(format!(
-            "the update refuses a payload at {payload}, which is not an allowed download location"
-        ))
+        Err(format!("the update refuses a payload at {payload}, which is not an allowed download location"))
     }
 }
 
@@ -367,10 +360,7 @@ mod test_endpoints {
     pub const DOWNLOAD_VAR: &str = "SLASHIT_UPDATER_TEST_DOWNLOAD_BASE";
 
     pub fn from_environment() -> Result<Endpoints, String> {
-        resolve(
-            read_var(LISTING_VAR)?.as_deref(),
-            read_var(DOWNLOAD_VAR)?.as_deref(),
-        )
+        resolve(read_var(LISTING_VAR)?.as_deref(), read_var(DOWNLOAD_VAR)?.as_deref())
     }
 
     /// A variable that is set but is not Unicode is an error, never an absent
@@ -392,15 +382,12 @@ mod test_endpoints {
                 listing: loopback_url(LISTING_VAR, listing)?,
                 download_base: loopback_url(DOWNLOAD_VAR, download)?,
             }),
-            _ => Err(format!(
-                "{LISTING_VAR} and {DOWNLOAD_VAR} must be set together"
-            )),
+            _ => Err(format!("{LISTING_VAR} and {DOWNLOAD_VAR} must be set together")),
         }
     }
 
     fn loopback_url(name: &str, value: &str) -> Result<String, String> {
-        let url =
-            reqwest::Url::parse(value).map_err(|error| format!("{name} is not a URL: {error}"))?;
+        let url = reqwest::Url::parse(value).map_err(|error| format!("{name} is not a URL: {error}"))?;
         if !matches!(url.scheme(), "http" | "https") {
             return Err(format!("{name} must use http or https"));
         }
@@ -447,22 +434,13 @@ mod test_endpoints {
             let plain = url("http://127.0.0.1:8080/repos");
             let secure = url("https://127.0.0.1:8443/repos");
             // Plain HTTP to plain HTTP, and HTTP upgraded to HTTPS, are allowed.
-            assert!(redirect_allowed(
-                std::slice::from_ref(&plain),
-                &url("http://127.0.0.2:9/x")
-            ));
+            assert!(redirect_allowed(std::slice::from_ref(&plain), &url("http://127.0.0.2:9/x")));
             assert!(redirect_allowed(std::slice::from_ref(&plain), &secure));
             // HTTPS to HTTPS on loopback is allowed.
-            assert!(redirect_allowed(
-                std::slice::from_ref(&secure),
-                &url("https://127.0.0.2:9/x")
-            ));
+            assert!(redirect_allowed(std::slice::from_ref(&secure), &url("https://127.0.0.2:9/x")));
             // A downgrade from HTTPS to HTTP is refused, even on loopback.
             assert!(!redirect_allowed(std::slice::from_ref(&secure), &plain));
-            assert!(!redirect_allowed(
-                &[plain.clone(), secure.clone()],
-                &url("http://[::1]:9/x")
-            ));
+            assert!(!redirect_allowed(&[plain.clone(), secure.clone()], &url("http://[::1]:9/x")));
         }
 
         #[test]
@@ -475,10 +453,7 @@ mod test_endpoints {
                 "http://10.0.0.1/",
                 "https://github.com/BarraDev/slashit/releases/download/v0.0.1/latest.json",
             ] {
-                assert!(
-                    !redirect_allowed(&origin, &url(target)),
-                    "{target} must be refused"
-                );
+                assert!(!redirect_allowed(&origin, &url(target)), "{target} must be refused");
             }
         }
 
@@ -490,15 +465,8 @@ mod test_endpoints {
 
         #[test]
         fn loopback_ip_literals_are_accepted() {
-            for value in [
-                "http://127.0.0.1:8080/repos",
-                "https://127.0.0.2/x",
-                "http://[::1]:9/download/",
-            ] {
-                assert!(
-                    loopback_url(LISTING_VAR, value).is_ok(),
-                    "{value} must be accepted"
-                );
+            for value in ["http://127.0.0.1:8080/repos", "https://127.0.0.2/x", "http://[::1]:9/download/"] {
+                assert!(loopback_url(LISTING_VAR, value).is_ok(), "{value} must be accepted");
             }
         }
 
@@ -515,10 +483,7 @@ mod test_endpoints {
                 "http://user@127.0.0.1/",
                 "http://127.0.0.1/x?per_page=1",
             ] {
-                assert!(
-                    loopback_url(LISTING_VAR, value).is_err(),
-                    "{value} must be refused"
-                );
+                assert!(loopback_url(LISTING_VAR, value).is_err(), "{value} must be refused");
             }
         }
 
@@ -543,10 +508,7 @@ mod test_endpoints {
                 Some("http://127.0.0.1:8080/download/"),
             )
             .unwrap();
-            assert_eq!(
-                endpoints.listing,
-                "http://127.0.0.1:8080/repos/BarraDev/slashit/releases"
-            );
+            assert_eq!(endpoints.listing, "http://127.0.0.1:8080/repos/BarraDev/slashit/releases");
             assert_eq!(endpoints.download_base, "http://127.0.0.1:8080/download");
         }
     }
@@ -650,10 +612,7 @@ mod tests {
             ("0.0.4", stable, vec![("v0.0.5", false)], Some("v0.0.5")),
         ];
         for (installed, channel, published, expected) in cases {
-            let candidates = published
-                .into_iter()
-                .map(|(tag, pre)| release(tag, pre))
-                .collect();
+            let candidates = published.into_iter().map(|(tag, pre)| release(tag, pre)).collect();
             let selection = select(&feed(candidates), channel, version(installed));
             assert_eq!(
                 offered(&selection).as_deref(),
@@ -666,27 +625,15 @@ mod tests {
 
     #[test]
     fn the_highest_version_is_offered_not_the_first_listed() {
-        let candidates = vec![
-            release("v0.0.2", false),
-            release("v0.0.10", false),
-            release("v0.0.9", true),
-        ];
-        let selection = select(
-            &feed(candidates),
-            ReleaseChannel::Prerelease,
-            version("0.0.1"),
-        );
+        let candidates = vec![release("v0.0.2", false), release("v0.0.10", false), release("v0.0.9", true)];
+        let selection = select(&feed(candidates), ReleaseChannel::Prerelease, version("0.0.1"));
         assert_eq!(offered(&selection).as_deref(), Some("v0.0.10"));
     }
 
     #[test]
     fn a_stable_release_newer_than_a_prerelease_is_offered_to_prerelease_users() {
         let candidates = vec![release("v0.0.3", false), release("v0.0.2", true)];
-        let selection = select(
-            &feed(candidates),
-            ReleaseChannel::Prerelease,
-            version("0.0.2"),
-        );
+        let selection = select(&feed(candidates), ReleaseChannel::Prerelease, version("0.0.2"));
         assert_eq!(offered(&selection).as_deref(), Some("v0.0.3"));
     }
 
@@ -700,11 +647,7 @@ mod tests {
     fn drafts_are_never_offered() {
         let mut draft = release("v0.0.2", false);
         draft.draft = true;
-        let selection = select(
-            &feed(vec![draft]),
-            ReleaseChannel::Prerelease,
-            version("0.0.1"),
-        );
+        let selection = select(&feed(vec![draft]), ReleaseChannel::Prerelease, version("0.0.1"));
         assert_eq!(offered(&selection), None);
         assert!(selection.notices.is_empty());
     }
@@ -727,10 +670,7 @@ mod tests {
         let candidates = vec![odd, release("v0.0.2", false)];
         let selection = select(&feed(candidates), ReleaseChannel::Stable, version("0.0.1"));
         assert_eq!(offered(&selection).as_deref(), Some("v0.0.2"));
-        assert!(selection
-            .notices
-            .iter()
-            .any(|notice| notice.contains("release-next")));
+        assert!(selection.notices.iter().any(|notice| notice.contains("release-next")));
     }
 
     #[test]
@@ -763,14 +703,8 @@ mod tests {
     #[test]
     fn the_production_endpoints_are_the_published_github_locations() {
         let published = Endpoints::published();
-        assert_eq!(
-            published.listing,
-            "https://api.github.com/repos/BarraDev/slashit/releases"
-        );
-        assert_eq!(
-            published.download_base,
-            "https://github.com/BarraDev/slashit/releases/download"
-        );
+        assert_eq!(published.listing, "https://api.github.com/repos/BarraDev/slashit/releases");
+        assert_eq!(published.download_base, "https://github.com/BarraDev/slashit/releases/download");
     }
 
     /// A production build has no seam to read, so this holds whatever the
@@ -790,10 +724,7 @@ mod tests {
         };
         assert!(check_manifest_version(&chosen, "0.0.2").is_ok());
         let refused = check_manifest_version(&chosen, "0.0.9").unwrap_err();
-        assert!(
-            refused.contains("v0.0.2") && refused.contains("0.0.9"),
-            "{refused}"
-        );
+        assert!(refused.contains("v0.0.2") && refused.contains("0.0.9"), "{refused}");
     }
 
     #[test]
@@ -809,22 +740,13 @@ mod tests {
         assert_eq!(candidates.len(), 3);
         assert_eq!(candidates[0].version, Some(version("0.0.2")));
         assert!(candidates[0].has_manifest && candidates[0].prerelease);
-        assert_eq!(
-            candidates[1].version, None,
-            "a numeric suffix is not a plain version"
-        );
-        assert!(
-            !candidates[2].has_manifest,
-            "an asset list without latest.json has no manifest"
-        );
+        assert_eq!(candidates[1].version, None, "a numeric suffix is not a plain version");
+        assert!(!candidates[2].has_manifest, "an asset list without latest.json has no manifest");
     }
 
     #[test]
     fn a_listing_that_is_not_json_is_malformed() {
-        assert!(matches!(
-            parse_page(b"<html>"),
-            Err(FeedError::Malformed(_))
-        ));
+        assert!(matches!(parse_page(b"<html>"), Err(FeedError::Malformed(_))));
     }
 
     // --- Against a local HTTP server --------------------------------------
@@ -834,10 +756,7 @@ mod tests {
 
     fn plain_client() -> reqwest::Client {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap()
+        reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap()
     }
 
     /// One HTTP/1.1 response, closed after the body.
@@ -852,10 +771,7 @@ mod tests {
     fn serve(responses: Vec<String>) -> (String, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let listing = format!(
-            "http://{}/repos/BarraDev/slashit/releases",
-            listener.local_addr().unwrap()
-        );
+        let listing = format!("http://{}/repos/BarraDev/slashit/releases", listener.local_addr().unwrap());
         let handle = std::thread::spawn(move || {
             for reply in responses {
                 let (mut stream, _) = listener.accept().unwrap();
@@ -909,10 +825,7 @@ mod tests {
         let feed = fetch_feed(&plain_client(), &listing).await.unwrap();
         server.join().unwrap();
         assert_eq!(feed.candidates.len(), PAGE_SIZE * MAX_PAGES);
-        assert!(
-            feed.truncated,
-            "more releases may exist beyond the page limit"
-        );
+        assert!(feed.truncated, "more releases may exist beyond the page limit");
     }
 
     #[tokio::test]
@@ -976,10 +889,7 @@ mod tests {
         )
         .build()
         .unwrap();
-        assert!(
-            client.get(plain.as_str()).send().await.is_err(),
-            "a plain HTTP request must not be sent"
-        );
+        assert!(client.get(plain.as_str()).send().await.is_err(), "a plain HTTP request must not be sent");
     }
 
     // --- Against a local TLS server ---------------------------------------
@@ -1059,11 +969,7 @@ mod tests {
         let plain_url = format!("http://{}/payload", plain.local_addr().unwrap());
         let (port, origin) = serve_tls(
             config,
-            vec![response(
-                "302 Found",
-                &format!("Location: {plain_url}\r\n"),
-                "",
-            )],
+            vec![response("302 Found", &format!("Location: {plain_url}\r\n"), "")],
         );
         let error = tls_plugin_client(trusted)
             .get(format!("https://127.0.0.1:{port}/manifest"))
@@ -1072,10 +978,7 @@ mod tests {
             .unwrap_err();
         origin.join().unwrap();
         assert!(error.is_redirect(), "{error:?}");
-        assert!(
-            plain.accept().is_err(),
-            "the plain HTTP server must receive no connection"
-        );
+        assert!(plain.accept().is_err(), "the plain HTTP server must receive no connection");
     }
 
     /// A redirect from HTTPS to another HTTPS host is followed. A manifest's
@@ -1087,11 +990,7 @@ mod tests {
             serve_tls(config.clone(), vec![response("200 OK", "", "payload")]);
         let (origin, origin_server) = serve_tls(
             config,
-            vec![response(
-                "302 Found",
-                &format!("Location: https://localhost:{target}/payload\r\n"),
-                "",
-            )],
+            vec![response("302 Found", &format!("Location: https://localhost:{target}/payload\r\n"), "")],
         );
         let body = tls_plugin_client(trusted)
             .get(format!("https://127.0.0.1:{origin}/manifest"))
@@ -1115,10 +1014,7 @@ mod tests {
             "https://api.github.com/repos/BarraDev/slashit/releases/assets/1",
             "https://release-assets.githubusercontent.com/github-production-release-asset/1",
         ] {
-            assert!(
-                check_payload_location(&published, payload).is_ok(),
-                "{payload} must be accepted"
-            );
+            assert!(check_payload_location(&published, payload).is_ok(), "{payload} must be accepted");
         }
         for payload in [
             "http://api.github.com/repos/BarraDev/slashit/releases/assets/1",
@@ -1128,10 +1024,7 @@ mod tests {
             "not a url",
             "",
         ] {
-            assert!(
-                check_payload_location(&published, payload).is_err(),
-                "{payload} must be refused"
-            );
+            assert!(check_payload_location(&published, payload).is_err(), "{payload} must be refused");
         }
     }
 
@@ -1152,9 +1045,7 @@ mod tests {
     #[tokio::test]
     async fn the_test_client_reads_a_loopback_listing_over_plain_http() {
         let (listing, server) = serve(vec![response("200 OK", "", &full_page(0, 2))]);
-        let feed = fetch_feed(&client(&override_for(&listing)).unwrap(), &listing)
-            .await
-            .unwrap();
+        let feed = fetch_feed(&client(&override_for(&listing)).unwrap(), &listing).await.unwrap();
         server.join().unwrap();
         assert_eq!(feed.candidates.len(), 2);
     }
@@ -1165,14 +1056,9 @@ mod tests {
     #[tokio::test]
     async fn the_test_client_follows_a_redirect_to_a_loopback_address() {
         let (second, second_server) = serve(vec![response("200 OK", "", &full_page(0, 2))]);
-        let (first, first_server) = serve(vec![response(
-            "302 Found",
-            &format!("Location: {second}\r\n"),
-            "",
-        )]);
-        let feed = fetch_feed(&client(&override_for(&first)).unwrap(), &first)
-            .await
-            .unwrap();
+        let (first, first_server) =
+            serve(vec![response("302 Found", &format!("Location: {second}\r\n"), "")]);
+        let feed = fetch_feed(&client(&override_for(&first)).unwrap(), &first).await.unwrap();
         first_server.join().unwrap();
         second_server.join().unwrap();
         assert_eq!(feed.candidates.len(), 2);
@@ -1212,13 +1098,7 @@ mod tests {
             "",
         )]);
         let builder = plugin_client_policy(&override_for(&first))(reqwest::Client::builder());
-        let error = builder
-            .build()
-            .unwrap()
-            .get(&first)
-            .send()
-            .await
-            .unwrap_err();
+        let error = builder.build().unwrap().get(&first).send().await.unwrap_err();
         first_server.join().unwrap();
         assert!(error.is_redirect(), "{error:?}");
     }
@@ -1232,11 +1112,7 @@ mod tests {
             listing: "http://127.0.0.1:8080/repos/BarraDev/slashit/releases".to_string(),
             download_base: "http://127.0.0.1:8080/download".to_string(),
         };
-        assert!(check_payload_location(
-            &overridden,
-            "http://127.0.0.1:8080/download/v0.0.2/payload"
-        )
-        .is_ok());
+        assert!(check_payload_location(&overridden, "http://127.0.0.1:8080/download/v0.0.2/payload").is_ok());
         for payload in [
             // The same host on another port, and an https origin on the same port, are other origins.
             "http://127.0.0.1:9999/download/v0.0.2/payload",
@@ -1246,27 +1122,16 @@ mod tests {
             "http://localhost:8080/payload",
             "not a url",
         ] {
-            assert!(
-                check_payload_location(&overridden, payload).is_err(),
-                "{payload} must be refused"
-            );
+            assert!(check_payload_location(&overridden, payload).is_err(), "{payload} must be refused");
         }
         let published = Endpoints::published();
-        assert!(check_payload_location(
-            &published,
-            "https://github.com/BarraDev/slashit/releases/download/v0.0.2/payload"
-        )
-        .is_ok());
+        assert!(check_payload_location(&published, "https://github.com/BarraDev/slashit/releases/download/v0.0.2/payload").is_ok());
     }
 
     #[tokio::test]
     async fn a_listing_that_cannot_be_reached_is_unreachable() {
         // Bind, learn the port, and release it: nothing listens there now.
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let listing = format!("http://127.0.0.1:{port}/releases");
         let error = fetch_feed(&plain_client(), &listing).await.unwrap_err();
         assert!(matches!(error, FeedError::Unreachable(_)), "{error:?}");

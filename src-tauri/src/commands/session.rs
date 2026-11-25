@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 use crate::commands::gui_admission::GuiMutation;
-use crate::domain::{ChatMessage, ChatSession, MessageRole};
+use crate::domain::{ChatSession, ChatMessage, MessageRole};
+use uuid::Uuid;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use uuid::Uuid;
 
 type Sessions = Arc<RwLock<HashMap<Uuid, ChatSession>>>;
 type Messages = Arc<RwLock<HashMap<Uuid, Vec<ChatMessage>>>>;
@@ -39,8 +39,7 @@ pub async fn create_session(
 ) -> Result<ChatSession, String> {
     let id = Uuid::new_v4();
     let project_id = Uuid::parse_str(&project_id).map_err(|e| e.to_string())?;
-    crate::commands::project::refuse_if_project_removed(&state.project.projects, project_id)
-        .await?;
+    crate::commands::project::refuse_if_project_removed(&state.project.projects, project_id).await?;
     let now = chrono::Utc::now();
 
     let session = ChatSession {
@@ -51,12 +50,7 @@ pub async fn create_session(
         updated_at: now,
     };
 
-    state
-        .session
-        .sessions
-        .write()
-        .await
-        .insert(id, session.clone());
+    state.session.sessions.write().await.insert(id, session.clone());
     state.session.messages.write().await.insert(id, vec![]);
 
     Ok(session)
@@ -80,8 +74,7 @@ pub async fn send_message(
         timestamp: chrono::Utc::now(),
     };
 
-    state
-        .session
+    state.session
         .messages
         .write()
         .await
@@ -100,7 +93,10 @@ pub async fn get_session_history(
     let session_id = Uuid::parse_str(&session_id).map_err(|e| e.to_string())?;
     let messages = state.session.messages.read().await;
 
-    Ok(messages.get(&session_id).cloned().unwrap_or_default())
+    Ok(messages
+        .get(&session_id)
+        .cloned()
+        .unwrap_or_default())
 }
 
 #[tauri::command]

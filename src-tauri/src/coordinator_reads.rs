@@ -129,10 +129,7 @@ fn inspect_task(tasks: &HashMap<Uuid, Task>, project_id: Uuid, task_id: Uuid) ->
 /// position, then id. Pages and the Task index both follow it, so a page can
 /// never disagree with the index about which Task comes next.
 pub fn project_tasks(tasks: &HashMap<Uuid, Task>, project_id: Uuid) -> Vec<&Task> {
-    let mut found: Vec<&Task> = tasks
-        .values()
-        .filter(|task| task.project_id == project_id)
-        .collect();
+    let mut found: Vec<&Task> = tasks.values().filter(|task| task.project_id == project_id).collect();
     found.sort_by_key(|task| (task.position, task.id));
     found
 }
@@ -288,12 +285,9 @@ fn inspect_task_pull_request(
         .external_refs
         .iter()
         .filter_map(|reference| match reference {
-            ExternalRef::GithubPr {
-                number,
-                repo,
-                state,
-                ..
-            } => Some((repo.as_str(), *number, state.as_deref())),
+            ExternalRef::GithubPr { number, repo, state, .. } => {
+                Some((repo.as_str(), *number, state.as_deref()))
+            }
             _ => None,
         })
         .collect();
@@ -371,17 +365,12 @@ pub fn cap_read(mut result: Value, cap: usize) -> Value {
     if original <= cap {
         return result;
     }
-    result["result_truncated"] =
-        json!({"original_chars": original, "reason": "the result exceeded the per-read size cap"});
+    result["result_truncated"] = json!({"original_chars": original, "reason": "the result exceeded the per-read size cap"});
     let fits = |value: &Value| value_chars(value) <= cap;
 
     // A page of Tasks: drop the last Tasks and point at where the next page starts.
     if result["outcome"] == "listed" {
-        while !fits(&result)
-            && result["tasks"]
-                .as_array()
-                .is_some_and(|tasks| !tasks.is_empty())
-        {
+        while !fits(&result) && result["tasks"].as_array().is_some_and(|tasks| !tasks.is_empty()) {
             result["tasks"].as_array_mut().unwrap().pop();
             let returned = result["tasks"].as_array().unwrap().len();
             let offset = result["offset"].as_u64().unwrap_or(0);
@@ -392,11 +381,7 @@ pub fn cap_read(mut result: Value, cap: usize) -> Value {
     }
     // Activity: drop the oldest events and count them as omitted.
     if result.get("events").is_some() {
-        while !fits(&result)
-            && result["events"]
-                .as_array()
-                .is_some_and(|events| events.len() > 1)
-        {
+        while !fits(&result) && result["events"].as_array().is_some_and(|events| events.len() > 1) {
             result["events"].as_array_mut().unwrap().remove(0);
             let returned = result["events"].as_array().unwrap().len();
             let omitted = result["earlier_events_omitted"].as_u64().unwrap_or(0);
@@ -406,14 +391,9 @@ pub fn cap_read(mut result: Value, cap: usize) -> Value {
     }
     // Pull requests: drop the last ones, then the failing check names.
     if result.get("pull_requests").is_some() {
-        while !fits(&result)
-            && result["pull_requests"]
-                .as_array()
-                .is_some_and(|prs| prs.len() > 1)
-        {
+        while !fits(&result) && result["pull_requests"].as_array().is_some_and(|prs| prs.len() > 1) {
             result["pull_requests"].as_array_mut().unwrap().pop();
-            result["pull_requests_shown"] =
-                json!(result["pull_requests"].as_array().unwrap().len());
+            result["pull_requests_shown"] = json!(result["pull_requests"].as_array().unwrap().len());
         }
         if !fits(&result) {
             for pull_request in result["pull_requests"].as_array_mut().unwrap() {
@@ -426,24 +406,14 @@ pub fn cap_read(mut result: Value, cap: usize) -> Value {
     }
     // One Task: drop dependencies, then subtasks, then shorten the description.
     if result["task"].is_object() {
-        for (list, shown) in [
-            ("dependencies", "dependencies_truncated"),
-            ("subtasks", "subtasks_truncated"),
-        ] {
-            while !fits(&result)
-                && result["task"][list]
-                    .as_array()
-                    .is_some_and(|items| !items.is_empty())
-            {
+        for (list, shown) in [("dependencies", "dependencies_truncated"), ("subtasks", "subtasks_truncated")] {
+            while !fits(&result) && result["task"][list].as_array().is_some_and(|items| !items.is_empty()) {
                 result["task"][list].as_array_mut().unwrap().pop();
                 result["task"][shown] = json!(true);
             }
         }
         if !fits(&result) {
-            let description = result["task"]["description"]
-                .as_str()
-                .unwrap_or("")
-                .to_owned();
+            let description = result["task"]["description"].as_str().unwrap_or("").to_owned();
             let total = description.chars().count();
             let overshoot = value_chars(&result).saturating_sub(cap);
             let keep = total.saturating_sub(overshoot + 64);
@@ -485,21 +455,14 @@ fn read_uncapped(
         CoordinatorOutput::InspectTask { target_task_id } => {
             Some(inspect_task(tasks, project_id, *target_task_id))
         }
-        CoordinatorOutput::ListTasks {
-            status,
-            limit,
-            offset,
-        } => Some(list_tasks(
+        CoordinatorOutput::ListTasks { status, limit, offset } => Some(list_tasks(
             tasks,
             project_id,
             status.as_ref(),
             limit.map(usize::from),
             offset.map(|offset| usize::try_from(offset).unwrap_or(usize::MAX)),
         )),
-        CoordinatorOutput::InspectTaskActivity {
-            target_task_id,
-            limit,
-        } => Some(inspect_task_activity(
+        CoordinatorOutput::InspectTaskActivity { target_task_id, limit } => Some(inspect_task_activity(
             tasks,
             project_id,
             *target_task_id,
@@ -522,10 +485,7 @@ pub struct PromptLimits {
 }
 
 impl PromptLimits {
-    pub const UNBOUNDED: Self = Self {
-        max_chars: usize::MAX,
-        other_fixed_chars: 0,
-    };
+    pub const UNBOUNDED: Self = Self { max_chars: usize::MAX, other_fixed_chars: 0 };
 }
 
 fn availability_notice(reads_so_far: usize, refused: bool) -> String {
@@ -553,11 +513,7 @@ pub fn read_reserve_chars(per_read_cap: usize) -> usize {
     let envelope = (0..=READS_PER_TURN)
         .flat_map(|reads| [false, true].map(move |refused| (reads, refused)))
         .filter(|(reads, refused)| *reads > 0 && (!refused || *reads == READS_PER_TURN))
-        .map(|(reads, refused)| {
-            followup_prompt("", &availability_notice(reads, refused), "")
-                .chars()
-                .count()
-        })
+        .map(|(reads, refused)| followup_prompt("", &availability_notice(reads, refused), "").chars().count())
         .max()
         .unwrap_or(0);
     // `[`, `]` and the commas between three results.
@@ -593,16 +549,9 @@ where
         let prompt = if evidence.is_empty() {
             base_prompt.to_owned()
         } else {
-            followup_prompt(
-                base_prompt,
-                &availability_notice(evidence.len(), refused),
-                &Value::Array(evidence.clone()).to_string(),
-            )
+            followup_prompt(base_prompt, &availability_notice(evidence.len(), refused), &Value::Array(evidence.clone()).to_string())
         };
-        let sent = prompt
-            .chars()
-            .count()
-            .saturating_add(limits.other_fixed_chars);
+        let sent = prompt.chars().count().saturating_add(limits.other_fixed_chars);
         if sent > limits.max_chars {
             return Err(format!(
                 "The next provider run would send {sent} characters, over the {}-character context budget, so it was not started",
@@ -634,29 +583,19 @@ where
 mod tests {
     use super::*;
     use crate::domain::conversation::Conversation;
-    use crate::domain::{
-        NewTask, SecuritySeverity, TaskCategory, TaskComplexity, TaskImpact, TaskPriority,
-    };
+    use crate::domain::{NewTask, SecuritySeverity, TaskCategory, TaskComplexity, TaskImpact, TaskPriority};
     use crate::pr_status::{ChecksState, PrState, PrStatus, ReviewDecision};
     use crate::test_helpers::no_github;
     use slashit_activity::{Column, Kind};
     use std::sync::{Arc, Mutex};
 
     /// [`super::read`] with no GitHub to ask and an empty status cache.
-    fn read(
-        output: &CoordinatorOutput,
-        project_id: Uuid,
-        tasks: &HashMap<Uuid, Task>,
-    ) -> Option<Value> {
+    fn read(output: &CoordinatorOutput, project_id: Uuid, tasks: &HashMap<Uuid, Task>) -> Option<Value> {
         super::read(output, project_id, tasks, &no_github(), &facts())
     }
 
     fn facts() -> ProjectFacts {
-        ProjectFacts {
-            name: "Alpha".into(),
-            workspace: None,
-            base_branch: None,
-        }
+        ProjectFacts { name: "Alpha".into(), workspace: None, base_branch: None }
     }
 
     fn task(project_id: Uuid, title: &str, status: TaskStatus, position: i32) -> Task {
@@ -743,28 +682,16 @@ mod tests {
     #[test]
     fn detail_text_is_bounded_and_says_so() {
         let project = Uuid::new_v4();
-        let mut big = task(
-            project,
-            &"t".repeat(TITLE_CHARS * 2),
-            TaskStatus::Backlog,
-            0,
-        );
+        let mut big = task(project, &"t".repeat(TITLE_CHARS * 2), TaskStatus::Backlog, 0);
         big.description = Some("d".repeat(DESCRIPTION_CHARS + 50));
         big.error_message = Some("e".repeat(ERROR_CHARS * 3));
         let id = big.id;
         // Through the capped read path: the field limits fit inside the cap.
         let result = read(&inspect(id), project, &store(vec![big])).unwrap();
-        assert!(
-            result.get("result_truncated").is_none(),
-            "{}",
-            chars_of(&result)
-        );
+        assert!(result.get("result_truncated").is_none(), "{}", chars_of(&result));
         let task = &result["task"];
         assert_eq!(task["title"].as_str().unwrap().chars().count(), TITLE_CHARS);
-        assert_eq!(
-            task["description"].as_str().unwrap().chars().count(),
-            DESCRIPTION_CHARS
-        );
+        assert_eq!(task["description"].as_str().unwrap().chars().count(), DESCRIPTION_CHARS);
         assert_eq!(task["description_truncated"], true);
         assert_eq!(task["error"].as_str().unwrap().chars().count(), ERROR_CHARS);
     }
@@ -774,11 +701,7 @@ mod tests {
         let project = Uuid::new_v4();
         let mut big = task(project, "Subject", TaskStatus::Backlog, 0);
         big.subtasks = (0..SUBTASKS_SHOWN + 5)
-            .map(|n| crate::domain::Subtask {
-                id: Uuid::new_v4(),
-                title: format!("s{n}"),
-                completed: false,
-            })
+            .map(|n| crate::domain::Subtask { id: Uuid::new_v4(), title: format!("s{n}"), completed: false })
             .collect();
         let id = big.id;
         let result = read(&inspect(id), project, &store(vec![big])).unwrap();
@@ -796,11 +719,7 @@ mod tests {
             task(project, "running", TaskStatus::InProgress, 0),
             task(Uuid::new_v4(), "foreign", TaskStatus::Backlog, 0),
         ]);
-        let list = CoordinatorOutput::ListTasks {
-            status: Some(TaskStatus::Backlog),
-            limit: None,
-            offset: None,
-        };
+        let list = CoordinatorOutput::ListTasks { status: Some(TaskStatus::Backlog), limit: None, offset: None };
         let result = read(&list, project, &tasks).unwrap();
         let titles: Vec<_> = result["tasks"]
             .as_array()
@@ -821,34 +740,19 @@ mod tests {
                 .map(|n| task(project, &format!("t{n}"), TaskStatus::Backlog, n))
                 .collect(),
         );
-        let greedy = CoordinatorOutput::ListTasks {
-            status: None,
-            limit: Some(200),
-            offset: None,
-        };
+        let greedy = CoordinatorOutput::ListTasks { status: None, limit: Some(200), offset: None };
         let result = read(&greedy, project, &tasks).unwrap();
         assert_eq!(result["returned"], LIST_MAX_LIMIT);
         assert_eq!(result["total_matching"], LIST_MAX_LIMIT + 7);
         assert_eq!(result["truncated"], true);
         assert_eq!(result["next_offset"], LIST_MAX_LIMIT);
-        let default = CoordinatorOutput::ListTasks {
-            status: None,
-            limit: None,
-            offset: None,
-        };
-        assert_eq!(
-            read(&default, project, &tasks).unwrap()["returned"],
-            LIST_DEFAULT_LIMIT
-        );
+        let default = CoordinatorOutput::ListTasks { status: None, limit: None, offset: None };
+        assert_eq!(read(&default, project, &tasks).unwrap()["returned"], LIST_DEFAULT_LIMIT);
     }
 
     #[test]
     fn empty_project_lists_nothing() {
-        let list = CoordinatorOutput::ListTasks {
-            status: None,
-            limit: None,
-            offset: None,
-        };
+        let list = CoordinatorOutput::ListTasks { status: None, limit: None, offset: None };
         let result = read(&list, Uuid::new_v4(), &HashMap::new()).unwrap();
         assert_eq!(result["returned"], 0);
         assert_eq!(result["truncated"], false);
@@ -856,11 +760,7 @@ mod tests {
     }
 
     fn listing(limit: Option<u8>, offset: Option<u32>) -> CoordinatorOutput {
-        CoordinatorOutput::ListTasks {
-            status: None,
-            limit,
-            offset,
-        }
+        CoordinatorOutput::ListTasks { status: None, limit, offset }
     }
 
     /// Titles in the order a Coordinator reads them, following `next_offset`
@@ -869,12 +769,7 @@ mod tests {
         let mut titles = Vec::new();
         let mut offset = Some(0);
         while let Some(at) = offset {
-            let page = read(
-                &listing(Some(LIST_MAX_LIMIT as u8), Some(at)),
-                project,
-                tasks,
-            )
-            .unwrap();
+            let page = read(&listing(Some(LIST_MAX_LIMIT as u8), Some(at)), project, tasks).unwrap();
             titles.extend(
                 page["tasks"]
                     .as_array()
@@ -910,11 +805,7 @@ mod tests {
     fn pages_past_forty_reach_every_task_once_and_break_position_ties_by_id() {
         let project = Uuid::new_v4();
         // Every Task shares one position, so the id alone orders them.
-        let tasks = store(
-            (0..45)
-                .map(|n| task(project, &format!("t{n:02}"), TaskStatus::Backlog, 0))
-                .collect(),
-        );
+        let tasks = store((0..45).map(|n| task(project, &format!("t{n:02}"), TaskStatus::Backlog, 0)).collect());
         let by_id: Vec<String> = {
             let mut ordered: Vec<&Task> = tasks.values().collect();
             ordered.sort_by_key(|task| task.id);
@@ -928,23 +819,12 @@ mod tests {
     #[test]
     fn the_task_index_and_the_first_pages_agree_past_forty() {
         let project = Uuid::new_v4();
-        let tasks = store(
-            (0..45)
-                .rev()
-                .map(|n| task(project, &format!("t{n:02}"), TaskStatus::Backlog, n))
-                .collect(),
-        );
+        let tasks = store((0..45).rev().map(|n| task(project, &format!("t{n:02}"), TaskStatus::Backlog, n)).collect());
         let index: Vec<Value> = task_index(&tasks, project);
         assert_eq!(index.len(), 45);
         let listed = every_page_title(project, &tasks);
-        let indexed: Vec<&str> = index
-            .iter()
-            .map(|task| task["title"].as_str().unwrap())
-            .collect();
-        assert_eq!(
-            indexed,
-            listed.iter().map(String::as_str).collect::<Vec<_>>()
-        );
+        let indexed: Vec<&str> = index.iter().map(|task| task["title"].as_str().unwrap()).collect();
+        assert_eq!(indexed, listed.iter().map(String::as_str).collect::<Vec<_>>());
         // The projection shows the first 40; the tail is one offset read away.
         let tail = read(&listing(Some(20), Some(40)), project, &tasks).unwrap();
         assert_eq!(tail["tasks"][0]["id"], index[40]["id"]);
@@ -955,11 +835,7 @@ mod tests {
     #[test]
     fn an_offset_past_the_end_is_an_empty_last_page() {
         let project = Uuid::new_v4();
-        let tasks = store(
-            (0..3)
-                .map(|n| task(project, &format!("t{n}"), TaskStatus::Backlog, n))
-                .collect(),
-        );
+        let tasks = store((0..3).map(|n| task(project, &format!("t{n}"), TaskStatus::Backlog, n)).collect());
         let past = read(&listing(None, Some(3)), project, &tasks).unwrap();
         assert_eq!(past["returned"], 0);
         assert_eq!(past["truncated"], false);
@@ -969,10 +845,7 @@ mod tests {
     }
 
     fn activity(id: Uuid, limit: Option<u8>) -> CoordinatorOutput {
-        CoordinatorOutput::InspectTaskActivity {
-            target_task_id: id,
-            limit,
-        }
+        CoordinatorOutput::InspectTaskActivity { target_task_id: id, limit }
     }
 
     fn pull_request(id: Uuid) -> CoordinatorOutput {
@@ -983,34 +856,17 @@ mod tests {
     fn activity_is_recent_milestones_without_tool_noise() {
         let project = Uuid::new_v4();
         let mut subject = task(project, "Subject", TaskStatus::Error, 0);
-        subject.record_activity(Kind::RunStarted {
-            run: 1,
-            addressing_feedback: false,
-        });
+        subject.record_activity(Kind::RunStarted { run: 1, addressing_feedback: false });
         for n in 0..5 {
-            subject.record_activity(Kind::ToolUsed {
-                run: 1,
-                tool: "Edit".into(),
-                detail: Some(format!("f{n}")),
-                count: 1,
-            });
+            subject.record_activity(Kind::ToolUsed { run: 1, tool: "Edit".into(), detail: Some(format!("f{n}")), count: 1 });
         }
-        subject.record_activity(Kind::RunFailed {
-            run: Some(1),
-            reason: "r".repeat(ACTIVITY_DETAIL_CHARS * 2),
-        });
+        subject.record_activity(Kind::RunFailed { run: Some(1), reason: "r".repeat(ACTIVITY_DETAIL_CHARS * 2) });
         let id = subject.id;
         let result = read(&activity(id, None), project, &store(vec![subject])).unwrap();
         let events = result["events"].as_array().unwrap();
-        let names: Vec<_> = events
-            .iter()
-            .map(|e| e["event"].as_str().unwrap())
-            .collect();
+        let names: Vec<_> = events.iter().map(|e| e["event"].as_str().unwrap()).collect();
         assert_eq!(names, ["created", "run_started", "run_failed"]);
-        assert_eq!(
-            events[2]["detail"].as_str().unwrap().chars().count(),
-            ACTIVITY_DETAIL_CHARS
-        );
+        assert_eq!(events[2]["detail"].as_str().unwrap().chars().count(), ACTIVITY_DETAIL_CHARS);
         assert_eq!(result["earlier_events_omitted"], 0);
     }
 
@@ -1019,10 +875,7 @@ mod tests {
         let project = Uuid::new_v4();
         let mut subject = task(project, "Subject", TaskStatus::Backlog, 0);
         for run in 1..=ACTIVITY_MAX_LIMIT as u32 + 10 {
-            subject.record_activity(Kind::RunStarted {
-                run,
-                addressing_feedback: false,
-            });
+            subject.record_activity(Kind::RunStarted { run, addressing_feedback: false });
         }
         let id = subject.id;
         let tasks = store(vec![subject]);
@@ -1030,14 +883,8 @@ mod tests {
         assert_eq!(capped["events_returned"], ACTIVITY_MAX_LIMIT);
         assert_eq!(capped["earlier_events_omitted"], 11);
         let last = capped["events"].as_array().unwrap().last().unwrap();
-        assert_eq!(
-            last["title"],
-            format!("Coding started (attempt {})", ACTIVITY_MAX_LIMIT + 10)
-        );
-        assert_eq!(
-            read(&activity(id, Some(2)), project, &tasks).unwrap()["events_returned"],
-            2
-        );
+        assert_eq!(last["title"], format!("Coding started (attempt {})", ACTIVITY_MAX_LIMIT + 10));
+        assert_eq!(read(&activity(id, Some(2)), project, &tasks).unwrap()["events_returned"], 2);
     }
 
     #[test]
@@ -1116,21 +963,12 @@ mod tests {
     fn activity_and_pull_request_reads_do_not_cross_projects() {
         let project = Uuid::new_v4();
         let mut foreign = task(Uuid::new_v4(), "Secret", TaskStatus::Backlog, 0);
-        foreign.record_activity(Kind::Moved {
-            from: Column::Backlog,
-            to: Column::Queue,
-        });
+        foreign.record_activity(Kind::Moved { from: Column::Backlog, to: Column::Queue });
         let foreign_id = foreign.id;
         let tasks = store(vec![foreign]);
         let missing = read(&inspect(Uuid::new_v4()), project, &tasks).unwrap();
-        assert_eq!(
-            read(&activity(foreign_id, None), project, &tasks).unwrap(),
-            missing
-        );
-        assert_eq!(
-            read(&pull_request(foreign_id), project, &tasks).unwrap(),
-            missing
-        );
+        assert_eq!(read(&activity(foreign_id, None), project, &tasks).unwrap(), missing);
+        assert_eq!(read(&pull_request(foreign_id), project, &tasks).unwrap(), missing);
     }
 
     #[test]
@@ -1149,10 +987,7 @@ mod tests {
         let tasks = store(vec![subject, plain]);
         let result = read(&pull_request(id), project, &tasks).unwrap();
         let pr = &result["pull_requests"][0];
-        assert_eq!(
-            (pr["repo"].as_str(), pr["number"].as_u64()),
-            (Some("o/r"), Some(7))
-        );
+        assert_eq!((pr["repo"].as_str(), pr["number"].as_u64()), (Some("o/r"), Some(7)));
         assert_eq!(pr["recorded_state"], "OPEN");
         assert!(pr["live"].is_null());
         let none = read(&pull_request(plain_id), project, &tasks).unwrap();
@@ -1185,21 +1020,12 @@ mod tests {
                 head_oid: None,
             },
         );
-        let result = super::read(
-            &pull_request(id),
-            project,
-            &store(vec![subject]),
-            &statuses,
-            &facts(),
-        )
-        .unwrap();
+        let result =
+            super::read(&pull_request(id), project, &store(vec![subject]), &statuses, &facts()).unwrap();
         let live = &result["pull_requests"][0]["live"];
         assert_eq!(live["checks"], "failing");
         assert_eq!(live["review_decision"], "changes_requested");
-        assert_eq!(
-            live["failing_checks"][0].as_str().unwrap().chars().count(),
-            CHECK_NAME_CHARS
-        );
+        assert_eq!(live["failing_checks"][0].as_str().unwrap().chars().count(), CHECK_NAME_CHARS);
         assert!(!result["pull_requests"][0]["live_read_at"].is_null());
     }
 
@@ -1207,22 +1033,16 @@ mod tests {
     fn new_read_requests_are_strictly_parsed() {
         let id = Uuid::new_v4();
         assert!(matches!(
-            Conversation::parse_output(&format!(
-                r#"{{"type":"inspect_task_activity","target_task_id":"{id}","limit":5}}"#
-            )),
+            Conversation::parse_output(&format!(r#"{{"type":"inspect_task_activity","target_task_id":"{id}","limit":5}}"#)),
             Ok(CoordinatorOutput::InspectTaskActivity { limit: Some(5), .. })
         ));
         assert!(matches!(
-            Conversation::parse_output(&format!(
-                r#"{{"type":"inspect_task_pull_request","target_task_id":"{id}"}}"#
-            )),
+            Conversation::parse_output(&format!(r#"{{"type":"inspect_task_pull_request","target_task_id":"{id}"}}"#)),
             Ok(CoordinatorOutput::InspectTaskPullRequest { .. })
         ));
         for bad in [
             format!(r#"{{"type":"inspect_task_activity","target_task_id":"{id}","limit":0}}"#),
-            format!(
-                r#"{{"type":"inspect_task_pull_request","target_task_id":"{id}","refresh":true}}"#
-            ),
+            format!(r#"{{"type":"inspect_task_pull_request","target_task_id":"{id}","refresh":true}}"#),
             r#"{"type":"inspect_task_pull_request"}"#.to_owned(),
         ] {
             assert!(Conversation::parse_output(&bad).is_err(), "{bad}");
@@ -1247,12 +1067,7 @@ mod tests {
 
     #[test]
     fn project_read_reports_missing_optional_metadata_as_null() {
-        let result = read(
-            &CoordinatorOutput::InspectProject {},
-            Uuid::new_v4(),
-            &HashMap::new(),
-        )
-        .unwrap();
+        let result = read(&CoordinatorOutput::InspectProject {}, Uuid::new_v4(), &HashMap::new()).unwrap();
         assert!(result["workspace"].is_null());
         assert!(result["default_base_branch"].is_null());
         assert_eq!(result["tasks_total"], 0);
@@ -1276,17 +1091,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result["name"], "Alpha");
-        assert_eq!(
-            result["workspace"],
-            json!({"id": workspace_id.to_string(), "name": "Studio"})
-        );
+        assert_eq!(result["workspace"], json!({"id": workspace_id.to_string(), "name": "Studio"}));
         assert_eq!(result["default_base_branch"], "main");
         let keys: Vec<_> = result.as_object().unwrap().keys().cloned().collect();
-        assert!(
-            keys.iter()
-                .all(|key| !key.contains("path") && !key.contains("root")),
-            "{keys:?}"
-        );
+        assert!(keys.iter().all(|key| !key.contains("path") && !key.contains("root")), "{keys:?}");
     }
 
     #[test]
@@ -1343,9 +1151,7 @@ mod tests {
     fn read_requests_are_strictly_parsed() {
         let id = Uuid::new_v4();
         assert!(matches!(
-            Conversation::parse_output(&format!(
-                r#"{{"type":"inspect_task","target_task_id":"{id}"}}"#
-            )),
+            Conversation::parse_output(&format!(r#"{{"type":"inspect_task","target_task_id":"{id}"}}"#)),
             Ok(CoordinatorOutput::InspectTask { .. })
         ));
         assert!(matches!(
@@ -1354,10 +1160,7 @@ mod tests {
         ));
         assert!(matches!(
             Conversation::parse_output(r#"{"type":"list_tasks","offset":40}"#),
-            Ok(CoordinatorOutput::ListTasks {
-                offset: Some(40),
-                ..
-            })
+            Ok(CoordinatorOutput::ListTasks { offset: Some(40), .. })
         ));
         for bad in [
             r#"{"type":"inspect_task"}"#,
@@ -1432,10 +1235,7 @@ mod tests {
         assert!(matches!(result, Ok(CoordinatorOutput::Reply { .. })));
         assert_eq!(prompts.len(), READS_PER_TURN + 2);
         assert!(prompts[READS_PER_TURN].contains("No further reads are available"));
-        assert!(prompts
-            .last()
-            .unwrap()
-            .contains("read budget for this turn is spent"));
+        assert!(prompts.last().unwrap().contains("read budget for this turn is spent"));
         // The refused read added no evidence: the same three results remain.
         assert_eq!(
             prompts[READS_PER_TURN].matches("\"outcome\"").count(),
@@ -1446,12 +1246,8 @@ mod tests {
     #[tokio::test]
     async fn a_turn_that_keeps_reading_after_the_refusal_ends() {
         let list = r#"{"type":"list_tasks"}"#.to_owned();
-        let (result, prompts) = drive_script(
-            vec![list; READS_PER_TURN + 2],
-            Uuid::new_v4(),
-            HashMap::new(),
-        )
-        .await;
+        let (result, prompts) =
+            drive_script(vec![list; READS_PER_TURN + 2], Uuid::new_v4(), HashMap::new()).await;
         assert!(result.unwrap_err().contains("budget"));
         assert_eq!(prompts.len(), READS_PER_TURN + 2);
     }
@@ -1507,32 +1303,17 @@ mod tests {
         let mut big = task(project, &"t".repeat(300), TaskStatus::Error, 0);
         big.description = Some("d".repeat(DESCRIPTION_CHARS + 500));
         big.error_message = Some("e".repeat(ERROR_CHARS + 10));
-        let dependencies: Vec<Task> = (0..25)
-            .map(|n| task(project, &"x".repeat(300), TaskStatus::Done, n))
-            .collect();
+        let dependencies: Vec<Task> = (0..25).map(|n| task(project, &"x".repeat(300), TaskStatus::Done, n)).collect();
         big.dependencies = dependencies.iter().map(|dep| dep.id).collect();
         big.subtasks = (0..25)
-            .map(|n| crate::domain::Subtask {
-                id: Uuid::new_v4(),
-                title: "s".repeat(300),
-                completed: n % 2 == 0,
-            })
+            .map(|n| crate::domain::Subtask { id: Uuid::new_v4(), title: "s".repeat(300), completed: n % 2 == 0 })
             .collect();
         let id = big.id;
         let mut all = dependencies;
         all.push(big);
         let result = read(&inspect(id), project, &store(all)).unwrap();
-        assert!(
-            chars_of(&result) <= PER_READ_CAP_CHARS,
-            "{}",
-            chars_of(&result)
-        );
-        assert!(
-            result["result_truncated"]["original_chars"]
-                .as_u64()
-                .unwrap()
-                > PER_READ_CAP_CHARS as u64
-        );
+        assert!(chars_of(&result) <= PER_READ_CAP_CHARS, "{}", chars_of(&result));
+        assert!(result["result_truncated"]["original_chars"].as_u64().unwrap() > PER_READ_CAP_CHARS as u64);
         assert_eq!(result["outcome"], "found");
         assert_eq!(result["task"]["subtasks_total"], 25);
     }
@@ -1540,23 +1321,8 @@ mod tests {
     #[test]
     fn a_maximum_list_page_is_shortened_and_still_points_at_the_next_page() {
         let project = Uuid::new_v4();
-        let tasks = store(
-            (0..30)
-                .map(|n| {
-                    task(
-                        project,
-                        &"t".repeat(TITLE_CHARS + 50),
-                        TaskStatus::Backlog,
-                        n,
-                    )
-                })
-                .collect(),
-        );
-        let list = CoordinatorOutput::ListTasks {
-            status: None,
-            limit: Some(20),
-            offset: Some(2),
-        };
+        let tasks = store((0..30).map(|n| task(project, &"t".repeat(TITLE_CHARS + 50), TaskStatus::Backlog, n)).collect());
+        let list = CoordinatorOutput::ListTasks { status: None, limit: Some(20), offset: Some(2) };
         let result = read(&list, project, &tasks).unwrap();
         assert!(chars_of(&result) <= PER_READ_CAP_CHARS);
         let returned = result["returned"].as_u64().unwrap();
@@ -1571,9 +1337,7 @@ mod tests {
         let project = Uuid::new_v4();
         let tasks = store(vec![task(project, "A", TaskStatus::Backlog, 0)]);
         let result = read(&CoordinatorOutput::InspectProject {}, project, &tasks).unwrap();
-        assert!(
-            result.get("result_truncated").is_none() && chars_of(&result) <= PER_READ_CAP_CHARS
-        );
+        assert!(result.get("result_truncated").is_none() && chars_of(&result) <= PER_READ_CAP_CHARS);
         let missing = read(&inspect(Uuid::new_v4()), project, &tasks).unwrap();
         assert_eq!(missing["outcome"], "not_found");
     }
@@ -1605,25 +1369,15 @@ mod tests {
 
     #[test]
     fn a_result_that_cannot_shrink_is_replaced_by_a_valid_notice() {
-        let capped = cap_read(
-            json!({"outcome": "unknown", "blob": "z".repeat(10_000)}),
-            PER_READ_CAP_CHARS,
-        );
+        let capped = cap_read(json!({"outcome": "unknown", "blob": "z".repeat(10_000)}), PER_READ_CAP_CHARS);
         assert_eq!(capped["outcome"], "too_large");
         assert!(chars_of(&capped) <= PER_READ_CAP_CHARS);
-        assert!(
-            capped["result_truncated"]["original_chars"]
-                .as_u64()
-                .unwrap()
-                > 10_000
-        );
+        assert!(capped["result_truncated"]["original_chars"].as_u64().unwrap() > 10_000);
     }
 
     #[test]
     fn the_read_reserve_covers_three_capped_results_and_the_worst_envelope() {
-        let results: Vec<Value> = (0..READS_PER_TURN)
-            .map(|_| json!("x".repeat(PER_READ_CAP_CHARS - 2)))
-            .collect();
+        let results: Vec<Value> = (0..READS_PER_TURN).map(|_| json!("x".repeat(PER_READ_CAP_CHARS - 2))).collect();
         let evidence = Value::Array(results).to_string();
         let refused = followup_prompt("", &availability_notice(READS_PER_TURN, true), &evidence);
         assert!(chars_of_str(&refused) <= read_reserve_chars(PER_READ_CAP_CHARS));
@@ -1640,23 +1394,14 @@ mod tests {
         let big = "x".repeat(500);
         let result = drive(
             "BASE",
-            PromptLimits {
-                max_chars: 400,
-                other_fixed_chars: 0,
-            },
+            PromptLimits { max_chars: 400, other_fixed_chars: 0 },
             move |_prompt, _guard: Option<()>| {
                 *count.lock().unwrap() += 1;
                 async move { Ok((Ok(r#"{"type":"inspect_project"}"#.to_owned()), ())) }
             },
             |output| {
                 let big = big.clone();
-                async move {
-                    if matches!(output, CoordinatorOutput::InspectProject {}) {
-                        Ok(json!(big))
-                    } else {
-                        Err(output)
-                    }
-                }
+                async move { if matches!(output, CoordinatorOutput::InspectProject {}) { Ok(json!(big)) } else { Err(output) } }
             },
         )
         .await;

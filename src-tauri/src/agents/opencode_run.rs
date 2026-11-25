@@ -109,15 +109,9 @@ pub const OPENCODE_POLICY_CONTENT: &str = r#"{"permissions":[{"action":"*","reso
 /// Workspace instruction file.
 pub fn policy_env(config_dir: &str, instructions: Option<&str>) -> Vec<(String, String)> {
     vec![
-        (
-            "OPENCODE_DISABLE_PROJECT_CONFIG".to_string(),
-            "1".to_string(),
-        ),
+        ("OPENCODE_DISABLE_PROJECT_CONFIG".to_string(), "1".to_string()),
         ("OPENCODE_CONFIG_DIR".to_string(), config_dir.to_string()),
-        (
-            "OPENCODE_CONFIG_CONTENT".to_string(),
-            policy_config_content(instructions),
-        ),
+        ("OPENCODE_CONFIG_CONTENT".to_string(), policy_config_content(instructions)),
     ]
 }
 
@@ -129,9 +123,7 @@ fn policy_config_content(instructions: Option<&str>) -> String {
         return OPENCODE_POLICY_CONTENT.to_string();
     };
     // The constant is a JSON object, so its first byte is the opening brace.
-    let rest = OPENCODE_POLICY_CONTENT
-        .strip_prefix('{')
-        .unwrap_or(OPENCODE_POLICY_CONTENT);
+    let rest = OPENCODE_POLICY_CONTENT.strip_prefix('{').unwrap_or(OPENCODE_POLICY_CONTENT);
     let path = serde_json::Value::String(path.to_string());
     format!(r#"{{"instructions":[{path}],{rest}"#)
 }
@@ -144,9 +136,8 @@ const INSTRUCTIONS_FILE: &str = "slashit-workspace-instructions.md";
 /// takes a path, not text. Returns the file's path.
 pub fn write_instructions(config_dir: &std::path::Path, text: &str) -> Result<String, String> {
     let path = config_dir.join(INSTRUCTIONS_FILE);
-    std::fs::write(&path, text).map_err(|e| {
-        format!("The Workspace instructions could not be written for this run: {e}")
-    })?;
+    std::fs::write(&path, text)
+        .map_err(|e| format!("The Workspace instructions could not be written for this run: {e}"))?;
     path.to_str()
         .map(str::to_string)
         .ok_or_else(|| "The Workspace instructions path is not UTF-8".to_string())
@@ -307,9 +298,7 @@ impl OpenCodeRunner {
         let config_dir = tempfile::Builder::new()
             .prefix("slashit-opencode-config-")
             .tempdir()
-            .map_err(|e| {
-                format!("The OpenCode configuration directory could not be created: {e}")
-            })?;
+            .map_err(|e| format!("The OpenCode configuration directory could not be created: {e}"))?;
         let config_path = config_dir
             .path()
             .to_str()
@@ -380,18 +369,12 @@ impl OpenCodeRunner {
     /// order. A refusal does not end the run: OpenCode may still finish the
     /// Task another way, so the caller decides what the refusals mean.
     pub fn refused_permissions(&self) -> Vec<String> {
-        self.refusals
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
+        self.refusals.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Subscribe to the run's events. See [`CodingRunEvent`].
     pub fn subscribe(&self) -> broadcast::Receiver<CodingRunEvent> {
-        let mut first = self
-            .first_subscriber
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut first = self.first_subscriber.lock().unwrap_or_else(|p| p.into_inner());
         first.take().unwrap_or_else(|| self.events.subscribe())
     }
 
@@ -416,9 +399,9 @@ impl OpenCodeRunner {
                 let ended = self.connection.shutdown(EXIT_GRACE).await;
                 let result = match (result, ended) {
                     (result, Ok(_)) => result,
-                    (Ok(()), Err(e)) => Err(format!(
-                        "the OpenCode process could not be confirmed ended: {e}"
-                    )),
+                    (Ok(()), Err(e)) => {
+                        Err(format!("the OpenCode process could not be confirmed ended: {e}"))
+                    }
                     (Err(turn), Err(e)) => Err(format!(
                         "{turn}; the OpenCode process could not be confirmed ended: {e}"
                     )),
@@ -438,9 +421,7 @@ impl OpenCodeRunner {
                         });
                     }
                     Err(message) => {
-                        let _ = self.events.send(CodingRunEvent::Error {
-                            message: message.clone(),
-                        });
+                        let _ = self.events.send(CodingRunEvent::Error { message: message.clone() });
                     }
                 }
                 result
@@ -486,11 +467,7 @@ impl Drop for OpenCodeRunner {
 
 /// Runs the single prompt turn and reports how it ended. The terminal event is
 /// sent by `wait`, once the event reader has delivered the turn's updates.
-async fn run_turn(
-    connection: Connection,
-    session: SessionRef,
-    prompt: String,
-) -> Result<(), String> {
+async fn run_turn(connection: Connection, session: SessionRef, prompt: String) -> Result<(), String> {
     match connection.prompt(&session, &prompt, TURN_TIMEOUT).await {
         Ok(turn) if turn.stop_reason == StopReason::EndTurn => Ok(()),
         Ok(turn) => Err(format!(
@@ -605,25 +582,16 @@ mod tests {
         ]
         .map(|(name, value)| (OsString::from(name), OsString::from(value)));
         let env: std::collections::HashMap<String, String> =
-            opencode_spawn_env(parent, "/run/slashit-config", None)
-                .into_iter()
-                .collect();
+            opencode_spawn_env(parent, "/run/slashit-config", None).into_iter().collect();
 
         assert_eq!(env.get("HOME").map(String::as_str), Some("/home/worker"));
-        assert_eq!(
-            env.get("OPENCODE_DISABLE_PROJECT_CONFIG")
-                .map(String::as_str),
-            Some("1")
-        );
+        assert_eq!(env.get("OPENCODE_DISABLE_PROJECT_CONFIG").map(String::as_str), Some("1"));
         assert_eq!(
             env.get("OPENCODE_CONFIG_DIR").map(String::as_str),
             Some("/run/slashit-config"),
             "the user's global configuration directory is replaced by the run's own"
         );
-        assert!(
-            !env.contains_key("OPENCODE_CONFIG"),
-            "the user's config file is not passed"
-        );
+        assert!(!env.contains_key("OPENCODE_CONFIG"), "the user's config file is not passed");
         assert_eq!(env["OPENCODE_CONFIG_CONTENT"], OPENCODE_POLICY_CONTENT);
     }
 
@@ -658,18 +626,14 @@ mod tests {
     #[test]
     fn the_policy_denies_by_default_and_allows_only_checkout_reads_edits_and_shell() {
         let rules = |policy: &str| -> Vec<(String, String)> {
-            let value: serde_json::Value =
-                serde_json::from_str(policy).expect("the policy is JSON");
+            let value: serde_json::Value = serde_json::from_str(policy).expect("the policy is JSON");
             value["permissions"]
                 .as_array()
                 .expect("a permissions array")
                 .iter()
                 .map(|rule| {
                     assert_eq!(rule["resource"], "*", "every rule matches all resources");
-                    (
-                        rule["action"].as_str().unwrap().to_string(),
-                        rule["effect"].as_str().unwrap().to_string(),
-                    )
+                    (rule["action"].as_str().unwrap().to_string(), rule["effect"].as_str().unwrap().to_string())
                 })
                 .collect()
         };
@@ -751,15 +715,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_run_streams_its_text_and_tool_activity_and_ends_with_end_turn() {
-        let run = OpenCodeRunner::start(fixture("ok"), None)
-            .await
-            .expect("start");
+        let run = OpenCodeRunner::start(fixture("ok"), None).await.expect("start");
         let mut events = run.subscribe();
         assert_eq!(run.wait().await, Ok(true));
         let seen = sent(&mut events);
-        assert!(seen
-            .iter()
-            .any(|e| matches!(e, CodingRunEvent::SystemInit { .. })));
+        assert!(seen.iter().any(|e| matches!(e, CodingRunEvent::SystemInit { .. })));
         assert!(seen
             .iter()
             .any(|e| matches!(e, CodingRunEvent::TextDelta { text } if text == "hello")));
@@ -767,13 +727,9 @@ mod tests {
             e,
             CodingRunEvent::ToolUse { tool, .. } if tool == "read file"
         )));
-        assert!(seen.iter().any(|e| matches!(
-            e,
-            CodingRunEvent::Result {
-                is_error: false,
-                ..
-            }
-        )));
+        assert!(seen
+            .iter()
+            .any(|e| matches!(e, CodingRunEvent::Result { is_error: false, .. })));
         // Thoughts are not the answer, so they are not in the output.
         assert_eq!(run.get_output().await, "hello");
         assert_eq!(run.final_result_text().await.as_deref(), Ok("hello"));
@@ -792,18 +748,9 @@ mod tests {
         assert_eq!(run.wait().await, Ok(true));
         let output = run.get_output().await;
 
-        assert!(
-            output.contains("slashit-workspace-instructions.md"),
-            "{output}"
-        );
-        assert!(
-            output.contains("instructions-text=### CLAUDE.md\n\nShared rule."),
-            "{output}"
-        );
-        assert!(
-            output.contains(r#""action":"external_directory","resource":"*","effect":"deny""#),
-            "{output}"
-        );
+        assert!(output.contains("slashit-workspace-instructions.md"), "{output}");
+        assert!(output.contains("instructions-text=### CLAUDE.md\n\nShared rule."), "{output}");
+        assert!(output.contains(r#""action":"external_directory","resource":"*","effect":"deny""#), "{output}");
         assert!(!output.contains("instructions-missing"), "{output}");
     }
 
@@ -811,21 +758,13 @@ mod tests {
     /// the policy only, and no instruction file.
     #[tokio::test]
     async fn a_run_without_workspace_instructions_is_configured_as_before() {
-        let run = OpenCodeRunner::start(fixture("config-echo"), None)
-            .await
-            .expect("start");
+        let run = OpenCodeRunner::start(fixture("config-echo"), None).await.expect("start");
         assert_eq!(run.wait().await, Ok(true));
         let output = run.get_output().await;
 
         assert!(output.contains("instructions-none"), "{output}");
-        assert!(
-            !output.contains("slashit-workspace-instructions.md"),
-            "{output}"
-        );
-        assert!(
-            output.contains(OPENCODE_POLICY_CONTENT),
-            "the policy is the same as before: {output}"
-        );
+        assert!(!output.contains("slashit-workspace-instructions.md"), "{output}");
+        assert!(output.contains(OPENCODE_POLICY_CONTENT), "the policy is the same as before: {output}");
     }
 
     #[tokio::test]
@@ -887,19 +826,13 @@ mod tests {
         let seen = sent(&mut events);
         // The fake agent echoes the outcome it received.
         let output = run.get_output().await;
-        assert!(
-            output.contains("perm-outcome=selected:reject-once"),
-            "{output}"
-        );
+        assert!(output.contains("perm-outcome=selected:reject-once"), "{output}");
         assert!(!output.contains("allow-once"), "{output}");
         assert!(seen.iter().any(|e| matches!(
             e,
             CodingRunEvent::Error { message } if message.contains("refused")
         )));
-        assert_eq!(
-            run.refused_permissions(),
-            vec!["tool call tc-1".to_string()]
-        );
+        assert_eq!(run.refused_permissions(), vec!["tool call tc-1".to_string()]);
     }
 
     #[tokio::test]
@@ -911,10 +844,7 @@ mod tests {
         config.working_dir = dir.path().to_path_buf();
         let run = OpenCodeRunner::start(config, None).await.expect("start");
         assert_eq!(run.wait().await, Ok(true));
-        assert_eq!(
-            run.refused_permissions(),
-            vec!["tool call tc-1".to_string()]
-        );
+        assert_eq!(run.refused_permissions(), vec!["tool call tc-1".to_string()]);
         assert!(dir.path().join("permitted-change.txt").exists());
     }
 
@@ -1105,18 +1035,14 @@ mod tests {
         // the kill was requested, so the agent is still running and its
         // configuration is in place.
         assert!(crate::agents::provider_lease::prove_absent(&lease_path).is_err());
-        assert!(
-            config.is_dir(),
-            "the configuration was removed while the agent ran"
-        );
+        assert!(config.is_dir(), "the configuration was removed while the agent ran");
         eventually("the dropped run's agent did not end", || {
             crate::agents::provider_lease::prove_absent(&lease_path).is_ok()
         })
         .await;
-        eventually(
-            "the configuration was not removed after its agent ended",
-            || !config.exists(),
-        )
+        eventually("the configuration was not removed after its agent ended", || {
+            !config.exists()
+        })
         .await;
     }
 
@@ -1132,10 +1058,7 @@ mod tests {
         assert_eq!(run.wait().await, Ok(true));
         crate::agents::provider_lease::prove_absent(&lease_path)
             .expect("the agent has ended once its run has");
-        eventually("the finished run's configuration was not removed", || {
-            !config.exists()
-        })
-        .await;
+        eventually("the finished run's configuration was not removed", || !config.exists()).await;
     }
 
     #[cfg(unix)]
@@ -1151,10 +1074,7 @@ mod tests {
         let _ = run.kill().await;
         crate::agents::provider_lease::prove_absent(&lease_path)
             .expect("kill returned while the agent was still running");
-        eventually("the cancelled run's configuration was not removed", || {
-            !config.exists()
-        })
-        .await;
+        eventually("the cancelled run's configuration was not removed", || !config.exists()).await;
         let _ = run.wait().await;
     }
 

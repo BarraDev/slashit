@@ -85,18 +85,10 @@ mod tests {
         let generated = super::super::WorktreeManager::branch_for_task(Uuid::new_v4());
         assert!(looks_like_task_branch(&generated));
         assert!(looks_like_task_branch("task-c0ffee11"));
-        for other in [
-            "task-login-page",
-            "task-c0ffee1",
-            "task-",
-            "main-task-c0ffee11",
-            "trunk",
-        ] {
+        for other in ["task-login-page", "task-c0ffee1", "task-", "main-task-c0ffee11", "trunk"] {
             assert!(!looks_like_task_branch(other), "{other}");
         }
-        assert!(checked_base_branch("-x")
-            .unwrap_err()
-            .contains("project's base branch"));
+        assert!(checked_base_branch("-x").unwrap_err().contains("project's base branch"));
     }
 
     #[test]
@@ -115,45 +107,12 @@ mod tests {
     #[test]
     fn checked_task_branch_refuses_options_revsets_globs_and_invalid_refs() {
         for branch in [
-            "",
-            "--mirror",
-            "-f",
-            "--receive-pack=touch x",
-            "mutable()",
-            "a|b",
-            "glob:*",
-            "exact:main",
-            "task*",
-            "task?",
-            "a b",
-            "a\nb",
-            "a\"b",
-            "a\\b",
-            "a~1",
-            "a^",
-            "a@{1}",
-            "a..b",
-            "a//b",
-            "/a",
-            "a/",
-            ".a",
-            "a/.b",
-            "a.lock",
-            "a.lock/b",
-            "a.",
-            "HEAD",
-            "tâsk",
-            "-Bvictim",
-            "-m",
-            "HEAD~1",
-            "HEAD^",
-            "@{-1}",
-            "main:path",
+            "", "--mirror", "-f", "--receive-pack=touch x", "mutable()", "a|b", "glob:*",
+            "exact:main", "task*", "task?", "a b", "a\nb", "a\"b", "a\\b", "a~1", "a^",
+            "a@{1}", "a..b", "a//b", "/a", "a/", ".a", "a/.b", "a.lock", "a.lock/b", "a.",
+            "HEAD", "tâsk", "-Bvictim", "-m", "HEAD~1", "HEAD^", "@{-1}", "main:path",
         ] {
-            assert!(
-                checked_task_branch(branch).is_err(),
-                "{branch:?} must be refused"
-            );
+            assert!(checked_task_branch(branch).is_err(), "{branch:?} must be refused");
         }
     }
 }

@@ -24,11 +24,7 @@ use super::runner::{ClaudeRunConfig, ClaudeRunner, LaunchError};
 pub enum CodingRunEvent {
     /// Session initialized
     #[serde(rename = "system_init")]
-    SystemInit {
-        session_id: String,
-        model: Option<String>,
-        message: Option<String>,
-    },
+    SystemInit { session_id: String, model: Option<String>, message: Option<String> },
     /// A provider system event that is not a session start (a status report, a
     /// notice between turns): it stays observable on the stream, but it is not
     /// an initialization and it claims no model — there is no model field to
@@ -41,20 +37,13 @@ pub enum CodingRunEvent {
     TextDelta { text: String },
     /// Agent is using a tool
     #[serde(rename = "tool_use")]
-    ToolUse {
-        tool: String,
-        input: Option<serde_json::Value>,
-    },
+    ToolUse { tool: String, input: Option<serde_json::Value> },
     /// Full assistant message received
     #[serde(rename = "assistant_message")]
     AssistantMessage { content: serde_json::Value },
     /// Final result
     #[serde(rename = "result")]
-    Result {
-        session_id: String,
-        text: String,
-        is_error: bool,
-    },
+    Result { session_id: String, text: String, is_error: bool },
     /// Error during execution
     #[serde(rename = "error")]
     Error { message: String },
@@ -76,9 +65,7 @@ impl CodingRunner {
         config: ClaudeRunConfig,
         lease: Option<ProviderLease>,
     ) -> Result<Self, LaunchError> {
-        ClaudeRunner::start_leased(config, lease)
-            .await
-            .map(Self::Claude)
+        ClaudeRunner::start_leased(config, lease).await.map(Self::Claude)
     }
 
     /// Start an OpenCode run over ACP. See [`OpenCodeRunner::start`].
@@ -86,9 +73,7 @@ impl CodingRunner {
         config: OpenCodeRunConfig,
         lease: Option<ProviderLease>,
     ) -> Result<Self, String> {
-        OpenCodeRunner::start(config, lease)
-            .await
-            .map(Self::OpenCode)
+        OpenCodeRunner::start(config, lease).await.map(Self::OpenCode)
     }
 
     /// Subscribe to the run's events. See [`ClaudeRunner::subscribe`].
@@ -178,32 +163,21 @@ mod tests {
                 serde_json::json!({ "type": "text_delta", "text": "hi" }),
             ),
             (
-                CodingRunEvent::ToolUse {
-                    tool: "Bash".into(),
-                    input: None,
-                },
+                CodingRunEvent::ToolUse { tool: "Bash".into(), input: None },
                 serde_json::json!({ "type": "tool_use", "tool": "Bash", "input": null }),
             ),
             (
-                CodingRunEvent::AssistantMessage {
-                    content: serde_json::json!([]),
-                },
+                CodingRunEvent::AssistantMessage { content: serde_json::json!([]) },
                 serde_json::json!({ "type": "assistant_message", "content": [] }),
             ),
             (
-                CodingRunEvent::Result {
-                    session_id: "s".into(),
-                    text: "t".into(),
-                    is_error: false,
-                },
+                CodingRunEvent::Result { session_id: "s".into(), text: "t".into(), is_error: false },
                 serde_json::json!({
                     "type": "result", "session_id": "s", "text": "t", "is_error": false
                 }),
             ),
             (
-                CodingRunEvent::Error {
-                    message: "boom".into(),
-                },
+                CodingRunEvent::Error { message: "boom".into() },
                 serde_json::json!({ "type": "error", "message": "boom" }),
             ),
         ];

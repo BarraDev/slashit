@@ -81,14 +81,12 @@ pub async fn dispatch(req: IpcRequest, ctx: &IpcContext, peer: &PeerContext) -> 
         IpcRequest::SetTaskModel { task_id, model } => {
             Dispatch::reply(handle_set_task_model(ctx, task_id, model).await)
         }
-        IpcRequest::SetTaskReviewMode {
-            task_id,
-            review_mode,
-        } => Dispatch::reply(handle_set_task_review_mode(ctx, task_id, review_mode).await),
-        IpcRequest::SetTaskDependencies {
-            task_id,
-            dependencies,
-        } => Dispatch::reply(handle_set_task_dependencies(ctx, task_id, dependencies).await),
+        IpcRequest::SetTaskReviewMode { task_id, review_mode } => {
+            Dispatch::reply(handle_set_task_review_mode(ctx, task_id, review_mode).await)
+        }
+        IpcRequest::SetTaskDependencies { task_id, dependencies } => {
+            Dispatch::reply(handle_set_task_dependencies(ctx, task_id, dependencies).await)
+        }
         IpcRequest::DeleteTask { task_id } => {
             Dispatch::reply(handle_delete_task(ctx, task_id).await)
         }
@@ -1212,23 +1210,11 @@ async fn handle_move_task(ctx: &IpcContext, task_id: String, status: String) -> 
     if matches!(new_status, crate::domain::TaskStatus::Done) {
         // Taken under the lease, and decided on the status read under it, as the
         // desktop's close is, so the refusal comes before terminalization begins.
-        let _lease = match crate::commands::project::lease_active_task_in(
-            &ctx.task_lifecycle_locks,
-            &ctx.tasks,
-            &ctx.projects,
-            task_uuid,
-        )
-        .await
-        {
+        let _lease = match crate::commands::project::lease_active_task_in(&ctx.task_lifecycle_locks, &ctx.tasks, &ctx.projects, task_uuid).await {
             Ok(lease) => lease,
             Err(e) => return IpcResponse::error(e),
         };
-        let current = ctx
-            .tasks
-            .read()
-            .await
-            .get(&task_uuid)
-            .map(|t| t.status.clone());
+        let current = ctx.tasks.read().await.get(&task_uuid).map(|t| t.status.clone());
         if current == Some(crate::domain::TaskStatus::HumanReview) {
             return IpcResponse::error(CLI_FROM_HUMAN_REVIEW_REFUSAL.to_string());
         }
@@ -1256,42 +1242,34 @@ async fn handle_move_task(ctx: &IpcContext, task_id: String, status: String) -> 
         };
     }
 
-    let _lease = match crate::commands::project::lease_active_task_in(
-        &ctx.task_lifecycle_locks,
-        &ctx.tasks,
-        &ctx.projects,
-        task_uuid,
-    )
-    .await
-    {
+    let _lease = match crate::commands::project::lease_active_task_in(&ctx.task_lifecycle_locks, &ctx.tasks, &ctx.projects, task_uuid).await {
         Ok(lease) => lease,
         Err(e) => return IpcResponse::error(e),
     };
 
-    let (old_status, unfinished_integration, queue_refusal, repeated_queue) =
-        match ctx.tasks.read().await.get(&task_uuid).map(|t| {
+    let (old_status, unfinished_integration, queue_refusal, repeated_queue) = match ctx
+        .tasks
+        .read()
+        .await
+        .get(&task_uuid)
+        .map(|t| {
             (
                 t.status.clone(),
                 t.integration_unfinished_refusal(),
                 crate::lifecycle::queue_move_refusal(t, &new_status),
                 crate::lifecycle::is_repeated_queue_move(t, &new_status),
             )
-        }) {
-            Some(found) => found,
-            None => return IpcResponse::error(format!("Task {task_id} not found")),
-        };
+        })
+    {
+        Some(found) => found,
+        None => return IpcResponse::error(format!("Task {task_id} not found")),
+    };
     // A removed Project's Tasks do not enter Queue, from the CLI either. Read
     // under the lease held above.
     let queue_refusal = match queue_refusal {
         Some(refusal) => Some(refusal),
         None => {
-            crate::lifecycle::removed_project_queue_refusal(
-                &ctx.tasks,
-                &ctx.projects,
-                task_uuid,
-                &new_status,
-            )
-            .await
+            crate::lifecycle::removed_project_queue_refusal(&ctx.tasks, &ctx.projects, task_uuid, &new_status).await
         }
     };
 
@@ -1371,24 +1349,19 @@ async fn handle_move_task(ctx: &IpcContext, task_id: String, status: String) -> 
         let Some(executor) = ctx.executor.get() else {
             return IpcResponse::error(crate::commands::queue::NO_EXECUTOR_PROMOTION.to_string());
         };
-        let record_move =
-            move |staged: &mut std::collections::HashMap<Uuid, crate::domain::Task>,
-                  promoted_id: Uuid| {
-                if let Some(task) = staged.get_mut(&promoted_id) {
-                    task.record_move(&crate::domain::TaskStatus::Queue);
-                }
-            };
+        let record_move = move |staged: &mut std::collections::HashMap<Uuid, crate::domain::Task>,
+                                promoted_id: Uuid| {
+            if let Some(task) = staged.get_mut(&promoted_id) {
+                task.record_move(&crate::domain::TaskStatus::Queue);
+            }
+        };
         return match executor
             .promote_queued(crate::queue::PromotionChoice::Exact(task_uuid), record_move)
             .await
         {
-            Ok(crate::queue::PromotionOutcome::Promoted(task)) => {
-                task_summary_reply(ctx, &task).await
-            }
+            Ok(crate::queue::PromotionOutcome::Promoted(task)) => task_summary_reply(ctx, &task).await,
             Ok(refused) => IpcResponse::error(
-                executor
-                    .queued_promotion_refusal(Some(task_uuid), &refused)
-                    .await,
+                executor.queued_promotion_refusal(Some(task_uuid), &refused).await,
             ),
             Err(e) => IpcResponse::error(e),
         };
@@ -1869,14 +1842,8 @@ pub(super) mod tests {
         // A bare `origin` whose `HEAD` is recorded locally, so that the task
         // checkout has a default base to start from.
         let origin = tmp.join("origin.git");
-        git(
-            &repo_dir,
-            &["init", "-q", "--bare", origin.to_str().unwrap()],
-        );
-        git(
-            &repo_dir,
-            &["remote", "add", "origin", origin.to_str().unwrap()],
-        );
+        git(&repo_dir, &["init", "-q", "--bare", origin.to_str().unwrap()]);
+        git(&repo_dir, &["remote", "add", "origin", origin.to_str().unwrap()]);
         git(&repo_dir, &["push", "-q", "origin", "main"]);
         git(&repo_dir, &["remote", "set-head", "origin", "main"]);
         let repo_path = repo_dir.to_string_lossy().to_string();
@@ -2082,10 +2049,7 @@ pub(super) mod tests {
             crate::domain::TaskPhase::Idle,
             "a stale Failed phase must not survive a move out of Error"
         );
-        assert!(
-            updated.error_message.is_none(),
-            "the old failure must not linger"
-        );
+        assert!(updated.error_message.is_none(), "the old failure must not linger");
         assert!(
             updated.is_ready_to_execute(),
             "the production readiness predicate must agree this task can run"
@@ -2136,18 +2100,11 @@ pub(super) mod tests {
         task.record_activity(crate::domain::task::ActivityKind::CompletedLocally {});
         let task_id = task.id;
         ctx.tasks.write().await.insert(task_id, task.clone());
-        ctx.storage
-            .save_project_tasks(project_id, &[task.clone()])
-            .expect("seed the board");
+        ctx.storage.save_project_tasks(project_id, &[task.clone()]).expect("seed the board");
 
-        let mut requests = vec![IpcRequest::EnqueueTask {
-            task_id: task_id.to_string(),
-        }];
+        let mut requests = vec![IpcRequest::EnqueueTask { task_id: task_id.to_string() }];
         for status in ["backlog", "queue", "in_progress", "done"] {
-            requests.push(IpcRequest::MoveTask {
-                task_id: task_id.to_string(),
-                status: status.to_string(),
-            });
+            requests.push(IpcRequest::MoveTask { task_id: task_id.to_string(), status: status.to_string() });
         }
         for request in requests {
             let label = format!("{request:?}");
@@ -2164,22 +2121,9 @@ pub(super) mod tests {
                 "{label}: the board is unchanged"
             );
             assert_eq!(board.local_integration, task.local_integration, "{label}");
-            let persisted = ctx
-                .storage
-                .load_project_tasks(project_id)
-                .expect("read back");
-            assert_eq!(
-                persisted[0].status,
-                TaskStatus::Done,
-                "{label}: the file is unchanged"
-            );
-            assert!(
-                persisted[0]
-                    .local_integration
-                    .as_ref()
-                    .is_some_and(|r| r.is_pending()),
-                "{label}"
-            );
+            let persisted = ctx.storage.load_project_tasks(project_id).expect("read back");
+            assert_eq!(persisted[0].status, TaskStatus::Done, "{label}: the file is unchanged");
+            assert!(persisted[0].local_integration.as_ref().is_some_and(|r| r.is_pending()), "{label}");
         }
     }
 
@@ -2313,14 +2257,12 @@ pub(super) mod tests {
             with_repo_id,
             mk_project(with_repo_id, "has-a-repo", Some(repository_id)),
         );
-        ctx.projects.write().await.insert(
-            without_repo_id,
-            mk_project(without_repo_id, "standalone", None),
-        );
-
-        let answer = dispatch(IpcRequest::ListProjects, &ctx, &peer())
+        ctx.projects
+            .write()
             .await
-            .response;
+            .insert(without_repo_id, mk_project(without_repo_id, "standalone", None));
+
+        let answer = dispatch(IpcRequest::ListProjects, &ctx, &peer()).await.response;
         assert!(answer.ok, "{answer:?}");
         let summaries: Vec<slashit_ipc::ProjectSummary> =
             serde_json::from_value(answer.data).expect("valid summaries");
@@ -2390,10 +2332,7 @@ mod human_review_close {
 
     async fn move_to(ctx: &IpcContext, task_id: Uuid, status: &str) -> IpcResponse {
         dispatch(
-            IpcRequest::MoveTask {
-                task_id: task_id.to_string(),
-                status: status.to_string(),
-            },
+            IpcRequest::MoveTask { task_id: task_id.to_string(), status: status.to_string() },
             ctx,
             &peer(),
         )
@@ -2411,19 +2350,13 @@ mod human_review_close {
         let first = move_to(&ctx, task_id, "done").await;
         let second = move_to(&ctx, task_id, "done").await;
 
-        assert!(
-            !first.ok,
-            "a Task in Human Review must not be closed from the CLI: {first:?}"
-        );
+        assert!(!first.ok, "a Task in Human Review must not be closed from the CLI: {first:?}");
         let message = first.error.clone().unwrap_or_default();
         assert!(
             message.contains("Human Review") && message.contains("application"),
             "the refusal must say the decision is made in the application: {message}"
         );
-        assert_eq!(
-            second.error, first.error,
-            "a repeated request gives the same refusal"
-        );
+        assert_eq!(second.error, first.error, "a repeated request gives the same refusal");
 
         let in_memory = ctx.tasks.read().await.get(&task_id).cloned().unwrap();
         assert_eq!(in_memory.status, TaskStatus::HumanReview);
@@ -2458,10 +2391,7 @@ mod human_review_close {
             );
         }
 
-        assert_eq!(
-            serde_json::to_value(ctx.tasks.read().await.get(&task_id).cloned().unwrap()).unwrap(),
-            before
-        );
+        assert_eq!(serde_json::to_value(ctx.tasks.read().await.get(&task_id).cloned().unwrap()).unwrap(), before);
         let on_disk = ctx
             .storage
             .load_project_tasks(project_id)
@@ -2479,28 +2409,16 @@ mod human_review_close {
         let (_tmp, ctx) = test_ctx().await;
         let project_id = Uuid::new_v4();
         let mut task = create_test_task_full("under test", project_id, TaskStatus::HumanReview, 0);
-        task.human_review
-            .approve(Some("a".repeat(40)), chrono::Utc::now());
+        task.human_review.approve(Some("a".repeat(40)), chrono::Utc::now());
         let task_id = task.id;
         ctx.tasks.write().await.insert(task_id, task.clone());
-        ctx.storage
-            .save_project_tasks(project_id, &[task])
-            .expect("seed the board");
+        ctx.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
 
-        let answer = dispatch(
-            IpcRequest::EnqueueTask {
-                task_id: task_id.to_string(),
-            },
-            &ctx,
-            &peer(),
-        )
-        .await
-        .response;
+        let answer = dispatch(IpcRequest::EnqueueTask { task_id: task_id.to_string() }, &ctx, &peer())
+            .await
+            .response;
 
-        assert!(
-            !answer.ok,
-            "a Human Review task must not be queued from the CLI: {answer:?}"
-        );
+        assert!(!answer.ok, "a Human Review task must not be queued from the CLI: {answer:?}");
         let in_memory = ctx.tasks.read().await.get(&task_id).cloned().unwrap();
         assert_eq!(in_memory.status, TaskStatus::HumanReview);
         assert!(in_memory.human_review.is_approved(), "the approval is kept");
@@ -2523,10 +2441,7 @@ mod human_review_close {
         let answer = move_to(&ctx, task_id, "done").await;
 
         assert!(answer.ok, "{answer:?}");
-        assert_eq!(
-            ctx.tasks.read().await.get(&task_id).unwrap().status,
-            TaskStatus::Done
-        );
+        assert_eq!(ctx.tasks.read().await.get(&task_id).unwrap().status, TaskStatus::Done);
     }
 }
 
@@ -2579,15 +2494,10 @@ mod lifecycle_ownership {
         let (_tmp, ctx) = test_ctx().await;
         let executor = attach_test_executor_ipc(&ctx).await;
         let task_id = seed(&ctx, TaskStatus::InProgress).await;
-        let cleaned_up = executor
-            .register_fake_running_execution_for_test(task_id)
-            .await;
+        let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
 
         let answer = dispatch(
-            IpcRequest::MoveTask {
-                task_id: task_id.to_string(),
-                status: "backlog".to_string(),
-            },
+            IpcRequest::MoveTask { task_id: task_id.to_string(), status: "backlog".to_string() },
             &ctx,
             &peer(),
         )
@@ -2608,15 +2518,10 @@ mod lifecycle_ownership {
         let (_tmp, ctx) = test_ctx().await;
         let executor = attach_test_executor_ipc(&ctx).await;
         let task_id = seed(&ctx, TaskStatus::AiReview).await;
-        let cleaned_up = executor
-            .register_fake_reviewing_owner_for_test(task_id)
-            .await;
+        let cleaned_up = executor.register_fake_reviewing_owner_for_test(task_id).await;
 
         let answer = dispatch(
-            IpcRequest::MoveTask {
-                task_id: task_id.to_string(),
-                status: "backlog".to_string(),
-            },
+            IpcRequest::MoveTask { task_id: task_id.to_string(), status: "backlog".to_string() },
             &ctx,
             &peer(),
         )
@@ -2633,15 +2538,10 @@ mod lifecycle_ownership {
         let (_tmp, ctx) = test_ctx().await;
         let executor = attach_test_executor_ipc(&ctx).await;
         let task_id = seed(&ctx, TaskStatus::InProgress).await;
-        executor
-            .register_unkillable_running_execution_for_test(task_id)
-            .await;
+        executor.register_unkillable_running_execution_for_test(task_id).await;
 
         let answer = dispatch(
-            IpcRequest::MoveTask {
-                task_id: task_id.to_string(),
-                status: "backlog".to_string(),
-            },
+            IpcRequest::MoveTask { task_id: task_id.to_string(), status: "backlog".to_string() },
             &ctx,
             &peer(),
         )
@@ -2669,15 +2569,10 @@ mod lifecycle_ownership {
         let (_tmp, ctx) = test_ctx().await;
         let executor = attach_test_executor_ipc(&ctx).await;
         let task_id = seed(&ctx, TaskStatus::InProgress).await;
-        let cleaned_up = executor
-            .register_fake_running_execution_for_test(task_id)
-            .await;
+        let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
 
         let answer = dispatch(
-            IpcRequest::MoveTask {
-                task_id: task_id.to_string(),
-                status: "in_progress".to_string(),
-            },
+            IpcRequest::MoveTask { task_id: task_id.to_string(), status: "in_progress".to_string() },
             &ctx,
             &peer(),
         )
@@ -2714,10 +2609,7 @@ mod lifecycle_ownership {
     }
 
     fn move_to_queue(task_id: Uuid) -> IpcRequest {
-        IpcRequest::MoveTask {
-            task_id: task_id.to_string(),
-            status: "queue".to_string(),
-        }
+        IpcRequest::MoveTask { task_id: task_id.to_string(), status: "queue".to_string() }
     }
 
     #[tokio::test]
@@ -2730,13 +2622,9 @@ mod lifecycle_ownership {
         let mut task = create_test_task_full("cleaning up", project_id, TaskStatus::HumanReview, 0);
         task.cleanup_in_flight = true;
         let task_id = seed_task(&ctx, task).await;
-        let cleaned_up = executor
-            .register_fake_running_execution_for_test(task_id)
-            .await;
+        let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
 
-        let answer = dispatch(move_to_queue(task_id), &ctx, &peer())
-            .await
-            .response;
+        let answer = dispatch(move_to_queue(task_id), &ctx, &peer()).await.response;
 
         // The command line refuses any move out of Human Review before the
         // cleanup refusal is reached, and before an owner is ended.
@@ -2747,14 +2635,8 @@ mod lifecycle_ownership {
             "a move that will be refused must not end the owner"
         );
         assert!(executor.is_task_running(task_id).await);
-        assert_eq!(
-            ctx.tasks.read().await[&task_id].status,
-            TaskStatus::HumanReview
-        );
-        assert_eq!(
-            persisted(&ctx, project_id, task_id).status,
-            TaskStatus::HumanReview
-        );
+        assert_eq!(ctx.tasks.read().await[&task_id].status, TaskStatus::HumanReview);
+        assert_eq!(persisted(&ctx, project_id, task_id).status, TaskStatus::HumanReview);
     }
 
     #[tokio::test]
@@ -2779,13 +2661,9 @@ mod lifecycle_ownership {
             reviewer_model: None,
         });
         let task_id = seed_task(&ctx, task).await;
-        let cleaned_up = executor
-            .register_fake_running_execution_for_test(task_id)
-            .await;
+        let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
 
-        let answer = dispatch(move_to_queue(task_id), &ctx, &peer())
-            .await
-            .response;
+        let answer = dispatch(move_to_queue(task_id), &ctx, &peer()).await.response;
 
         assert!(!answer.ok, "{answer:?}");
         assert!(
@@ -2793,14 +2671,8 @@ mod lifecycle_ownership {
             "a queue request that cannot be written must leave the live Worker running"
         );
         assert!(executor.is_task_running(task_id).await);
-        assert_eq!(
-            ctx.tasks.read().await[&task_id].status,
-            TaskStatus::InProgress
-        );
-        assert_eq!(
-            persisted(&ctx, project_id, task_id).status,
-            TaskStatus::InProgress
-        );
+        assert_eq!(ctx.tasks.read().await[&task_id].status, TaskStatus::InProgress);
+        assert_eq!(persisted(&ctx, project_id, task_id).status, TaskStatus::InProgress);
     }
 
     #[tokio::test]
@@ -2810,18 +2682,14 @@ mod lifecycle_ownership {
         let task = create_test_task_full("ready", project_id, TaskStatus::Backlog, 0);
         let task_id = seed_task(&ctx, task).await;
 
-        let answer = dispatch(move_to_queue(task_id), &ctx, &peer())
-            .await
-            .response;
+        let answer = dispatch(move_to_queue(task_id), &ctx, &peer()).await.response;
         assert!(answer.ok, "{answer:?}");
         let written = persisted(&ctx, project_id, task_id);
         assert_eq!(written.status, TaskStatus::Queue);
         let activity = written.activity.len();
 
         // A repeated request changes nothing, and records no second move.
-        let answer = dispatch(move_to_queue(task_id), &ctx, &peer())
-            .await
-            .response;
+        let answer = dispatch(move_to_queue(task_id), &ctx, &peer()).await.response;
         assert!(answer.ok, "{answer:?}");
         let repeated = persisted(&ctx, project_id, task_id);
         assert_eq!(repeated.status, TaskStatus::Queue);
@@ -2840,11 +2708,9 @@ mod lifecycle_ownership {
         let executor = attach_test_executor_ipc(&ctx).await;
         let project_id = Uuid::new_v4();
         for with_recovery in [false, true] {
-            let mut task =
-                create_test_task_full("queued with evidence", project_id, TaskStatus::Queue, 0);
+            let mut task = create_test_task_full("queued with evidence", project_id, TaskStatus::Queue, 0);
             task.error_message = Some("the last run failed".into());
-            task.human_review
-                .approve(Some("a".repeat(40)), chrono::Utc::now());
+            task.human_review.approve(Some("a".repeat(40)), chrono::Utc::now());
             if with_recovery {
                 task.worker_handoff = Some(crate::domain::WorkerHandoff {
                     review_mode: Default::default(),
@@ -2869,25 +2735,14 @@ mod lifecycle_ownership {
             let board = {
                 let mut tasks = ctx.tasks.write().await;
                 tasks.insert(task_id, task);
-                tasks
-                    .values()
-                    .filter(|t| t.project_id == project_id)
-                    .cloned()
-                    .collect::<Vec<_>>()
+                tasks.values().filter(|t| t.project_id == project_id).cloned().collect::<Vec<_>>()
             };
-            ctx.storage
-                .save_project_tasks(project_id, &board)
-                .expect("seed the board");
-            let cleaned_up = executor
-                .register_fake_running_execution_for_test(task_id)
-                .await;
-            let memory_before =
-                serde_json::to_value(ctx.tasks.read().await[&task_id].clone()).unwrap();
+            ctx.storage.save_project_tasks(project_id, &board).expect("seed the board");
+            let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
+            let memory_before = serde_json::to_value(ctx.tasks.read().await[&task_id].clone()).unwrap();
             let disk_before = serde_json::to_value(persisted(&ctx, project_id, task_id)).unwrap();
 
-            let answer = dispatch(move_to_queue(task_id), &ctx, &peer())
-                .await
-                .response;
+            let answer = dispatch(move_to_queue(task_id), &ctx, &peer()).await.response;
 
             assert!(answer.ok, "with recovery {with_recovery}: {answer:?}");
             assert!(
@@ -2895,22 +2750,12 @@ mod lifecycle_ownership {
                 "a request that changes nothing must not end the owner"
             );
             assert!(executor.is_task_running(task_id).await);
-            let memory_after =
-                serde_json::to_value(ctx.tasks.read().await[&task_id].clone()).unwrap();
+            let memory_after = serde_json::to_value(ctx.tasks.read().await[&task_id].clone()).unwrap();
             let disk_after = serde_json::to_value(persisted(&ctx, project_id, task_id)).unwrap();
-            assert_eq!(
-                memory_after, memory_before,
-                "with recovery {with_recovery}: memory is unchanged"
-            );
-            assert_eq!(
-                disk_after, disk_before,
-                "with recovery {with_recovery}: the record is not rewritten"
-            );
+            assert_eq!(memory_after, memory_before, "with recovery {with_recovery}: memory is unchanged");
+            assert_eq!(disk_after, disk_before, "with recovery {with_recovery}: the record is not rewritten");
             let written = persisted(&ctx, project_id, task_id);
-            assert_eq!(
-                written.error_message.as_deref(),
-                Some("the last run failed")
-            );
+            assert_eq!(written.error_message.as_deref(), Some("the last run failed"));
             assert!(written.human_review.is_approved());
             assert_eq!(written.worker_handoff.is_some(), with_recovery);
             if with_recovery {
@@ -2927,19 +2772,11 @@ mod lifecycle_ownership {
         let (_tmp, ctx) = test_ctx().await;
         let executor = attach_test_executor_ipc(&ctx).await;
         let task_id = seed(&ctx, TaskStatus::InProgress).await;
-        let cleaned_up = executor
-            .register_fake_running_execution_for_test(task_id)
-            .await;
+        let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
 
-        let answer = dispatch(
-            IpcRequest::EnqueueTask {
-                task_id: task_id.to_string(),
-            },
-            &ctx,
-            &peer(),
-        )
-        .await
-        .response;
+        let answer = dispatch(IpcRequest::EnqueueTask { task_id: task_id.to_string() }, &ctx, &peer())
+            .await
+            .response;
 
         assert!(answer.ok, "{answer:?}");
         assert!(
@@ -2980,27 +2817,16 @@ mod disk_pressure {
         let task = create_test_task_full("under test", project_id, TaskStatus::Queue, 0);
         let task_id = task.id;
         ctx.tasks.write().await.insert(task_id, task.clone());
-        ctx.storage
-            .save_project_tasks(project_id, &[task])
-            .expect("seed the board");
+        ctx.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
         // This platform's own local endpoint -- a Unix socket or a named
         // pipe -- so the test describes a caller that can exist here. The
         // handler reads it only to answer `Ping`.
-        let peer = PeerContext {
-            endpoint: Endpoint::local_default(),
-            os_verified: true,
-        };
-        let move_to = |status: &str| IpcRequest::MoveTask {
-            task_id: task_id.to_string(),
-            status: status.to_string(),
-        };
+        let peer = PeerContext { endpoint: Endpoint::local_default(), os_verified: true };
+        let move_to = |status: &str| IpcRequest::MoveTask { task_id: task_id.to_string(), status: status.to_string() };
 
         let answer = dispatch(move_to("in_progress"), &ctx, &peer).await.response;
         assert!(!answer.ok, "{answer:?}");
-        assert!(
-            format!("{answer:?}").contains("New work paused"),
-            "{answer:?}"
-        );
+        assert!(format!("{answer:?}").contains("New work paused"), "{answer:?}");
         assert_eq!(ctx.tasks.read().await[&task_id].status, TaskStatus::Queue);
 
         // Other moves are not starts.
@@ -3010,10 +2836,7 @@ mod disk_pressure {
         disk.set_available(300 * GIB);
         let answer = dispatch(move_to("in_progress"), &ctx, &peer).await.response;
         assert!(answer.ok, "{answer:?}");
-        assert_eq!(
-            ctx.tasks.read().await[&task_id].status,
-            TaskStatus::InProgress
-        );
+        assert_eq!(ctx.tasks.read().await[&task_id].status, TaskStatus::InProgress);
     }
 }
 
@@ -3066,8 +2889,10 @@ mod enqueue_from_the_cli {
 #[cfg(test)]
 mod get_task {
     use super::*;
+    use crate::domain::task::{
+        CodingProvider, HumanReviewDecision, HumanReviewEntry, ReviewMode,
+    };
     use crate::domain::publication::{PrPublication, PublicationState};
-    use crate::domain::task::{CodingProvider, HumanReviewDecision, HumanReviewEntry, ReviewMode};
     use crate::test_helpers::{create_test_task_full, ipc_test_context};
     use slashit_ipc::Endpoint;
     use std::sync::Arc;
@@ -3082,15 +2907,9 @@ mod get_task {
     }
 
     async fn get(ctx: &IpcContext, id: &str) -> IpcResponse {
-        dispatch(
-            IpcRequest::GetTask {
-                task_id: id.to_string(),
-            },
-            ctx,
-            &peer(),
-        )
-        .await
-        .response
+        dispatch(IpcRequest::GetTask { task_id: id.to_string() }, ctx, &peer())
+            .await
+            .response
     }
 
     fn files_under(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
@@ -3136,9 +2955,7 @@ mod get_task {
         });
         let id = task.id;
         ctx.tasks.write().await.insert(id, task.clone());
-        ctx.storage
-            .save_project_tasks(project_id, &[task])
-            .expect("seed the board");
+        ctx.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
         (tmp, ctx, id)
     }
 
@@ -3151,10 +2968,7 @@ mod get_task {
 
         assert_eq!(d["id"], id.to_string());
         assert_eq!(d["title"], "Inspect me");
-        assert_eq!(
-            d["status"],
-            serde_json::to_value(TaskStatus::HumanReview).unwrap()
-        );
+        assert_eq!(d["status"], serde_json::to_value(TaskStatus::HumanReview).unwrap());
         assert!(d.get("phase").is_some());
         assert_eq!(d["model"], "claude-sonnet-5-5");
         assert_eq!(d["provider"], "opencode");
@@ -3162,10 +2976,7 @@ mod get_task {
         assert_eq!(d["reviewer_model"], "claude-opus-5-5");
         assert_eq!(d["dependencies"].as_array().unwrap().len(), 1);
         assert_eq!(d["human_review"]["entries"][0]["decision"], "approved");
-        assert_eq!(
-            d["human_review"]["entries"][0]["approved_tip"],
-            "a".repeat(40)
-        );
+        assert_eq!(d["human_review"]["entries"][0]["approved_tip"], "a".repeat(40));
         assert_eq!(d["pr_url"], "https://github.com/o/r/pull/7");
         assert_eq!(d["pr_publication"]["commit"], "a".repeat(40));
         assert_eq!(d["pr_publication"]["state"]["kind"], "published");
@@ -3179,20 +2990,10 @@ mod get_task {
     async fn makes_no_write() {
         let (tmp, ctx, id) = rich_world().await;
         let before = files_under(tmp.path());
-        assert!(
-            before
-                .iter()
-                .any(|(p, b)| p.extension().is_some_and(|e| e == "toml")
-                    && String::from_utf8_lossy(b).contains("Inspect me")),
-            "the seeded board is on disk"
-        );
+        assert!(before.iter().any(|(p, b)| p.extension().is_some_and(|e| e == "toml") && String::from_utf8_lossy(b).contains("Inspect me")), "the seeded board is on disk");
         let reply = get(&ctx, &id.to_string()).await;
         assert!(reply.ok);
-        assert_eq!(
-            files_under(tmp.path()),
-            before,
-            "the Task store must be byte-identical"
-        );
+        assert_eq!(files_under(tmp.path()), before, "the Task store must be byte-identical");
     }
 
     #[tokio::test]
@@ -3331,37 +3132,22 @@ mod task_configuration_writes {
         let (state, _report) = crate::app_core::build_state_with_paths(paths)
             .await
             .expect("state should build under a fresh tempdir");
-        state
-            .project
-            .projects
-            .write()
-            .await
-            .insert(project_id, project_for(project_id));
+        state.project.projects.write().await.insert(project_id, project_for(project_id));
         {
             let mut memory = state.task.tasks.write().await;
             for task in &tasks {
                 memory.insert(task.id, task.clone());
             }
-            let board: Vec<crate::domain::Task> = memory
-                .values()
-                .filter(|t| t.project_id == project_id)
-                .cloned()
-                .collect();
-            state
-                .storage
-                .save_project_tasks(project_id, &board)
-                .expect("seed the board");
+            let board: Vec<crate::domain::Task> =
+                memory.values().filter(|t| t.project_id == project_id).cloned().collect();
+            state.storage.save_project_tasks(project_id, &board).expect("seed the board");
         }
         let app = tauri::test::mock_app();
         app.manage(state);
         (tmp, app)
     }
 
-    fn new_params(
-        task_id: Uuid,
-        model: Option<String>,
-        review_mode: Option<ReviewMode>,
-    ) -> crate::commands::task::UpdateTaskParams {
+    fn new_params(task_id: Uuid, model: Option<String>, review_mode: Option<ReviewMode>) -> crate::commands::task::UpdateTaskParams {
         crate::commands::task::UpdateTaskParams {
             task_id: task_id.to_string(),
             title: None,
@@ -3480,10 +3266,7 @@ mod task_configuration_writes {
         );
         assert_eq!(persisted_json(&ctx, project_id, task_id), disk_before);
         let shown = read_back(&ctx, task_id).await;
-        assert_eq!(
-            shown["model"], "default",
-            "the read-back still answers the old value"
-        );
+        assert_eq!(shown["model"], "default", "the read-back still answers the old value");
     }
 
     /// The same identifier gets the same answer from the desktop write and from
@@ -3529,15 +3312,8 @@ mod task_configuration_writes {
             .await
             .response;
 
-            assert_eq!(
-                matches!(gui, Ok(Some(_))),
-                accepted,
-                "desktop write, {model:?}: {gui:?}"
-            );
-            assert_eq!(
-                answer.ok, accepted,
-                "control channel, {model:?}: {answer:?}"
-            );
+            assert_eq!(matches!(gui, Ok(Some(_))), accepted, "desktop write, {model:?}: {gui:?}");
+            assert_eq!(answer.ok, accepted, "control channel, {model:?}: {answer:?}");
             if accepted {
                 let stored = gui_app.state::<crate::AppState>().task.tasks.read().await[&task_id]
                     .model
@@ -3546,17 +3322,9 @@ mod task_configuration_writes {
                 assert_eq!(persisted(&ctx, ipc_project_id, ipc_task_id).model, model);
             } else {
                 let desktop_refusal = gui.err().unwrap_or_default();
-                assert!(
-                    desktop_refusal.contains("was not saved")
-                        || desktop_refusal.contains("No model"),
-                    "{desktop_refusal}"
-                );
+                assert!(desktop_refusal.contains("was not saved") || desktop_refusal.contains("No model"), "{desktop_refusal}");
                 let channel_refusal = answer.error.unwrap_or_default();
-                assert!(
-                    channel_refusal.contains("was not saved")
-                        || channel_refusal.contains("No model"),
-                    "{channel_refusal}"
-                );
+                assert!(channel_refusal.contains("was not saved") || channel_refusal.contains("No model"), "{channel_refusal}");
             }
         }
     }
@@ -3574,9 +3342,12 @@ mod task_configuration_writes {
         let (_gui_tmp, gui_app) = gui_app(project_id, vec![task]).await;
         let mut params = new_params(task_id, None, None);
         params.provider = Some(CodingProvider::OpenCode);
-        let refused =
-            crate::commands::task::update_task(GuiMutation::untracked(), gui_app.state(), params)
-                .await;
+        let refused = crate::commands::task::update_task(
+            GuiMutation::untracked(),
+            gui_app.state(),
+            params,
+        )
+        .await;
         let message = refused.expect_err("a Claude alias must not become an OpenCode model");
         assert!(message.contains("provider/model"), "{message}");
         let stored = gui_app.state::<crate::AppState>().task.tasks.read().await[&task_id].clone();
@@ -3633,10 +3404,7 @@ mod task_configuration_writes {
         );
 
         let shown = read_back(&ctx, task_id).await;
-        assert_eq!(
-            shown["review_mode"], "manual",
-            "the slice 1 read verb confirms it"
-        );
+        assert_eq!(shown["review_mode"], "manual", "the slice 1 read verb confirms it");
     }
 
     #[tokio::test]
@@ -3730,20 +3498,14 @@ mod task_configuration_writes {
 
         // An empty request is a clearing, and that is persisted as well.
         let answer = dispatch(
-            IpcRequest::SetTaskDependencies {
-                task_id: task_id.to_string(),
-                dependencies: Vec::new(),
-            },
+            IpcRequest::SetTaskDependencies { task_id: task_id.to_string(), dependencies: Vec::new() },
             &ctx,
             &peer(),
         )
         .await
         .response;
         assert!(answer.ok, "{answer:?}");
-        assert_eq!(
-            persisted(&ctx, ipc_project_id, task_id).dependencies,
-            Vec::<uuid::Uuid>::new()
-        );
+        assert_eq!(persisted(&ctx, ipc_project_id, task_id).dependencies, Vec::<uuid::Uuid>::new());
     }
 
     /// A request that closes a dependency cycle is refused with the desktop's
@@ -3772,11 +3534,8 @@ mod task_configuration_writes {
             .filter(|t| t.project_id == project_id)
             .cloned()
             .collect::<Vec<_>>();
-        ctx.storage
-            .save_project_tasks(project_id, &board)
-            .expect("seed the board");
-        let memory_before =
-            serde_json::to_value(ctx.tasks.read().await[&lower_id].clone()).unwrap();
+        ctx.storage.save_project_tasks(project_id, &board).expect("seed the board");
+        let memory_before = serde_json::to_value(ctx.tasks.read().await[&lower_id].clone()).unwrap();
         let disk_before = persisted_json(&ctx, project_id, lower_id);
 
         let answer = dispatch(
@@ -3850,9 +3609,7 @@ mod task_configuration_writes {
             .filter(|t| t.project_id == project_id)
             .cloned()
             .collect::<Vec<_>>();
-        ctx.storage
-            .save_project_tasks(project_id, &board)
-            .expect("seed the board");
+        ctx.storage.save_project_tasks(project_id, &board).expect("seed the board");
         let running_memory =
             serde_json::to_value(ctx.tasks.read().await[&running_id].clone()).unwrap();
         let running_disk = persisted_json(&ctx, project_id, running_id);
@@ -3870,10 +3627,7 @@ mod task_configuration_writes {
         )
         .await
         .response;
-        assert!(
-            !model.ok,
-            "a running Task must refuse a model edit: {model:?}"
-        );
+        assert!(!model.ok, "a running Task must refuse a model edit: {model:?}");
         assert!(
             model
                 .error
@@ -3893,10 +3647,7 @@ mod task_configuration_writes {
         )
         .await
         .response;
-        assert!(
-            !review_mode.ok,
-            "a running Task must refuse a review mode edit: {review_mode:?}"
-        );
+        assert!(!review_mode.ok, "a running Task must refuse a review mode edit: {review_mode:?}");
 
         let dependencies = dispatch(
             IpcRequest::SetTaskDependencies {
@@ -3908,16 +3659,9 @@ mod task_configuration_writes {
         )
         .await
         .response;
+        assert!(!dependencies.ok, "a checkout must refuse a dependency edit: {dependencies:?}");
         assert!(
-            !dependencies.ok,
-            "a checkout must refuse a dependency edit: {dependencies:?}"
-        );
-        assert!(
-            dependencies
-                .error
-                .clone()
-                .unwrap_or_default()
-                .contains("checkout"),
+            dependencies.error.clone().unwrap_or_default().contains("checkout"),
             "{dependencies:?}"
         );
 
@@ -3932,10 +3676,7 @@ mod task_configuration_writes {
             checked_out_memory,
             "the refused dependency edit changed nothing"
         );
-        assert_eq!(
-            persisted_json(&ctx, project_id, checked_out_id),
-            checked_out_disk
-        );
+        assert_eq!(persisted_json(&ctx, project_id, checked_out_id), checked_out_disk);
     }
 
     #[tokio::test]
@@ -3943,30 +3684,17 @@ mod task_configuration_writes {
         let (_tmp, ctx) = test_ctx().await;
         let missing = Uuid::new_v4().to_string();
         for request in [
-            IpcRequest::SetTaskModel {
-                task_id: missing.clone(),
-                model: "default".to_string(),
-            },
+            IpcRequest::SetTaskModel { task_id: missing.clone(), model: "default".to_string() },
             IpcRequest::SetTaskReviewMode {
                 task_id: missing.clone(),
                 review_mode: "manual".to_string(),
             },
-            IpcRequest::SetTaskDependencies {
-                task_id: missing.clone(),
-                dependencies: Vec::new(),
-            },
+            IpcRequest::SetTaskDependencies { task_id: missing.clone(), dependencies: Vec::new() },
         ] {
             let answer = dispatch(request, &ctx, &peer()).await.response;
+            assert!(!answer.ok, "a task that is not on the board cannot be changed: {answer:?}");
             assert!(
-                !answer.ok,
-                "a task that is not on the board cannot be changed: {answer:?}"
-            );
-            assert!(
-                answer
-                    .error
-                    .clone()
-                    .unwrap_or_default()
-                    .contains("not found"),
+                answer.error.clone().unwrap_or_default().contains("not found"),
                 "{answer:?}"
             );
         }
@@ -4047,20 +3775,14 @@ mod import_lock_order {
             "the handler waits for Projects without holding Tasks: an Apply holding Tasks and \
              waiting for Projects deadlocks against it"
         );
-        assert!(
-            response.ok,
-            "the handler must finish once the lock is free: {response:?}"
-        );
+        assert!(response.ok, "the handler must finish once the lock is free: {response:?}");
     }
 
     #[tokio::test]
     async fn export_takes_tasks_before_projects() {
         let (tmp, ctx) = test_ctx();
         let project_id = Uuid::new_v4();
-        ctx.projects
-            .write()
-            .await
-            .insert(project_id, project_for(project_id));
+        ctx.projects.write().await.insert(project_id, project_for(project_id));
         let destination = tmp.path().join("export.slashit-project");
         let handler = handle_export_project(
             &ctx,
@@ -4074,10 +3796,7 @@ mod import_lock_order {
     async fn preview_takes_tasks_before_projects() {
         let (tmp, ctx) = test_ctx();
         let project_id = Uuid::new_v4();
-        ctx.projects
-            .write()
-            .await
-            .insert(project_id, project_for(project_id));
+        ctx.projects.write().await.insert(project_id, project_for(project_id));
         let destination = tmp.path().join("export.slashit-project");
         let exported = handle_export_project(
             &ctx,
@@ -4556,10 +4275,7 @@ mod get_task_evidence {
         for input in ["x".repeat(1_000_000), "bad\u{1b}[2J\u{1}".to_string()] {
             let reply = evidence_or_error(&ctx, &input).await;
             assert!(!reply.ok);
-            assert_eq!(
-                reply.error.as_deref(),
-                Some("Invalid task_id: expected a UUID")
-            );
+            assert_eq!(reply.error.as_deref(), Some("Invalid task_id: expected a UUID"));
         }
     }
 
@@ -5025,15 +4741,9 @@ mod get_task_evidence {
         for run in 1..=500u32 {
             let text = "r".repeat(slashit_activity::MAX_RESULT_CHARS);
             for kind in [
-                Kind::RunStarted {
-                    run,
-                    addressing_feedback: false,
-                },
+                Kind::RunStarted { run, addressing_feedback: false },
                 Kind::RunCompleted { run },
-                Kind::RunResult {
-                    run,
-                    result: RunResult::Available { text },
-                },
+                Kind::RunResult { run, result: RunResult::Available { text } },
             ] {
                 let seq = activity.len() as u32 + 1;
                 activity.push(Entry { seq, at, kind });

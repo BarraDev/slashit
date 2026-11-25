@@ -258,14 +258,8 @@ mod tests {
         // permanently short two permits relative to the limit it now claims.
         let c = admission.try_acquire();
         let d = admission.try_acquire();
-        assert!(
-            c.is_some() && d.is_some(),
-            "growing back to 2 must restore both permits"
-        );
-        assert!(
-            admission.try_acquire().is_none(),
-            "still exactly 2, not more"
-        );
+        assert!(c.is_some() && d.is_some(), "growing back to 2 must restore both permits");
+        assert!(admission.try_acquire().is_none(), "still exactly 2, not more");
     }
 
     #[tokio::test]
@@ -273,9 +267,6 @@ mod tests {
         let admission = Admission::new(1);
         let _a = admission.try_acquire().expect("first permit");
         assert!(admission.try_acquire().is_none());
-        assert!(
-            admission.try_acquire().is_none(),
-            "declining twice must not double-charge anything"
-        );
+        assert!(admission.try_acquire().is_none(), "declining twice must not double-charge anything");
     }
 }

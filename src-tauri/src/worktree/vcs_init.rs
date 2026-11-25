@@ -1116,10 +1116,7 @@ mod partial_failure_tests {
         // Published by `write_executable`'s short-lived child, not written by
         // this process, so git's exec of the hook cannot fail with ETXTBSY
         // while a fork still holds it open for writing.
-        crate::test_helpers::write_executable(
-            &hook,
-            "#!/bin/sh\necho 'hook says no' >&2\nexit 1\n",
-        );
+        crate::test_helpers::write_executable(&hook, "#!/bin/sh\necho 'hook says no' >&2\nexit 1\n");
         let mut env = test_env::isolated(temp.path(), "trunk-xyz");
         env.push(("GIT_CONFIG_COUNT".to_string(), "1".to_string()));
         env.push(("GIT_CONFIG_KEY_0".to_string(), "core.hooksPath".to_string()));

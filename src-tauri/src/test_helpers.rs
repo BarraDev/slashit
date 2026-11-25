@@ -293,10 +293,7 @@ impl FakeProgram {
     /// contains `claudeMdExcludes`.
     pub fn launches(&self, name: &str) -> usize {
         let prefix = format!("{name} ");
-        self.invocations()
-            .lines()
-            .filter(|line| line.starts_with(&prefix))
-            .count()
+        self.invocations().lines().filter(|line| line.starts_with(&prefix)).count()
     }
 }
 
@@ -380,9 +377,8 @@ pub fn write_executable(path: &std::path::Path, body: &str) {
         // `/bin/cp` not being runnable is also a failed publication.
         Err(error) => panic!("could not create {}: {error}", staged.0.display()),
     }
-    std::fs::set_permissions(&staged.0, std::fs::Permissions::from_mode(0o755)).unwrap_or_else(
-        |error| panic!("could not make {} executable: {error}", staged.0.display()),
-    );
+    std::fs::set_permissions(&staged.0, std::fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|error| panic!("could not make {} executable: {error}", staged.0.display()));
     std::fs::rename(&staged.0, path)
         .unwrap_or_else(|error| panic!("could not rename {} into place: {error}", path.display()));
 }
@@ -413,10 +409,7 @@ mod executable_fixture_tests {
             let (mut ready_rx, ready_tx) = UnixStream::pair().unwrap();
             let (release, gate) = UnixStream::pair().unwrap();
             let mut command = Command::new("/bin/true");
-            command
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
+            command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
             // Runs in the forked child, before exec. It only reads and writes
             // sockets that are already open.
             unsafe {
@@ -434,11 +427,7 @@ mod executable_fixture_tests {
 
         fn finish(mut self) {
             self.release.write_all(&[1]).unwrap();
-            let mut child = self
-                .spawner
-                .join()
-                .unwrap()
-                .expect("spawn the pending child");
+            let mut child = self.spawner.join().unwrap().expect("spawn the pending child");
             assert!(child.wait().unwrap().success());
         }
     }
@@ -452,8 +441,7 @@ mod executable_fixture_tests {
         let path = dir.path().join("gh");
         let mut open = File::create(&path).unwrap();
         open.write_all(SCRIPT.as_bytes()).unwrap();
-        open.set_permissions(std::fs::Permissions::from_mode(0o755))
-            .unwrap();
+        open.set_permissions(std::fs::Permissions::from_mode(0o755)).unwrap();
         let pending = PendingFork::start();
         let err = Command::new(&path)
             .stdin(Stdio::null())
@@ -537,8 +525,7 @@ mod executable_fixture_tests {
         write_executable(&path, "#!/bin/sh\necho previous\n");
         // Restores write access on drop, including when an assertion below
         // unwinds, so `tempdir`'s cleanup never meets a read-only directory.
-        let _unwritable =
-            UnwritableDir::new(dir.path()).expect("the directory still accepts writes");
+        let _unwritable = UnwritableDir::new(dir.path()).expect("the directory still accepts writes");
 
         let message = std::panic::catch_unwind(|| write_executable(&path, SCRIPT))
             .expect_err("a directory without write permission defeats the publication")
@@ -634,7 +621,8 @@ mod executable_fixture_tests {
         write_executable(&occupied, SCRIPT);
 
         assert!(
-            std::fs::symlink_metadata(&occupied).is_ok_and(|meta| !meta.file_type().is_symlink()),
+            std::fs::symlink_metadata(&occupied)
+                .is_ok_and(|meta| !meta.file_type().is_symlink()),
             "the entry is a file of its own now"
         );
         assert_eq!(std::fs::read_to_string(&occupied).unwrap(), SCRIPT);

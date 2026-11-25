@@ -294,10 +294,7 @@ impl BoundIpc {
 
     /// The endpoints actually bound, with any OS-chosen port resolved.
     pub fn endpoints(&self) -> Vec<Endpoint> {
-        self.listeners
-            .iter()
-            .map(|owner| owner.endpoint.clone())
-            .collect()
+        self.listeners.iter().map(|owner| owner.endpoint.clone()).collect()
     }
 
     /// A second reference to the claimed listeners, to be released only after
@@ -343,10 +340,7 @@ impl BoundIpc {
                 Ok(minted) => {
                     // The path, never the value: a token printed into a log has
                     // outlived the 0600 file it was written to.
-                    println!(
-                        "[ipc] bearer token for TCP clients is in {}",
-                        path.display()
-                    );
+                    println!("[ipc] bearer token for TCP clients is in {}", path.display());
                     token = Some(Arc::new(minted));
                 }
                 // Failing closed on the listener that needs the credential, and
@@ -426,10 +420,7 @@ impl IpcServer {
 
     /// The endpoints actually bound, with any OS-chosen port resolved.
     pub fn endpoints(&self) -> Vec<Endpoint> {
-        self.listeners
-            .iter()
-            .map(|owner| owner.endpoint.clone())
-            .collect()
+        self.listeners.iter().map(|owner| owner.endpoint.clone()).collect()
     }
 
     /// A second reference to the bound listeners; see [`IpcOwnership`].
@@ -844,8 +835,9 @@ pub async fn drain_execution(executor: &crate::queue::TaskExecutor, grace: Durat
     }
     if !grace.is_zero() {
         let deadline = tokio::time::Instant::now() + grace;
-        let live =
-            || async { executor.running_task_count().await + executor.active_project_run_count() };
+        let live = || async {
+            executor.running_task_count().await + executor.active_project_run_count()
+        };
         let running = live().await;
         if running > 0 {
             println!("[ipc] waiting up to {grace:?} for {running} running owner(s) to finish");
@@ -957,24 +949,25 @@ async fn handle_connection(
     } = accepted;
     let (reader, mut writer) = stream.into_halves();
 
-    let frame =
-        match tokio::time::timeout(REQUEST_TIMEOUT, read_frame(reader, MAX_REQUEST_BYTES)).await {
-            Ok(Ok(frame)) => frame,
-            Ok(Err(e)) => {
-                eprintln!("[ipc] read failed on {endpoint}: {e}");
-                return;
-            }
-            Err(_elapsed) => {
-                let seconds = REQUEST_TIMEOUT.as_secs();
-                eprintln!("[ipc] no request within {seconds}s on {endpoint}; closing");
-                respond(
-                    &mut writer,
-                    &IpcResponse::error(format!("No request received within {seconds} seconds")),
-                )
-                .await;
-                return;
-            }
-        };
+    let frame = match tokio::time::timeout(REQUEST_TIMEOUT, read_frame(reader, MAX_REQUEST_BYTES))
+        .await
+    {
+        Ok(Ok(frame)) => frame,
+        Ok(Err(e)) => {
+            eprintln!("[ipc] read failed on {endpoint}: {e}");
+            return;
+        }
+        Err(_elapsed) => {
+            let seconds = REQUEST_TIMEOUT.as_secs();
+            eprintln!("[ipc] no request within {seconds}s on {endpoint}; closing");
+            respond(
+                &mut writer,
+                &IpcResponse::error(format!("No request received within {seconds} seconds")),
+            )
+            .await;
+            return;
+        }
+    };
 
     let line = match frame {
         Frame::Line(line) => line,
@@ -984,9 +977,7 @@ async fn handle_connection(
         Frame::TooLarge => {
             respond(
                 &mut writer,
-                &IpcResponse::error(format!(
-                    "Request exceeds the {MAX_REQUEST_BYTES} byte limit"
-                )),
+                &IpcResponse::error(format!("Request exceeds the {MAX_REQUEST_BYTES} byte limit")),
             )
             .await;
             return;
@@ -1345,11 +1336,7 @@ pub(crate) mod tests {
         }
         #[cfg(windows)]
         {
-            let tag = root
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .replace('.', "-");
+            let tag = root.file_name().unwrap().to_string_lossy().replace('.', "-");
             Endpoint::NamedPipe {
                 name: format!(r"\\.\pipe\slashit-shutdown-test-{tag}"),
             }
@@ -1391,31 +1378,13 @@ pub(crate) mod tests {
 
     impl Layout {
         fn local_only() -> Self {
-            Self {
-                root: None,
-                local: true,
-                tcp: false,
-                control: None,
-                grace: Duration::ZERO,
-            }
+            Self { root: None, local: true, tcp: false, control: None, grace: Duration::ZERO }
         }
         fn local_and_tcp() -> Self {
-            Self {
-                root: None,
-                local: true,
-                tcp: true,
-                control: None,
-                grace: Duration::ZERO,
-            }
+            Self { root: None, local: true, tcp: true, control: None, grace: Duration::ZERO }
         }
         fn tcp_only() -> Self {
-            Self {
-                root: None,
-                local: false,
-                tcp: true,
-                control: None,
-                grace: Duration::ZERO,
-            }
+            Self { root: None, local: false, tcp: true, control: None, grace: Duration::ZERO }
         }
     }
 
@@ -1501,18 +1470,12 @@ pub(crate) mod tests {
 
         /// A second SlashIt instance trying to become the owner.
         async fn second_instance(&self) -> anyhow::Result<BoundIpc> {
-            BoundIpc::bind_endpoints(
-                &self.paths,
-                std::slice::from_ref(&self.local),
-                &BindOptions::default(),
-            )
-            .await
+            BoundIpc::bind_endpoints(&self.paths, std::slice::from_ref(&self.local), &BindOptions::default())
+                .await
         }
 
         fn server_finished(&self) -> bool {
-            self.server
-                .as_ref()
-                .is_some_and(|server| server.is_finished())
+            self.server.as_ref().is_some_and(|server| server.is_finished())
         }
 
         async fn finish(&mut self) -> anyhow::Result<()> {
@@ -1664,32 +1627,19 @@ pub(crate) mod tests {
             reviewer_model: None,
         });
         let task_id = task.id;
-        rig.ctx
-            .storage
-            .save_project_tasks(project_id, std::slice::from_ref(&task))
-            .unwrap();
+        rig.ctx.storage.save_project_tasks(project_id, std::slice::from_ref(&task)).unwrap();
         rig.ctx.tasks.write().await.insert(task_id, task);
-        let task_json =
-            |tasks: &HashMap<Uuid, Task>| serde_json::to_string(&tasks[&task_id]).unwrap();
+        let task_json = |tasks: &HashMap<Uuid, Task>| serde_json::to_string(&tasks[&task_id]).unwrap();
         let storage = rig.ctx.storage.clone();
         let stored_json = move || {
             serde_json::to_string(&storage.load_project_tasks(project_id).unwrap()).unwrap()
         };
         let task_before = task_json(&*rig.ctx.tasks.read().await);
         let stored_before = stored_json();
-        let refs_before = git(
-            &repo,
-            &["for-each-ref", "--format=%(refname) %(objectname)"],
-        );
+        let refs_before = git(&repo, &["for-each-ref", "--format=%(refname) %(objectname)"]);
 
-        let worker = rig
-            .executor
-            .register_gated_running_execution_for_test(task_id)
-            .await;
-        assert!(
-            rig.ping(&rig.local).await.unwrap().ok,
-            "serving before the failure"
-        );
+        let worker = rig.executor.register_gated_running_execution_for_test(task_id).await;
+        assert!(rig.ping(&rig.local).await.unwrap().ok, "serving before the failure");
 
         rig.local_fault.as_ref().expect("local listener").fail();
 
@@ -1710,14 +1660,8 @@ pub(crate) mod tests {
         );
 
         worker.release.send(true).unwrap();
-        let error = rig
-            .finish()
-            .await
-            .expect_err("a failure is never reported as a clean stop");
-        assert!(
-            error.to_string().contains("mandatory local IPC listener"),
-            "{error}"
-        );
+        let error = rig.finish().await.expect_err("a failure is never reported as a clean stop");
+        assert!(error.to_string().contains("mandatory local IPC listener"), "{error}");
         assert!(worker.finished.load(Ordering::SeqCst));
         assert_eq!(rig.executor.running_task_count().await, 0);
 
@@ -1729,17 +1673,10 @@ pub(crate) mod tests {
         drop(rig.ownership.take());
         acquire_after_release(|| rig.second_instance()).await;
 
-        assert_eq!(
-            task_json(&*rig.ctx.tasks.read().await),
-            task_before,
-            "Task and evidence"
-        );
+        assert_eq!(task_json(&*rig.ctx.tasks.read().await), task_before, "Task and evidence");
         assert_eq!(stored_json(), stored_before, "persisted Task");
         assert_eq!(
-            git(
-                &repo,
-                &["for-each-ref", "--format=%(refname) %(objectname)"]
-            ),
+            git(&repo, &["for-each-ref", "--format=%(refname) %(objectname)"]),
             refs_before
         );
         assert_eq!(
@@ -1754,26 +1691,20 @@ pub(crate) mod tests {
     async fn local_listener_failure_fails_closed_even_though_tcp_is_healthy() {
         let mut rig = Rig::start(Layout::local_and_tcp()).await;
         let tcp = rig.tcp.clone().expect("tcp bound");
-        assert!(
-            rig.ping(&tcp).await.unwrap().ok,
-            "TCP serves before the failure"
-        );
+        assert!(rig.ping(&tcp).await.unwrap().ok, "TCP serves before the failure");
 
         rig.local_fault.as_ref().unwrap().fail();
 
         let error = rig.finish().await.expect_err("fail closed");
-        assert!(
-            error.to_string().contains("mandatory local IPC listener"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("mandatory local IPC listener"), "{error}");
         assert!(!rig.executor.is_accepting_work());
         // Refusal is awaited, not read at one instant. The kernel keeps a socket
         // in LISTEN while any copy of its descriptor exists, and another test's
         // fork can hold one between fork and exec, so a connect can still be
         // queued for a moment after the listener is dropped.
         tokio::time::timeout(Duration::from_secs(10), until_connection_refused(&tcp))
-            .await
-            .expect("the surviving TCP listener is closed with the rest of the instance");
+        .await
+        .expect("the surviving TCP listener is closed with the rest of the instance");
         drop(rig.ownership.take());
         acquire_after_release(|| rig.second_instance()).await;
     }
@@ -1791,24 +1722,13 @@ pub(crate) mod tests {
         tokio::time::timeout(Duration::from_secs(10), until_connection_refused(&tcp))
             .await
             .expect("the failed optional listener is closed, so its clients are refused");
-        assert!(
-            !rig.server_finished(),
-            "TCP is optional: the server carries on"
-        );
+        assert!(!rig.server_finished(), "TCP is optional: the server carries on");
         assert!(rig.executor.is_accepting_work());
-        assert!(
-            rig.ping(&rig.local).await.unwrap().ok,
-            "the local owner still answers"
-        );
-        assert!(
-            rig.second_instance().await.is_err(),
-            "and still owns the endpoint"
-        );
+        assert!(rig.ping(&rig.local).await.unwrap().ok, "the local owner still answers");
+        assert!(rig.second_instance().await.is_err(), "and still owns the endpoint");
 
         rig.stop.send(true).unwrap();
-        rig.finish()
-            .await
-            .expect("a later intentional shutdown is clean");
+        rig.finish().await.expect("a later intentional shutdown is clean");
     }
 
     // --- 4: abnormal accept-loop completion and panic -------------------------
@@ -1862,10 +1782,7 @@ pub(crate) mod tests {
         let _ = send(&IpcRequest::Quit, &rig.options(&rig.local)).await;
 
         let error = rig.finish().await.expect_err("fail closed");
-        assert!(
-            error.to_string().contains("connection handler failed"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("connection handler failed"), "{error}");
         assert!(!rig.executor.is_accepting_work());
     }
 
@@ -1875,10 +1792,7 @@ pub(crate) mod tests {
     async fn an_intentional_shutdown_drains_then_releases_and_reports_clean() {
         let mut rig = Rig::start(Layout::local_and_tcp()).await;
         let task_id = Uuid::new_v4();
-        let worker = rig
-            .executor
-            .register_gated_running_execution_for_test(task_id)
-            .await;
+        let worker = rig.executor.register_gated_running_execution_for_test(task_id).await;
 
         rig.stop.send(true).unwrap();
         eventually("the Worker to be told to stop", || {
@@ -1888,15 +1802,10 @@ pub(crate) mod tests {
         settle().await;
         assert!(!rig.executor.is_accepting_work());
         assert!(!rig.server_finished());
-        assert!(
-            rig.second_instance().await.is_err(),
-            "still the owner while draining"
-        );
+        assert!(rig.second_instance().await.is_err(), "still the owner while draining");
 
         worker.release.send(true).unwrap();
-        rig.finish()
-            .await
-            .expect("an intentional shutdown that drained is clean");
+        rig.finish().await.expect("an intentional shutdown that drained is clean");
         drop(rig.ownership.take());
         acquire_after_release(|| rig.second_instance()).await;
     }
@@ -1916,10 +1825,7 @@ pub(crate) mod tests {
             let ctx = ipc_test_context(paths);
             (attach_test_executor_ipc(&ctx).await, (tmp, ctx))
         };
-        let lease = executor
-            .begin_project_run(Uuid::new_v4(), false)
-            .await
-            .unwrap();
+        let lease = executor.begin_project_run(Uuid::new_v4(), false).await.unwrap();
         let mut cancel = lease.cancel_receiver();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1928,10 +1834,7 @@ pub(crate) mod tests {
 
         drain_execution(&executor, Duration::from_secs(30)).await;
 
-        assert!(
-            !*cancel.borrow_and_update(),
-            "it finished by itself and was never cancelled"
-        );
+        assert!(!*cancel.borrow_and_update(), "it finished by itself and was never cancelled");
         assert_eq!(executor.running_task_count().await, 0);
     }
 
@@ -1949,25 +1852,18 @@ pub(crate) mod tests {
         rig.local_fault.as_ref().unwrap().fail();
         eventually("admission to close", || !rig.executor.is_accepting_work()).await;
         settle().await;
-        assert!(
-            !rig.server_finished(),
-            "the admitted handler is still accounted for"
-        );
+        assert!(!rig.server_finished(), "the admitted handler is still accounted for");
         assert!(rig.second_instance().await.is_err());
 
         // The handler now receives a state-changing request. It is refused.
         let request = slashit_ipc::IpcEnvelope::new(IpcRequest::DeleteTask {
             task_id: Uuid::new_v4().to_string(),
         });
-        slashit_ipc::framing::write_json_frame(&mut writer, &request)
-            .await
-            .unwrap();
+        slashit_ipc::framing::write_json_frame(&mut writer, &request).await.unwrap();
         let frame = slashit_ipc::framing::read_frame(reader, MAX_REQUEST_BYTES)
             .await
             .expect("answered");
-        let slashit_ipc::framing::Frame::Line(line) = frame else {
-            panic!("no answer")
-        };
+        let slashit_ipc::framing::Frame::Line(line) = frame else { panic!("no answer") };
         let response: IpcResponse = serde_json::from_str(&line).unwrap();
         assert!(!response.ok);
         assert!(response.error.unwrap().contains("shutting down"));
@@ -1996,21 +1892,13 @@ pub(crate) mod tests {
         let ctx = Arc::new(ipc_test_context(paths.clone()));
         let executor = attach_test_executor_ipc(&ctx).await;
         let local = local_endpoint(&root);
-        let bound = BoundIpc::bind_endpoints(
-            &paths,
-            std::slice::from_ref(&local),
-            &BindOptions::default(),
-        )
-        .await
-        .expect("bind");
+        let bound = BoundIpc::bind_endpoints(&paths, std::slice::from_ref(&local), &BindOptions::default())
+            .await
+            .expect("bind");
         let ownership = bound.ownership();
         let second = || async {
-            BoundIpc::bind_endpoints(
-                &paths,
-                std::slice::from_ref(&local),
-                &BindOptions::default(),
-            )
-            .await
+            BoundIpc::bind_endpoints(&paths, std::slice::from_ref(&local), &BindOptions::default())
+                .await
         };
 
         // A poll pass held mid-way at a barrier. When it is let go it changes
@@ -2041,32 +1929,19 @@ pub(crate) mod tests {
         let quiesced = tokio::spawn({
             let executor = executor.clone();
             async move {
-                quiesce_after_supervisor_failure(
-                    Some(&executor),
-                    Some(poller),
-                    &HandlerRescue::default(),
-                )
-                .await
+                quiesce_after_supervisor_failure(Some(&executor), Some(poller), &HandlerRescue::default())
+                    .await
             }
         });
         eventually("admission to close", || !executor.is_accepting_work()).await;
         settle().await;
-        assert!(
-            !quiesced.is_finished(),
-            "closing the fence is not the poller returning"
-        );
+        assert!(!quiesced.is_finished(), "closing the fence is not the poller returning");
         assert!(!pass_finished.load(Ordering::SeqCst));
-        assert!(
-            second().await.is_err(),
-            "ownership is held while the pass is running"
-        );
+        assert!(second().await.is_err(), "ownership is held while the pass is running");
 
         release.send(true).unwrap();
         quiesced.await.expect("quiescence completes");
-        assert!(
-            pass_finished.load(Ordering::SeqCst),
-            "the pass finished before quiescence did"
-        );
+        assert!(pass_finished.load(Ordering::SeqCst), "the pass finished before quiescence did");
 
         drop(ownership);
         acquire_after_release(second).await;
@@ -2119,11 +1994,7 @@ pub(crate) mod tests {
 
     fn spawn_child(root: &std::path::Path) -> std::process::Child {
         std::process::Command::new(std::env::current_exe().expect("test binary"))
-            .args([
-                "ipc::server::tests::shutdown_child_process",
-                "--exact",
-                "--nocapture",
-            ])
+            .args(["ipc::server::tests::shutdown_child_process", "--exact", "--nocapture"])
             .env(CHILD_ROOT, root)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -2144,9 +2015,7 @@ pub(crate) mod tests {
         .unwrap_or_else(|_| panic!("timed out waiting for {}", path.display()));
     }
 
-    fn second_instance_at(
-        root: &std::path::Path,
-    ) -> impl std::future::Future<Output = anyhow::Result<BoundIpc>> {
+    fn second_instance_at(root: &std::path::Path) -> impl std::future::Future<Output = anyhow::Result<BoundIpc>> {
         let paths = AppPaths::with_roots(
             root.join("parent-config"),
             root.join("parent-data"),
@@ -2154,7 +2023,9 @@ pub(crate) mod tests {
             root.join("runtime"),
         );
         let endpoint = local_endpoint(root);
-        async move { BoundIpc::bind_endpoints(&paths, &[endpoint], &BindOptions::default()).await }
+        async move {
+            BoundIpc::bind_endpoints(&paths, &[endpoint], &BindOptions::default()).await
+        }
     }
 
     /// The real boundary: two OS processes, the production supervisor, the
@@ -2179,10 +2050,7 @@ pub(crate) mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(
-            status.success(),
-            "the first instance failed closed and exited: {status}"
-        );
+        assert!(status.success(), "the first instance failed closed and exited: {status}");
 
         acquire_after_release(|| second_instance_at(root.path())).await;
     }
@@ -2239,11 +2107,7 @@ pub(crate) mod tests {
         let (state, _report) = crate::app_core::build_state_with_paths(rig.paths.clone())
             .await
             .expect("build state");
-        state
-            .executor
-            .set(rig.executor.clone())
-            .ok()
-            .expect("one executor");
+        state.executor.set(rig.executor.clone()).ok().expect("one executor");
 
         let started = Arc::new(AtomicUsize::new(0));
         let performed = Arc::new(AtomicBool::new(false));
@@ -2279,14 +2143,8 @@ pub(crate) mod tests {
         rig.local_fault.as_ref().unwrap().fail();
         eventually("admission to close", || !rig.executor.is_accepting_work()).await;
         settle().await;
-        assert!(
-            !rig.server_finished(),
-            "the supervisor waits for the admitted command"
-        );
-        assert!(
-            rig.second_instance().await.is_err(),
-            "ownership is still held"
-        );
+        assert!(!rig.server_finished(), "the supervisor waits for the admitted command");
+        assert!(rig.second_instance().await.is_err(), "ownership is still held");
         assert!(!performed.load(Ordering::SeqCst));
 
         // A command dispatched now is refused before its body runs.
@@ -2298,29 +2156,19 @@ pub(crate) mod tests {
         .unwrap()
         .expect_err("refused after the fence");
         assert!(refused.to_string().contains("shutting down"), "{refused}");
-        assert_eq!(
-            started.load(Ordering::SeqCst),
-            1,
-            "the refused command never started"
-        );
+        assert_eq!(started.load(Ordering::SeqCst), 1, "the refused command never started");
 
         // Let the admitted command finish. Only after it has mutated may the
         // supervisor release the endpoint.
         release.send(true).unwrap();
-        in_flight
-            .await
-            .unwrap()
-            .expect("the admitted command completes");
+        in_flight.await.unwrap().expect("the admitted command completes");
         assert!(performed.load(Ordering::SeqCst));
 
         let error = rig.finish().await.expect_err("fail closed");
         assert!(error.to_string().contains("mandatory local"), "{error}");
         drop(rig.ownership.take());
         acquire_after_release(|| rig.second_instance()).await;
-        assert!(
-            performed.load(Ordering::SeqCst),
-            "nothing ran after release"
-        );
+        assert!(performed.load(Ordering::SeqCst), "nothing ran after release");
     }
 
     // --- a handler's blocking git run, after the server task dies -----------
@@ -2372,13 +2220,9 @@ pub(crate) mod tests {
             root.join("runtime"),
         ));
         let local = local_endpoint(&root);
-        let bound = BoundIpc::bind_endpoints(
-            &paths,
-            std::slice::from_ref(&local),
-            &BindOptions::default(),
-        )
-        .await
-        .expect("bind");
+        let bound = BoundIpc::bind_endpoints(&paths, std::slice::from_ref(&local), &BindOptions::default())
+            .await
+            .expect("bind");
         let ownership = bound.ownership();
 
         let handlers = HandlerRescue::default();
@@ -2408,9 +2252,7 @@ pub(crate) mod tests {
                 let delete = slashit_ipc::IpcEnvelope::new(IpcRequest::DeleteTask {
                     task_id: task_id.to_string(),
                 });
-                slashit_ipc::framing::write_json_frame(&mut writer, &delete)
-                    .await
-                    .unwrap();
+                slashit_ipc::framing::write_json_frame(&mut writer, &delete).await.unwrap();
                 slashit_ipc::framing::read_frame(reader, MAX_REQUEST_BYTES).await
             }
         });
@@ -2418,10 +2260,7 @@ pub(crate) mod tests {
         // The handler is inside the held `git`: the wrapper says so.
         wait_for_path(&root.join("in-git")).await;
         fail.send(true).unwrap();
-        assert!(server
-            .await
-            .expect_err("the server task panicked")
-            .is_panic());
+        assert!(server.await.expect_err("the server task panicked").is_panic());
         std::fs::write(root.join("panicked"), b"").unwrap();
 
         let quiesced = tokio::spawn({
@@ -2446,16 +2285,12 @@ pub(crate) mod tests {
         drop(ownership);
 
         // The handler was not cancelled: it finished the delete it had begun.
-        let slashit_ipc::framing::Frame::Line(line) = request.await.unwrap().expect("answered")
-        else {
+        let slashit_ipc::framing::Frame::Line(line) = request.await.unwrap().expect("answered") else {
             panic!("no answer")
         };
         let response: IpcResponse = serde_json::from_str(&line).unwrap();
         assert!(response.ok, "{response:?}");
-        assert!(
-            !std::path::Path::new(&checkout).exists(),
-            "the checkout is gone"
-        );
+        assert!(!std::path::Path::new(&checkout).exists(), "the checkout is gone");
         assert!(!ctx.tasks.read().await.contains_key(&task_id));
         std::fs::write(root.join("quiesced"), b"").unwrap();
     }
@@ -2498,11 +2333,7 @@ pub(crate) mod tests {
         path.push(std::env::var_os("PATH").unwrap());
 
         let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
-            .args([
-                "ipc::server::tests::held_git_child_process",
-                "--exact",
-                "--nocapture",
-            ])
+            .args(["ipc::server::tests::held_git_child_process", "--exact", "--nocapture"])
             .env(GIT_CHILD_ROOT, root.path())
             .env("PATH", path)
             .stdout(std::process::Stdio::null())
@@ -2520,18 +2351,12 @@ pub(crate) mod tests {
             !root.path().join("released-early").exists(),
             "the supervisor finished its quiescence while the handler's git run was still held"
         );
-        assert!(
-            registered(root.path()),
-            "git has not removed the checkout yet"
-        );
+        assert!(registered(root.path()), "git has not removed the checkout yet");
         assert!(
             second_instance_at(root.path()).await.is_err(),
             "a git run is still in flight: no one else may own the endpoint"
         );
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "and the first instance has not exited"
-        );
+        assert!(child.try_wait().unwrap().is_none(), "and the first instance has not exited");
         assert!(!root.path().join("quiesced").exists());
 
         std::fs::write(root.path().join("release"), b"").unwrap();
@@ -2543,17 +2368,11 @@ pub(crate) mod tests {
         .expect("the first instance exits once git has finished")
         .unwrap()
         .unwrap();
-        assert!(
-            status.success(),
-            "the first instance quiesced and exited: {status}"
-        );
+        assert!(status.success(), "the first instance quiesced and exited: {status}");
         assert!(root.path().join("quiesced").exists());
 
         acquire_after_release(|| second_instance_at(root.path())).await;
-        assert!(
-            !registered(root.path()),
-            "the removal completed before ownership went"
-        );
+        assert!(!registered(root.path()), "the removal completed before ownership went");
     }
 
     /// What is *not* promised, pinned so it stays honest: killing the owner

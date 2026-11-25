@@ -57,9 +57,7 @@ pub fn backup_ref(task_id: Uuid) -> String {
 /// lowercase hexadecimal digits, which is all `git rev-parse` prints for one.
 pub fn is_full_object_id(value: &str) -> bool {
     matches!(value.len(), 40 | 64)
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// A finished `git` run: its exit code, stdout and stderr, both trimmed.
@@ -137,11 +135,7 @@ async fn git_entries(dir: &Path, args: &[&str]) -> Result<Vec<String>, String> {
 async fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     let ran = run(dir, args, &[]).await?;
     if ran.code != Some(0) {
-        return Err(format!(
-            "git {} failed: {}",
-            args.first().unwrap_or(&""),
-            ran.stderr
-        ));
+        return Err(format!("git {} failed: {}", args.first().unwrap_or(&""), ran.stderr));
     }
     Ok(ran.stdout)
 }
@@ -153,11 +147,7 @@ async fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
 /// merely shares it. Its pattern also matches refs below `refname/`, so only
 /// the line for the exact name is taken.
 pub async fn exact_ref(dir: &Path, refname: &str) -> Result<Option<String>, String> {
-    let listed = git(
-        dir,
-        &["for-each-ref", "--format=%(refname) %(objectname)", refname],
-    )
-    .await?;
+    let listed = git(dir, &["for-each-ref", "--format=%(refname) %(objectname)", refname]).await?;
     Ok(listed.lines().find_map(|line| {
         let (name, oid) = line.split_once(' ')?;
         (name == refname && is_full_object_id(oid)).then(|| oid.to_string())
@@ -175,10 +165,7 @@ pub async fn has_commit(dir: &Path, oid: &str) -> Result<bool, String> {
         // This Git version reports an absent full object with this explicit
         // diagnostic. Any other nonzero status is an inspection failure.
         Some(128) if ran.stderr.contains("Not a valid object name") => Ok(false),
-        _ => Err(format!(
-            "git could not inspect commit {oid}: {}",
-            ran.stderr
-        )),
+        _ => Err(format!("git could not inspect commit {oid}: {}", ran.stderr)),
     }
 }
 
@@ -191,12 +178,7 @@ pub async fn is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> Result
             "{ancestor:?} and {descendant:?} must both be full object IDs to be compared"
         ));
     }
-    let ran = run(
-        dir,
-        &["merge-base", "--is-ancestor", ancestor, descendant],
-        &[],
-    )
-    .await?;
+    let ran = run(dir, &["merge-base", "--is-ancestor", ancestor, descendant], &[]).await?;
     match ran.code {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
@@ -224,17 +206,7 @@ pub async fn branches_containing(dir: &Path, oid: &str) -> Result<Vec<String>, S
     if !is_full_object_id(oid) {
         return Err(format!("{oid:?} is not a full object ID"));
     }
-    let listed = git(
-        dir,
-        &[
-            "for-each-ref",
-            "--format=%(refname)",
-            "--contains",
-            oid,
-            "refs/heads/",
-        ],
-    )
-    .await?;
+    let listed = git(dir, &["for-each-ref", "--format=%(refname)", "--contains", oid, "refs/heads/"]).await?;
     Ok(listed.lines().map(str::to_string).collect())
 }
 
@@ -265,10 +237,7 @@ pub async fn remote_branch_exists(dir: &Path, branch: &str) -> Result<bool, Stri
     if ran.code != Some(0) {
         return Err(format!("git ls-remote failed: {}", ran.stderr));
     }
-    Ok(ran
-        .stdout
-        .lines()
-        .any(|line| line.ends_with(&format!("\t{refname}"))))
+    Ok(ran.stdout.lines().any(|line| line.ends_with(&format!("\t{refname}"))))
 }
 
 /// What a task's worktree has in progress and uncommitted, as far as a
@@ -289,11 +258,7 @@ pub struct WorktreeState {
 /// directory for per-worktree state such as a rebase in progress.
 async fn git_path(dir: &Path, name: &str) -> Result<PathBuf, String> {
     let path = PathBuf::from(git(dir, &["rev-parse", "--git-path", name]).await?);
-    Ok(if path.is_absolute() {
-        path
-    } else {
-        dir.join(path)
-    })
+    Ok(if path.is_absolute() { path } else { dir.join(path) })
 }
 
 /// What operation the worktree at `dir` is in the middle of, if any.
@@ -325,12 +290,7 @@ pub async fn worktree_state(dir: &Path) -> Result<WorktreeState, String> {
         .lines()
         .map(str::to_string)
         .collect();
-    Ok(WorktreeState {
-        head_ref,
-        head,
-        in_progress,
-        uncommitted,
-    })
+    Ok(WorktreeState { head_ref, head, in_progress, uncommitted })
 }
 
 /// A rebase of a branch left in progress in a worktree, as git's own state
@@ -349,10 +309,7 @@ pub struct InterruptedRebase {
 /// but an apply-backend rebase left by anything else is still reported, so
 /// that it goes through the same ownership checks rather than being
 /// overlooked.
-pub async fn interrupted_rebase_of(
-    dir: &Path,
-    branch: &str,
-) -> Result<Option<InterruptedRebase>, String> {
+pub async fn interrupted_rebase_of(dir: &Path, branch: &str) -> Result<Option<InterruptedRebase>, String> {
     let wanted = format!("refs/heads/{branch}");
     for name in ["rebase-merge", "rebase-apply"] {
         let state = git_path(dir, name).await?;
@@ -360,16 +317,8 @@ pub async fn interrupted_rebase_of(
             continue;
         };
         if head_name.trim() == wanted {
-            let read = |file: &str| {
-                std::fs::read_to_string(state.join(file))
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string()
-            };
-            return Ok(Some(InterruptedRebase {
-                orig_head: read("orig-head"),
-                onto: read("onto"),
-            }));
+            let read = |file: &str| std::fs::read_to_string(state.join(file)).unwrap_or_default().trim().to_string();
+            return Ok(Some(InterruptedRebase { orig_head: read("orig-head"), onto: read("onto") }));
         }
     }
     Ok(None)
@@ -389,23 +338,12 @@ async fn reflog(dir: &Path, refname: &str, limit: usize) -> Result<Vec<(String, 
     let limit = format!("--max-count={limit}");
     let ran = run(
         dir,
-        &[
-            "log",
-            "-g",
-            "--no-show-signature",
-            &limit,
-            "--format=%H%x00%gs",
-            refname,
-            "--",
-        ],
+        &["log", "-g", "--no-show-signature", &limit, "--format=%H%x00%gs", refname, "--"],
         &[],
     )
     .await?;
     if ran.code != Some(0) {
-        return Err(format!(
-            "git could not read the reflog of {refname}: {}",
-            ran.stderr
-        ));
+        return Err(format!("git could not read the reflog of {refname}: {}", ran.stderr));
     }
     Ok(ran
         .stdout
@@ -517,104 +455,38 @@ pub async fn head_moved_only_by_a_restack(dir: &Path) -> Result<Option<String>, 
 /// (`--diff-filter=T`), and refuses the undo, which would otherwise remove
 /// it.
 pub async fn changes_beyond_the_stop(dir: &Path) -> Result<Option<String>, String> {
-    let paths = |listed: Vec<String>| -> std::collections::BTreeSet<String> {
-        listed.into_iter().collect()
-    };
-    let unmerged =
-        paths(git_entries(dir, &["diff", "-z", "--name-only", "--diff-filter=U"]).await?);
+    let paths = |listed: Vec<String>| -> std::collections::BTreeSet<String> { listed.into_iter().collect() };
+    let unmerged = paths(git_entries(dir, &["diff", "-z", "--name-only", "--diff-filter=U"]).await?);
     if unmerged.is_empty() {
-        return Ok(Some(
-            "no conflicted paths are left, so they were resolved by hand".to_string(),
-        ));
+        return Ok(Some("no conflicted paths are left, so they were resolved by hand".to_string()));
     }
-    let mut unstaged = paths(
-        git_entries(
-            dir,
-            &["diff", "-z", "--name-only", "--ignore-submodules=all"],
-        )
-        .await?,
-    );
+    let mut unstaged = paths(git_entries(dir, &["diff", "-z", "--name-only", "--ignore-submodules=all"]).await?);
     unstaged.extend(paths(
-        git_entries(
-            dir,
-            &[
-                "diff",
-                "-z",
-                "--name-only",
-                "--diff-filter=T",
-                "--ignore-submodules=none",
-            ],
-        )
-        .await?,
+        git_entries(dir, &["diff", "-z", "--name-only", "--diff-filter=T", "--ignore-submodules=none"]).await?,
     ));
     let others: Vec<String> = unstaged.difference(&unmerged).cloned().collect();
     if !others.is_empty() {
-        return Ok(Some(format!(
-            "{} changed besides the conflict",
-            others.join(", ")
-        )));
+        return Ok(Some(format!("{} changed besides the conflict", others.join(", "))));
     }
-    let Some(stopped) = run(
-        dir,
-        &["rev-parse", "-q", "--verify", "REBASE_HEAD^{commit}"],
-        &[],
-    )
-    .await?
-    .stdout
-    .lines()
-    .next()
-    .filter(|oid| is_full_object_id(oid))
-    .map(str::to_string) else {
-        return Ok(Some(
-            "git does not name the commit it stopped on (REBASE_HEAD)".to_string(),
-        ));
+    let Some(stopped) = run(dir, &["rev-parse", "-q", "--verify", "REBASE_HEAD^{commit}"], &[])
+        .await?
+        .stdout
+        .lines()
+        .next()
+        .filter(|oid| is_full_object_id(oid))
+        .map(str::to_string)
+    else {
+        return Ok(Some("git does not name the commit it stopped on (REBASE_HEAD)".to_string()));
     };
-    let parent = run(
-        dir,
-        &["rev-parse", "-q", "--verify", &format!("{stopped}^1")],
-        &[],
-    )
-    .await?;
+    let parent = run(dir, &["rev-parse", "-q", "--verify", &format!("{stopped}^1")], &[]).await?;
     if parent.code != Some(0) || !is_full_object_id(&parent.stdout) {
-        return Ok(Some(format!(
-            "the commit it stopped on, {stopped}, has no parent to compare it with"
-        )));
+        return Ok(Some(format!("the commit it stopped on, {stopped}, has no parent to compare it with")));
     }
-    let own = paths(
-        git_entries(
-            dir,
-            &[
-                "diff-tree",
-                "-r",
-                "-z",
-                "--name-only",
-                "--no-renames",
-                &parent.stdout,
-                &stopped,
-            ],
-        )
-        .await?,
-    );
+    let own = paths(git_entries(dir, &["diff-tree", "-r", "-z", "--name-only", "--no-renames", &parent.stdout, &stopped]).await?);
     let staged = paths(
-        git_entries(
-            dir,
-            &[
-                "diff",
-                "--cached",
-                "-z",
-                "--name-only",
-                "--no-renames",
-                "--ignore-submodules=none",
-                "HEAD",
-            ],
-        )
-        .await?,
+        git_entries(dir, &["diff", "--cached", "-z", "--name-only", "--no-renames", "--ignore-submodules=none", "HEAD"]).await?,
     );
-    let foreign: Vec<String> = staged
-        .difference(&unmerged)
-        .filter(|p| !own.contains(*p))
-        .cloned()
-        .collect();
+    let foreign: Vec<String> = staged.difference(&unmerged).filter(|p| !own.contains(*p)).cloned().collect();
     if !foreign.is_empty() {
         return Ok(Some(format!(
             "{} staged, which the commit it stopped on does not change (or git staged its change \
@@ -622,8 +494,7 @@ pub async fn changes_beyond_the_stop(dir: &Path) -> Result<Option<String>, Strin
             foreign.join(", ")
         )));
     }
-    let untracked =
-        paths(git_entries(dir, &["ls-files", "-z", "--others", "--exclude-standard"]).await?);
+    let untracked = paths(git_entries(dir, &["ls-files", "-z", "--others", "--exclude-standard"]).await?);
     if !untracked.is_empty() {
         return Ok(Some(format!(
             "it has untracked files ({})",
@@ -646,61 +517,19 @@ pub async fn changes_beyond_the_stop(dir: &Path) -> Result<Option<String>, Strin
 /// staged, and is refused. So is a clean merge of a path both sides changed,
 /// which git stages as a third version: recovery fails closed there.
 pub async fn staged_resolutions_in_the_stop(dir: &Path) -> Result<Option<String>, String> {
-    let paths = |listed: Vec<String>| -> std::collections::BTreeSet<String> {
-        listed.into_iter().collect()
-    };
-    let stopped = git(
-        dir,
-        &["rev-parse", "-q", "--verify", "REBASE_HEAD^{commit}"],
-    )
-    .await;
+    let paths = |listed: Vec<String>| -> std::collections::BTreeSet<String> { listed.into_iter().collect() };
+    let stopped = git(dir, &["rev-parse", "-q", "--verify", "REBASE_HEAD^{commit}"]).await;
     let Some(stopped) = stopped.ok().filter(|oid| is_full_object_id(oid)) else {
-        return Ok(Some(
-            "git does not name the commit it stopped on (REBASE_HEAD)".to_string(),
-        ));
+        return Ok(Some("git does not name the commit it stopped on (REBASE_HEAD)".to_string()));
     };
-    let parent = run(
-        dir,
-        &["rev-parse", "-q", "--verify", &format!("{stopped}^1")],
-        &[],
-    )
-    .await?;
+    let parent = run(dir, &["rev-parse", "-q", "--verify", &format!("{stopped}^1")], &[]).await?;
     if parent.code != Some(0) || !is_full_object_id(&parent.stdout) {
-        return Ok(Some(format!(
-            "the commit it stopped on, {stopped}, has no parent to compare it with"
-        )));
+        return Ok(Some(format!("the commit it stopped on, {stopped}, has no parent to compare it with")));
     }
-    let unmerged =
-        paths(git_entries(dir, &["diff", "-z", "--name-only", "--diff-filter=U"]).await?);
-    let own = paths(
-        git_entries(
-            dir,
-            &[
-                "diff-tree",
-                "-r",
-                "-z",
-                "--name-only",
-                "--no-renames",
-                &parent.stdout,
-                &stopped,
-            ],
-        )
-        .await?,
-    );
+    let unmerged = paths(git_entries(dir, &["diff", "-z", "--name-only", "--diff-filter=U"]).await?);
+    let own = paths(git_entries(dir, &["diff-tree", "-r", "-z", "--name-only", "--no-renames", &parent.stdout, &stopped]).await?);
     let staged = paths(
-        git_entries(
-            dir,
-            &[
-                "diff",
-                "--cached",
-                "-z",
-                "--name-only",
-                "--no-renames",
-                "--ignore-submodules=none",
-                "HEAD",
-            ],
-        )
-        .await?,
+        git_entries(dir, &["diff", "--cached", "-z", "--name-only", "--no-renames", "--ignore-submodules=none", "HEAD"]).await?,
     );
     let candidates: Vec<&str> = staged
         .iter()
@@ -740,26 +569,12 @@ pub async fn staged_resolutions_in_the_stop(dir: &Path) -> Result<Option<String>
         git_entries(dir, &args).await
     };
     let index = entries(list(listing(vec!["ls-files", "-s", "-z"])).await?, false);
-    let head = entries(
-        list(listing(vec!["ls-tree", "-r", "-z", "--full-tree", "HEAD"])).await?,
-        true,
-    );
-    let rebase_head = entries(
-        list(listing(vec![
-            "ls-tree",
-            "-r",
-            "-z",
-            "--full-tree",
-            &stopped,
-        ]))
-        .await?,
-        true,
-    );
+    let head = entries(list(listing(vec!["ls-tree", "-r", "-z", "--full-tree", "HEAD"])).await?, true);
+    let rebase_head = entries(list(listing(vec!["ls-tree", "-r", "-z", "--full-tree", &stopped])).await?, true);
     let resolved: Vec<&str> = candidates
         .into_iter()
         .filter(|path| {
-            let at =
-                |listed: &std::collections::BTreeMap<String, String>| listed.get(*path).cloned();
+            let at = |listed: &std::collections::BTreeMap<String, String>| listed.get(*path).cloned();
             at(&index) != at(&head) && at(&index) != at(&rebase_head)
         })
         .collect();
@@ -794,26 +609,11 @@ pub async fn staged_resolutions_in_the_stop(dir: &Path) -> Result<Option<String>
 /// the reset is destroyed. The result is verified with
 /// [`verify_restored`]; if the branch was moved in the meantime, that fails
 /// and nothing it was moved to is lost.
-pub async fn undo_stopped_rebase(
-    dir: &Path,
-    branch: &str,
-    old_tip: &str,
-    message: &str,
-) -> Result<(), String> {
+pub async fn undo_stopped_rebase(dir: &Path, branch: &str, old_tip: &str, message: &str) -> Result<(), String> {
     let branch_ref = format!("refs/heads/{branch}");
     git(dir, &["rebase", "--quit"]).await?;
     git(dir, &["symbolic-ref", "-m", message, "HEAD", &branch_ref]).await?;
-    git(
-        dir,
-        &[
-            "read-tree",
-            "--reset",
-            "-u",
-            "--no-recurse-submodules",
-            old_tip,
-        ],
-    )
-    .await?;
+    git(dir, &["read-tree", "--reset", "-u", "--no-recurse-submodules", old_tip]).await?;
     verify_restored(dir, branch, old_tip).await
 }
 
@@ -847,9 +647,7 @@ pub async fn replay_matches(
     }
     for (original, replayed) in before.iter().zip(&after) {
         if patch_id(dir, original).await? != patch_id(dir, replayed).await? {
-            return Err(format!(
-                "{replayed} does not make the same change as {original}"
-            ));
+            return Err(format!("{replayed} does not make the same change as {original}"));
         }
     }
     Ok(())
@@ -885,18 +683,11 @@ pub async fn replay_matches_exactly(
 
 /// A commit's author name, author email and full raw message, untrimmed.
 async fn authored_message(dir: &Path, commit: &str) -> Result<(String, String, String), String> {
-    let mut parts = git_entries(
-        dir,
-        &["show", "-s", "-z", "--format=%an%x00%ae%x00%B", commit],
-    )
-    .await?
-    .into_iter();
-    let name = parts
-        .next()
-        .ok_or_else(|| format!("could not read the author of {commit}"))?;
-    let email = parts
-        .next()
-        .ok_or_else(|| format!("could not read the author of {commit}"))?;
+    let mut parts = git_entries(dir, &["show", "-s", "-z", "--format=%an%x00%ae%x00%B", commit])
+        .await?
+        .into_iter();
+    let name = parts.next().ok_or_else(|| format!("could not read the author of {commit}"))?;
+    let email = parts.next().ok_or_else(|| format!("could not read the author of {commit}"))?;
     Ok((name, email, parts.next().unwrap_or_default()))
 }
 
@@ -916,23 +707,15 @@ pub fn republish_backup_ref(task_id: Uuid) -> String {
 /// -m -u`, which refuses rather than overwrite a local change. The caller has
 /// checked that the worktree is on the branch at `from`, clean and in the
 /// middle of nothing. Verified afterwards by [`verify_restored`].
-pub async fn move_branch_back(
-    dir: &Path,
-    branch: &str,
-    from: &str,
-    to: &str,
-) -> Result<(), String> {
+pub async fn move_branch_back(dir: &Path, branch: &str, from: &str, to: &str) -> Result<(), String> {
     let branch_ref = format!("refs/heads/{branch}");
     git(dir, &["update-ref", &branch_ref, to, from])
         .await
         .map_err(|e| format!("could not move {branch_ref} from {from} back to {to}: {e}"))?;
     git(dir, &["update-index", "-q", "--refresh"]).await?;
-    git(
-        dir,
-        &["read-tree", "-m", "-u", "--no-recurse-submodules", from, to],
-    )
-    .await
-    .map_err(|e| format!("{branch_ref} is back at {to}, but the worktree could not follow: {e}"))?;
+    git(dir, &["read-tree", "-m", "-u", "--no-recurse-submodules", from, to])
+        .await
+        .map_err(|e| format!("{branch_ref} is back at {to}, but the worktree could not follow: {e}"))?;
     verify_restored(dir, branch, to).await
 }
 
@@ -959,10 +742,7 @@ pub async fn verify_restored(dir: &Path, branch: &str, old_tip: &str) -> Result<
     let branch_ref = format!("refs/heads/{branch}");
     let tip = exact_ref(dir, &branch_ref).await?;
     if tip.as_deref() != Some(old_tip) {
-        return Err(format!(
-            "{branch_ref} is at {}, not {old_tip}",
-            tip.as_deref().unwrap_or("nothing (it is missing)")
-        ));
+        return Err(format!("{branch_ref} is at {}, not {old_tip}", tip.as_deref().unwrap_or("nothing (it is missing)")));
     }
     let state = worktree_state(dir).await?;
     if state.head_ref.as_deref() != Some(branch_ref.as_str()) || state.head != old_tip {
@@ -973,9 +753,7 @@ pub async fn verify_restored(dir: &Path, branch: &str, old_tip: &str) -> Result<
         ));
     }
     if let Some(operation) = state.in_progress {
-        return Err(format!(
-            "the worktree is still in the middle of a {operation}"
-        ));
+        return Err(format!("the worktree is still in the middle of a {operation}"));
     }
     Ok(())
 }
@@ -1110,18 +888,14 @@ impl<'a> Restack<'a> {
         let mut envs = match committer_env(self.worktree, self.old_tip).await {
             Ok(envs) => envs,
             Err(e) => {
-                return Err(self
-                    .restore(false, format!("the rebase could not be started: {e}"))
-                    .await)
+                return Err(self.restore(false, format!("the rebase could not be started: {e}")).await)
             }
         };
         envs.push(("GIT_REFLOG_ACTION", self.marker.clone()));
         let version = match git(self.worktree, &["version"]).await {
             Ok(version) => version,
             Err(e) => {
-                return Err(self
-                    .restore(false, format!("the rebase could not be started: {e}"))
-                    .await)
+                return Err(self.restore(false, format!("the rebase could not be started: {e}")).await)
             }
         };
         let mut args = vec![
@@ -1149,9 +923,7 @@ impl<'a> Restack<'a> {
         let rebased = run(self.worktree, &args, &envs).await;
         match rebased {
             Ok(ran) => Ok(ran),
-            Err(e) => Err(self
-                .restore(false, format!("git rebase could not be run: {e}"))
-                .await),
+            Err(e) => Err(self.restore(false, format!("git rebase could not be run: {e}")).await),
         }
     }
 
@@ -1164,19 +936,14 @@ impl<'a> Restack<'a> {
             let what = if conflicted.is_empty() {
                 format!("git rebase failed: {}", rebased.stderr)
             } else {
-                format!(
-                    "it stopped on a conflict in {}",
-                    conflicted.lines().collect::<Vec<_>>().join(", ")
-                )
+                format!("it stopped on a conflict in {}", conflicted.lines().collect::<Vec<_>>().join(", "))
             };
             return Err(self.restore(true, what).await);
         }
 
         match self.verify().await {
             Ok(new_tip) => Ok(new_tip),
-            Err(why) => Err(self
-                .restore(true, format!("the rebased branch did not verify: {why}"))
-                .await),
+            Err(why) => Err(self.restore(true, format!("the rebased branch did not verify: {why}")).await),
         }
     }
 
@@ -1186,9 +953,7 @@ impl<'a> Restack<'a> {
         let branch_ref = format!("refs/heads/{}", self.branch);
         let new_tip = produced_tip(self.worktree, self.branch, &self.marker)
             .await?
-            .ok_or_else(|| {
-                format!("the latest update of {branch_ref} is not this restack's rebase")
-            })?;
+            .ok_or_else(|| format!("the latest update of {branch_ref} is not this restack's rebase"))?;
         let tip = exact_ref(self.worktree, &branch_ref).await?;
         if tip.as_deref() != Some(new_tip.as_str()) {
             return Err(format!(
@@ -1197,27 +962,16 @@ impl<'a> Restack<'a> {
             ));
         }
         if !head_moved_only_by(self.worktree, &self.marker).await? {
-            return Err(
-                "the worktree's HEAD was moved by something other than this restack".to_string(),
-            );
+            return Err("the worktree's HEAD was moved by something other than this restack".to_string());
         }
         let state = worktree_state(self.worktree).await?;
         if state.head_ref.as_deref() != Some(branch_ref.as_str()) || state.head != new_tip {
-            return Err(format!(
-                "the worktree's HEAD is not {branch_ref} at {new_tip}"
-            ));
+            return Err(format!("the worktree's HEAD is not {branch_ref} at {new_tip}"));
         }
         if let Some(operation) = state.in_progress {
             return Err(format!("the worktree is in the middle of a {operation}"));
         }
-        replay_matches(
-            self.worktree,
-            self.fork_point,
-            self.old_tip,
-            self.onto,
-            &new_tip,
-        )
-        .await?;
+        replay_matches(self.worktree, self.fork_point, self.old_tip, self.onto, &new_tip).await?;
         Ok(new_tip)
     }
 
@@ -1260,19 +1014,13 @@ impl<'a> Restack<'a> {
     /// left exactly as it is ([`RestackFailure::BranchMoved`]). Only a
     /// verified restoration retires the backup ref.
     async fn restore(&self, ran: bool, what: String) -> RestackFailure {
-        let undone = if ran {
-            self.undo().await
-        } else {
-            self.check_untouched().await
-        };
+        let undone = if ran { self.undo().await } else { self.check_untouched().await };
         match undone {
             Ok(()) => match retire_backup(self.worktree, self.backup, self.old_tip).await {
                 Ok(()) => RestackFailure::Restored(what),
                 Err(e) => RestackFailure::Restored(format!("{what} ({e})")),
             },
-            Err(NotUndone::Moved(how)) => {
-                RestackFailure::BranchMoved(format!("{what}; meanwhile {how}"))
-            }
+            Err(NotUndone::Moved(how)) => RestackFailure::BranchMoved(format!("{what}; meanwhile {how}")),
             Err(NotUndone::Failed(why)) => RestackFailure::NotRestored(format!(
                 "{what}, and the branch could not be verified as restored: {why}"
             )),
@@ -1284,11 +1032,7 @@ impl<'a> Restack<'a> {
     async fn check_untouched(&self) -> Result<(), NotUndone> {
         verify_restored(self.worktree, self.branch, self.old_tip)
             .await
-            .map_err(|why| {
-                NotUndone::Moved(format!(
-                    "{why}, although SlashIt had not changed anything yet"
-                ))
-            })
+            .map_err(|why| NotUndone::Moved(format!("{why}, although SlashIt had not changed anything yet")))
     }
 
     /// After a rebase that ran: undo what it provably did, and nothing else.
@@ -1299,8 +1043,7 @@ impl<'a> Restack<'a> {
 
         if operation_in_progress(self.worktree).await? == Some("rebase") {
             let rebase = interrupted_rebase_of(self.worktree, self.branch).await?;
-            let own_rebase =
-                rebase.is_some_and(|r| r.orig_head == self.old_tip && r.onto == self.onto);
+            let own_rebase = rebase.is_some_and(|r| r.orig_head == self.old_tip && r.onto == self.onto);
             if !own_rebase {
                 return Err(NotUndone::Moved(format!(
                     "the rebase in progress in the worktree is not this restack's; {branch_ref} is at {}",
@@ -1308,10 +1051,7 @@ impl<'a> Restack<'a> {
                 )));
             }
             if tip.as_deref() != Some(self.old_tip) {
-                return Err(NotUndone::Moved(format!(
-                    "{branch_ref} was moved to {}",
-                    shown(&tip)
-                )));
+                return Err(NotUndone::Moved(format!("{branch_ref} was moved to {}", shown(&tip))));
             }
             if !head_moved_only_by(self.worktree, &self.marker).await? {
                 let head = git(self.worktree, &["rev-parse", "--verify", "HEAD"]).await?;
@@ -1333,9 +1073,7 @@ impl<'a> Restack<'a> {
                 hook();
             }
             let message = format!("{} (rollback)", self.marker);
-            if let Err(why) =
-                undo_stopped_rebase(self.worktree, self.branch, self.old_tip, &message).await
-            {
+            if let Err(why) = undo_stopped_rebase(self.worktree, self.branch, self.old_tip, &message).await {
                 let now = exact_ref(self.worktree, &branch_ref).await?;
                 if now.as_deref() != Some(self.old_tip) {
                     return Err(NotUndone::Moved(format!(
@@ -1388,14 +1126,7 @@ impl<'a> Restack<'a> {
         let message = format!("{} (rollback)", self.marker);
         let swapped = run(
             self.worktree,
-            &[
-                "update-ref",
-                "-m",
-                &message,
-                &branch_ref,
-                self.old_tip,
-                &produced,
-            ],
+            &["update-ref", "-m", &message, &branch_ref, self.old_tip, &produced],
             &[],
         )
         .await?;
@@ -1415,14 +1146,7 @@ impl<'a> Restack<'a> {
         run(self.worktree, &["update-index", "-q", "--refresh"], &[]).await?;
         let files = run(
             self.worktree,
-            &[
-                "read-tree",
-                "-m",
-                "-u",
-                "--no-recurse-submodules",
-                &produced,
-                self.old_tip,
-            ],
+            &["read-tree", "-m", "-u", "--no-recurse-submodules", &produced, self.old_tip],
             &[],
         )
         .await?;
@@ -1474,25 +1198,14 @@ async fn committer_env(dir: &Path, tip: &str) -> Result<Vec<(&'static str, Strin
     let (name, email) = who
         .split_once('\0')
         .ok_or_else(|| format!("could not read the committer of {tip}"))?;
-    Ok(vec![
-        ("GIT_COMMITTER_NAME", name.to_string()),
-        ("GIT_COMMITTER_EMAIL", email.to_string()),
-    ])
+    Ok(vec![("GIT_COMMITTER_NAME", name.to_string()), ("GIT_COMMITTER_EMAIL", email.to_string())])
 }
 
 /// `git patch-id --stable` of `commit`'s own change with no context lines,
 /// or the empty string for a commit that changes nothing.
 async fn patch_id(dir: &Path, commit: &str) -> Result<String, String> {
     let diff = crate::host_process::tokio_command("git")
-        .args([
-            "diff-tree",
-            "-p",
-            "-U0",
-            "--no-color",
-            "--no-ext-diff",
-            "--no-renames",
-            commit,
-        ])
+        .args(["diff-tree", "-p", "-U0", "--no-color", "--no-ext-diff", "--no-renames", commit])
         .current_dir(dir)
         .stdin(std::process::Stdio::null())
         .output()
@@ -1597,41 +1310,18 @@ mod tests {
             let origin = tmp.path().join("origin.git");
             let repo = tmp.path().join("repo");
             let worktree = tmp.path().join("worktree");
-            git_in(
-                tmp.path(),
-                &["init", "-q", "--bare", origin.to_str().unwrap()],
-            );
-            git_in(
-                tmp.path(),
-                &["init", "-q", "-b", "main", repo.to_str().unwrap()],
-            );
+            git_in(tmp.path(), &["init", "-q", "--bare", origin.to_str().unwrap()]);
+            git_in(tmp.path(), &["init", "-q", "-b", "main", repo.to_str().unwrap()]);
             git_in(&repo, &["config", "user.name", "Test"]);
             git_in(&repo, &["config", "user.email", "test@example.com"]);
-            git_in(
-                &repo,
-                &["remote", "add", "origin", origin.to_str().unwrap()],
-            );
+            git_in(&repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
             let sub_commits = submodule.then(|| {
                 let sub = tmp.path().join("sub");
-                git_in(
-                    tmp.path(),
-                    &["init", "-q", "-b", "main", sub.to_str().unwrap()],
-                );
+                git_in(tmp.path(), &["init", "-q", "-b", "main", sub.to_str().unwrap()]);
                 let s1 = commit(&sub, "s.txt", "s1\n", "S1");
                 let s2 = commit(&sub, "s.txt", "s2\n", "S2");
                 let url = sub.to_str().unwrap();
-                git_in(
-                    &repo,
-                    &[
-                        "-c",
-                        "protocol.file.allow=always",
-                        "submodule",
-                        "add",
-                        "-q",
-                        url,
-                        "sub",
-                    ],
-                );
+                git_in(&repo, &["-c", "protocol.file.allow=always", "submodule", "add", "-q", url, "sub"]);
                 git_in(&repo.join("sub"), &["checkout", "-q", &s1]);
                 (s1, s2)
             });
@@ -1657,45 +1347,17 @@ mod tests {
             }
             let onto = git_in(&repo, &["rev-parse", "HEAD"]);
             git_in(&repo, &["push", "-q", "origin", "main"]);
-            git_in(
-                &repo,
-                &["worktree", "add", "-q", worktree.to_str().unwrap(), "task"],
-            );
+            git_in(&repo, &["worktree", "add", "-q", worktree.to_str().unwrap(), "task"]);
             if submodule {
-                git_in(
-                    &worktree,
-                    &[
-                        "-c",
-                        "protocol.file.allow=always",
-                        "submodule",
-                        "update",
-                        "-q",
-                        "--init",
-                    ],
-                );
+                git_in(&worktree, &["-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init"]);
             }
             let backup = backup_ref(Uuid::new_v4());
             git_in(&repo, &["update-ref", &backup, &old_tip, ""]);
-            Fixture {
-                _tmp: tmp,
-                origin,
-                worktree,
-                fork_point,
-                old_tip,
-                onto,
-                backup,
-            }
+            Fixture { _tmp: tmp, origin, worktree, fork_point, old_tip, onto, backup }
         }
 
         fn restack(&self) -> Restack<'_> {
-            Restack::new(
-                &self.worktree,
-                "task",
-                &self.fork_point,
-                &self.old_tip,
-                &self.onto,
-                &self.backup,
-            )
+            Restack::new(&self.worktree, "task", &self.fork_point, &self.old_tip, &self.onto, &self.backup)
         }
 
         fn tip(&self) -> Option<String> {
@@ -1719,32 +1381,17 @@ mod tests {
 
         /// Nothing reached `origin` but `main`.
         fn assert_nothing_pushed(&self) {
-            assert_eq!(
-                ref_in(&self.origin, "refs/heads/task"),
-                None,
-                "nothing may be pushed"
-            );
+            assert_eq!(ref_in(&self.origin, "refs/heads/task"), None, "nothing may be pushed");
         }
 
         /// The ordinary outcome of a rollback: the branch and the worktree
         /// exactly at the old tip, clean, and the backup retired.
         fn assert_restored(&self, name: &str) {
             assert_eq!(self.tip().as_deref(), Some(self.old_tip.as_str()), "{name}");
-            assert_eq!(
-                git_in(&self.worktree, &["symbolic-ref", "HEAD"]),
-                "refs/heads/task",
-                "{name}"
-            );
+            assert_eq!(git_in(&self.worktree, &["symbolic-ref", "HEAD"]), "refs/heads/task", "{name}");
             assert_eq!(self.head(), self.old_tip, "{name}");
             assert!(!self.rebase_in_progress(), "{name}");
-            assert_eq!(
-                git_in(
-                    &self.worktree,
-                    &["status", "--porcelain", "--untracked-files=all"]
-                ),
-                "",
-                "{name}"
-            );
+            assert_eq!(git_in(&self.worktree, &["status", "--porcelain", "--untracked-files=all"]), "", "{name}");
             assert_eq!(self.backup_at(), None, "{name}: the backup is retired");
             self.assert_nothing_pushed();
         }
@@ -1758,22 +1405,17 @@ mod tests {
     }
 
     fn ref_in(dir: &Path, refname: &str) -> Option<String> {
-        git_in(
-            dir,
-            &["for-each-ref", "--format=%(refname) %(objectname)", refname],
-        )
-        .lines()
-        .find_map(|line| {
-            let (name, oid) = line.split_once(' ')?;
-            (name == refname).then(|| oid.to_string())
-        })
+        git_in(dir, &["for-each-ref", "--format=%(refname) %(objectname)", refname])
+            .lines()
+            .find_map(|line| {
+                let (name, oid) = line.split_once(' ')?;
+                (name == refname).then(|| oid.to_string())
+            })
     }
 
     fn describe(failure: &RestackFailure) -> &str {
         match failure {
-            RestackFailure::Restored(why)
-            | RestackFailure::NotRestored(why)
-            | RestackFailure::BranchMoved(why) => why,
+            RestackFailure::Restored(why) | RestackFailure::NotRestored(why) | RestackFailure::BranchMoved(why) => why,
         }
     }
 
@@ -1786,32 +1428,19 @@ mod tests {
     async fn a_rollback_after_a_terminal_commit_leaves_the_branch_alone() {
         let fixture = Fixture::new(false);
         let restack = fixture.restack();
-        let new_tip = restack
-            .replay()
-            .await
-            .unwrap_or_else(|_| panic!("the replay verifies"));
+        let new_tip = restack.replay().await.unwrap_or_else(|_| panic!("the replay verifies"));
         assert_eq!(fixture.tip().as_deref(), Some(new_tip.as_str()));
         let user = commit(&fixture.worktree, "u.txt", "u\n", "U");
 
-        let failure = restack
-            .roll_back("the task could not record the restack".to_string())
-            .await;
+        let failure = restack.roll_back("the task could not record the restack".to_string()).await;
 
         assert!(
             matches!(&failure, RestackFailure::BranchMoved(why) if why.contains(&user)),
             "{}",
             describe(&failure)
         );
-        assert_eq!(
-            fixture.tip().as_deref(),
-            Some(user.as_str()),
-            "the terminal commit stays the tip"
-        );
-        assert_eq!(
-            fixture.backup_at().as_deref(),
-            Some(fixture.old_tip.as_str()),
-            "the backup is kept"
-        );
+        assert_eq!(fixture.tip().as_deref(), Some(user.as_str()), "the terminal commit stays the tip");
+        assert_eq!(fixture.backup_at().as_deref(), Some(fixture.old_tip.as_str()), "the backup is kept");
         fixture.assert_nothing_pushed();
     }
 
@@ -1822,30 +1451,15 @@ mod tests {
     async fn a_rollback_after_the_worktree_left_the_branch_leaves_it_alone() {
         let fixture = Fixture::new(false);
         let restack = fixture.restack();
-        let new_tip = restack
-            .replay()
-            .await
-            .unwrap_or_else(|f| panic!("{}", describe(&f)));
+        let new_tip = restack.replay().await.unwrap_or_else(|f| panic!("{}", describe(&f)));
         git_in(&fixture.worktree, &["checkout", "-q", "--detach"]);
 
-        let failure = restack
-            .roll_back("the task could not record the restack".to_string())
-            .await;
+        let failure = restack.roll_back("the task could not record the restack".to_string()).await;
 
-        assert!(
-            matches!(failure, RestackFailure::BranchMoved(_)),
-            "{}",
-            describe(&failure)
-        );
+        assert!(matches!(failure, RestackFailure::BranchMoved(_)), "{}", describe(&failure));
         assert_eq!(fixture.tip().as_deref(), Some(new_tip.as_str()));
-        assert!(
-            git_in(&fixture.worktree, &["branch", "--show-current"]).is_empty(),
-            "still detached"
-        );
-        assert_eq!(
-            fixture.backup_at().as_deref(),
-            Some(fixture.old_tip.as_str())
-        );
+        assert!(git_in(&fixture.worktree, &["branch", "--show-current"]).is_empty(), "still detached");
+        assert_eq!(fixture.backup_at().as_deref(), Some(fixture.old_tip.as_str()));
         fixture.assert_nothing_pushed();
     }
 
@@ -1856,15 +1470,10 @@ mod tests {
     async fn a_rollback_that_would_overwrite_a_local_change_keeps_it() {
         let fixture = Fixture::new(false);
         let restack = fixture.restack();
-        restack
-            .replay()
-            .await
-            .unwrap_or_else(|f| panic!("{}", describe(&f)));
+        restack.replay().await.unwrap_or_else(|f| panic!("{}", describe(&f)));
         std::fs::write(fixture.worktree.join("m.txt"), "edited\n").unwrap();
 
-        let failure = restack
-            .roll_back("the task could not record the restack".to_string())
-            .await;
+        let failure = restack.roll_back("the task could not record the restack".to_string()).await;
 
         assert!(
             matches!(&failure, RestackFailure::NotRestored(why) if why.contains("read-tree")),
@@ -1872,14 +1481,8 @@ mod tests {
             describe(&failure)
         );
         assert_eq!(fixture.tip().as_deref(), Some(fixture.old_tip.as_str()));
-        assert_eq!(
-            std::fs::read_to_string(fixture.worktree.join("m.txt")).unwrap(),
-            "edited\n"
-        );
-        assert_eq!(
-            fixture.backup_at().as_deref(),
-            Some(fixture.old_tip.as_str())
-        );
+        assert_eq!(std::fs::read_to_string(fixture.worktree.join("m.txt")).unwrap(), "edited\n");
+        assert_eq!(fixture.backup_at().as_deref(), Some(fixture.old_tip.as_str()));
         fixture.assert_nothing_pushed();
     }
 
@@ -1892,25 +1495,13 @@ mod tests {
         for moved_branch in [false, true] {
             let fixture = Fixture::new(true);
             let restack = fixture.restack();
-            let ran = restack
-                .rebase()
-                .await
-                .unwrap_or_else(|f| panic!("{}", describe(&f)));
+            let ran = restack.rebase().await.unwrap_or_else(|f| panic!("{}", describe(&f)));
             assert_ne!(ran.code, Some(0));
             assert!(fixture.rebase_in_progress());
             let (expected_tip, expected_head) = if moved_branch {
-                let tree = git_in(
-                    &fixture.worktree,
-                    &["rev-parse", &format!("{}^{{tree}}", fixture.old_tip)],
-                );
-                let moved = git_in(
-                    &fixture.worktree,
-                    &["commit-tree", "-p", &fixture.old_tip, "-m", "U", &tree],
-                );
-                git_in(
-                    &fixture.worktree,
-                    &["update-ref", "refs/heads/task", &moved, &fixture.old_tip],
-                );
+                let tree = git_in(&fixture.worktree, &["rev-parse", &format!("{}^{{tree}}", fixture.old_tip)]);
+                let moved = git_in(&fixture.worktree, &["commit-tree", "-p", &fixture.old_tip, "-m", "U", &tree]);
+                git_in(&fixture.worktree, &["update-ref", "refs/heads/task", &moved, &fixture.old_tip]);
                 (moved, fixture.head())
             } else {
                 std::fs::write(fixture.worktree.join("b.txt"), "resolved\n").unwrap();
@@ -1926,20 +1517,10 @@ mod tests {
                 "moved_branch={moved_branch}: {}",
                 describe(&failure)
             );
-            assert!(
-                fixture.rebase_in_progress(),
-                "moved_branch={moved_branch}: not aborted"
-            );
+            assert!(fixture.rebase_in_progress(), "moved_branch={moved_branch}: not aborted");
             assert_eq!(fixture.head(), expected_head, "moved_branch={moved_branch}");
-            assert_eq!(
-                fixture.tip().as_deref(),
-                Some(expected_tip.as_str()),
-                "moved_branch={moved_branch}"
-            );
-            assert_eq!(
-                fixture.backup_at().as_deref(),
-                Some(fixture.old_tip.as_str())
-            );
+            assert_eq!(fixture.tip().as_deref(), Some(expected_tip.as_str()), "moved_branch={moved_branch}");
+            assert_eq!(fixture.backup_at().as_deref(), Some(fixture.old_tip.as_str()));
             fixture.assert_nothing_pushed();
         }
     }
@@ -1952,46 +1533,23 @@ mod tests {
     async fn undoing_a_stopped_restack_never_moves_the_branch_back() {
         let fixture = Fixture::new(true);
         let restack = fixture.restack();
-        let ran = restack
-            .rebase()
-            .await
-            .unwrap_or_else(|f| panic!("{}", describe(&f)));
+        let ran = restack.rebase().await.unwrap_or_else(|f| panic!("{}", describe(&f)));
         assert_ne!(ran.code, Some(0));
-        let tree = git_in(
-            &fixture.worktree,
-            &["rev-parse", &format!("{}^{{tree}}", fixture.old_tip)],
-        );
-        let user = git_in(
-            &fixture.worktree,
-            &["commit-tree", "-p", &fixture.old_tip, "-m", "U", &tree],
-        );
+        let tree = git_in(&fixture.worktree, &["rev-parse", &format!("{}^{{tree}}", fixture.old_tip)]);
+        let user = git_in(&fixture.worktree, &["commit-tree", "-p", &fixture.old_tip, "-m", "U", &tree]);
         *restack.before_undoing_a_stop.lock().unwrap() = Some(Box::new({
             let worktree = fixture.worktree.clone();
             let (user, old_tip) = (user.clone(), fixture.old_tip.clone());
             move || {
-                git_in(
-                    &worktree,
-                    &["update-ref", "refs/heads/task", &user, &old_tip],
-                );
+                git_in(&worktree, &["update-ref", "refs/heads/task", &user, &old_tip]);
             }
         }));
 
         let failure = restack.settle(ran).await.expect_err("not restacked");
 
-        assert_eq!(
-            fixture.tip().as_deref(),
-            Some(user.as_str()),
-            "the branch keeps what it was moved to"
-        );
-        assert!(
-            !matches!(failure, RestackFailure::Restored(_)),
-            "{}",
-            describe(&failure)
-        );
-        assert_eq!(
-            fixture.backup_at().as_deref(),
-            Some(fixture.old_tip.as_str())
-        );
+        assert_eq!(fixture.tip().as_deref(), Some(user.as_str()), "the branch keeps what it was moved to");
+        assert!(!matches!(failure, RestackFailure::Restored(_)), "{}", describe(&failure));
+        assert_eq!(fixture.backup_at().as_deref(), Some(fixture.old_tip.as_str()));
         fixture.assert_nothing_pushed();
     }
 
@@ -2026,21 +1584,11 @@ mod tests {
         git_in(wt, &["config", "rerere.enabled", "true"]);
         git_in(wt, &["config", "rerere.autoUpdate", "true"]);
         let stopped = StdCommand::new("git")
-            .args([
-                "rebase",
-                "-q",
-                "--onto",
-                &fixture.onto,
-                &fixture.fork_point,
-                "task",
-            ])
+            .args(["rebase", "-q", "--onto", &fixture.onto, &fixture.fork_point, "task"])
             .current_dir(wt)
             .output()
             .expect("run git");
-        assert!(
-            !stopped.status.success(),
-            "the rebase must stop on the conflict"
-        );
+        assert!(!stopped.status.success(), "the rebase must stop on the conflict");
         std::fs::write(wt.join("b.txt"), "resolved\n").unwrap();
         git_in(wt, &["rerere"]);
         git_in(wt, &["rebase", "--abort"]);
@@ -2048,11 +1596,7 @@ mod tests {
 
         let failure = fixture.restack().replay().await.expect_err("conflict");
 
-        assert!(
-            matches!(failure, RestackFailure::Restored(_)),
-            "{}",
-            describe(&failure)
-        );
+        assert!(matches!(failure, RestackFailure::Restored(_)), "{}", describe(&failure));
         fixture.assert_restored("rerere");
     }
 
@@ -2065,11 +1609,7 @@ mod tests {
 
         let failure = fixture.restack().replay().await.expect_err("conflict");
 
-        assert!(
-            matches!(failure, RestackFailure::Restored(_)),
-            "{}",
-            describe(&failure)
-        );
+        assert!(matches!(failure, RestackFailure::Restored(_)), "{}", describe(&failure));
         fixture.assert_restored("submodule");
     }
 
@@ -2080,10 +1620,7 @@ mod tests {
         let fixture = Fixture::with_submodule();
         git_in(&fixture.worktree, &["config", "submodule.recurse", "true"]);
         let restack = fixture.restack();
-        let ran = restack
-            .rebase()
-            .await
-            .unwrap_or_else(|f| panic!("{}", describe(&f)));
+        let ran = restack.rebase().await.unwrap_or_else(|f| panic!("{}", describe(&f)));
         assert_ne!(ran.code, Some(0));
         let edited = fixture.worktree.join("sub").join("s.txt");
         std::fs::write(&edited, "edited in the submodule\n").unwrap();
@@ -2107,10 +1644,7 @@ mod tests {
     async fn undoing_a_stop_refuses_a_submodule_replaced_by_a_file() {
         let fixture = Fixture::with_submodule();
         let restack = fixture.restack();
-        let ran = restack
-            .rebase()
-            .await
-            .unwrap_or_else(|f| panic!("{}", describe(&f)));
+        let ran = restack.rebase().await.unwrap_or_else(|f| panic!("{}", describe(&f)));
         assert_ne!(ran.code, Some(0));
         let sub = fixture.worktree.join("sub");
         std::fs::remove_dir_all(&sub).unwrap();
@@ -2118,17 +1652,10 @@ mod tests {
 
         let failure = restack.settle(ran).await.expect_err("not restacked");
 
-        assert!(
-            matches!(failure, RestackFailure::BranchMoved(_)),
-            "{}",
-            describe(&failure)
-        );
+        assert!(matches!(failure, RestackFailure::BranchMoved(_)), "{}", describe(&failure));
         assert_eq!(std::fs::read_to_string(&sub).unwrap(), "a file now\n");
         assert!(fixture.rebase_in_progress(), "the stop is left as it is");
-        assert_eq!(
-            fixture.backup_at().as_deref(),
-            Some(fixture.old_tip.as_str())
-        );
+        assert_eq!(fixture.backup_at().as_deref(), Some(fixture.old_tip.as_str()));
         fixture.assert_nothing_pushed();
     }
 
@@ -2136,38 +1663,20 @@ mod tests {
     /// tells `git diff` to ignore that submodule.
     #[tokio::test]
     async fn undoing_a_stop_refuses_a_replaced_submodule_that_configuration_ignores() {
-        for (key, value) in [
-            ("submodule.sub.ignore", "all"),
-            ("diff.ignoreSubmodules", "all"),
-        ] {
+        for (key, value) in [("submodule.sub.ignore", "all"), ("diff.ignoreSubmodules", "all")] {
             let fixture = Fixture::with_submodule();
             git_in(&fixture.worktree, &["config", key, value]);
             let restack = fixture.restack();
-            let ran = restack
-                .rebase()
-                .await
-                .unwrap_or_else(|f| panic!("{}", describe(&f)));
+            let ran = restack.rebase().await.unwrap_or_else(|f| panic!("{}", describe(&f)));
             let sub = fixture.worktree.join("sub");
             std::fs::remove_dir_all(&sub).unwrap();
             std::fs::write(&sub, "a file now\n").unwrap();
 
             let failure = restack.settle(ran).await.expect_err("not restacked");
 
-            assert!(
-                matches!(failure, RestackFailure::BranchMoved(_)),
-                "{key}: {}",
-                describe(&failure)
-            );
-            assert_eq!(
-                std::fs::read_to_string(&sub).unwrap(),
-                "a file now\n",
-                "{key}"
-            );
-            assert_eq!(
-                fixture.backup_at().as_deref(),
-                Some(fixture.old_tip.as_str()),
-                "{key}"
-            );
+            assert!(matches!(failure, RestackFailure::BranchMoved(_)), "{key}: {}", describe(&failure));
+            assert_eq!(std::fs::read_to_string(&sub).unwrap(), "a file now\n", "{key}");
+            assert_eq!(fixture.backup_at().as_deref(), Some(fixture.old_tip.as_str()), "{key}");
         }
     }
 
@@ -2179,35 +1688,21 @@ mod tests {
         for new_file in [false, true] {
             let fixture = Fixture::new(true);
             let restack = fixture.restack();
-            let ran = restack
-                .rebase()
-                .await
-                .unwrap_or_else(|f| panic!("{}", describe(&f)));
+            let ran = restack.rebase().await.unwrap_or_else(|f| panic!("{}", describe(&f)));
             let file = if new_file { "n.txt" } else { "f.txt" };
             std::fs::write(fixture.worktree.join(file), "staged by the user\n").unwrap();
             git_in(&fixture.worktree, &["add", file]);
 
             let failure = restack.settle(ran).await.expect_err("not restacked");
 
-            assert!(
-                matches!(failure, RestackFailure::BranchMoved(_)),
-                "{file}: {}",
-                describe(&failure)
-            );
+            assert!(matches!(failure, RestackFailure::BranchMoved(_)), "{file}: {}", describe(&failure));
             assert_eq!(
                 std::fs::read_to_string(fixture.worktree.join(file)).unwrap(),
                 "staged by the user\n",
                 "{file}"
             );
-            assert!(
-                fixture.rebase_in_progress(),
-                "{file}: the stop is left as it is"
-            );
-            assert_eq!(
-                fixture.backup_at().as_deref(),
-                Some(fixture.old_tip.as_str()),
-                "{file}"
-            );
+            assert!(fixture.rebase_in_progress(), "{file}: the stop is left as it is");
+            assert_eq!(fixture.backup_at().as_deref(), Some(fixture.old_tip.as_str()), "{file}");
         }
     }
 
@@ -2235,10 +1730,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path().join("repo");
         let worktree = tmp.path().join("worktree");
-        git_in(
-            tmp.path(),
-            &["init", "-q", "-b", "main", repo.to_str().unwrap()],
-        );
+        git_in(tmp.path(), &["init", "-q", "-b", "main", repo.to_str().unwrap()]);
         let fork_point = commit(&repo, "f.txt", "f\n", "F");
         git_in(&repo, &["checkout", "-q", "-b", "task"]);
         std::fs::write(repo.join(" lead.txt"), "task\n").unwrap();
@@ -2246,35 +1738,18 @@ mod tests {
         git_in(&repo, &["checkout", "-q", "main"]);
         std::fs::write(repo.join(" lead.txt"), "main\n").unwrap();
         let onto = commit(&repo, "z.txt", "main\n", "M");
-        git_in(
-            &repo,
-            &["worktree", "add", "-q", worktree.to_str().unwrap(), "task"],
-        );
+        git_in(&repo, &["worktree", "add", "-q", worktree.to_str().unwrap(), "task"]);
         let backup = backup_ref(Uuid::new_v4());
         let restack = Restack::new(&worktree, "task", &fork_point, &old_tip, &onto, &backup);
-        let ran = restack
-            .rebase()
-            .await
-            .unwrap_or_else(|f| panic!("{}", describe(&f)));
+        let ran = restack.rebase().await.unwrap_or_else(|f| panic!("{}", describe(&f)));
         assert_ne!(ran.code, Some(0));
-        assert_eq!(
-            git_in(&worktree, &["diff", "--name-only", "--diff-filter=U"])
-                .lines()
-                .count(),
-            2,
-            "both conflict"
-        );
+        assert_eq!(git_in(&worktree, &["diff", "--name-only", "--diff-filter=U"]).lines().count(), 2, "both conflict");
         std::fs::write(worktree.join(" lead.txt"), "resolved\n").unwrap();
         git_in(&worktree, &["add", " lead.txt"]);
 
         let found = staged_resolutions_in_the_stop(&worktree).await.unwrap();
 
-        assert!(
-            found
-                .as_deref()
-                .is_some_and(|why| why.contains(" lead.txt")),
-            "{found:?}"
-        );
+        assert!(found.as_deref().is_some_and(|why| why.contains(" lead.txt")), "{found:?}");
     }
 
     /// The restack runs git's merge backend whatever `rebase.backend` says:
@@ -2286,30 +1761,15 @@ mod tests {
         let fixture = Fixture::new(true);
         git_in(&fixture.worktree, &["config", "rebase.backend", "apply"]);
         let restack = fixture.restack();
-        let ran = restack
-            .rebase()
-            .await
-            .unwrap_or_else(|f| panic!("{}", describe(&f)));
+        let ran = restack.rebase().await.unwrap_or_else(|f| panic!("{}", describe(&f)));
         assert_ne!(ran.code, Some(0));
-        let state = |name: &str| {
-            fixture.worktree.join(git_in(
-                &fixture.worktree,
-                &["rev-parse", "--git-path", name],
-            ))
-        };
-        assert!(
-            state("rebase-merge").is_dir(),
-            "the stop is the merge backend's"
-        );
+        let state = |name: &str| fixture.worktree.join(git_in(&fixture.worktree, &["rev-parse", "--git-path", name]));
+        assert!(state("rebase-merge").is_dir(), "the stop is the merge backend's");
         assert!(!state("rebase-apply").exists(), "not the apply backend's");
 
         let failure = restack.settle(ran).await.expect_err("conflict");
 
-        assert!(
-            matches!(failure, RestackFailure::Restored(_)),
-            "{}",
-            describe(&failure)
-        );
+        assert!(matches!(failure, RestackFailure::Restored(_)), "{}", describe(&failure));
         fixture.assert_restored("apply configured, conflict");
     }
 
@@ -2338,16 +1798,10 @@ mod tests {
         crate::test_helpers::write_executable(&hook, &script);
         #[cfg(not(unix))]
         std::fs::write(&hook, script).unwrap();
-        git_in(
-            &fixture.worktree,
-            &["config", "core.hooksPath", hooks.to_str().unwrap()],
-        );
+        git_in(&fixture.worktree, &["config", "core.hooksPath", hooks.to_str().unwrap()]);
         let restack = fixture.restack();
 
-        let new_tip = restack
-            .replay()
-            .await
-            .unwrap_or_else(|f| panic!("{}", describe(&f)));
+        let new_tip = restack.replay().await.unwrap_or_else(|f| panic!("{}", describe(&f)));
 
         assert_eq!(std::fs::read_to_string(&seen).unwrap().trim(), "merge");
         assert_eq!(fixture.tip().as_deref(), Some(new_tip.as_str()));
@@ -2362,24 +1816,12 @@ mod tests {
         let restack = fixture.restack();
         let user = commit(&fixture.worktree, "u.txt", "u\n", "U");
 
-        let failure = restack
-            .restore(
-                false,
-                "the rebase could not be started: no identity".to_string(),
-            )
-            .await;
+        let failure = restack.restore(false, "the rebase could not be started: no identity".to_string()).await;
 
-        assert!(
-            matches!(&failure, RestackFailure::BranchMoved(why) if why.contains(&user)),
-            "{}",
-            describe(&failure)
-        );
+        assert!(matches!(&failure, RestackFailure::BranchMoved(why) if why.contains(&user)), "{}", describe(&failure));
         assert_eq!(fixture.tip().as_deref(), Some(user.as_str()));
         assert_eq!(fixture.head(), user);
-        assert_eq!(
-            fixture.backup_at().as_deref(),
-            Some(fixture.old_tip.as_str())
-        );
+        assert_eq!(fixture.backup_at().as_deref(), Some(fixture.old_tip.as_str()));
         fixture.assert_nothing_pushed();
     }
 
@@ -2394,14 +1836,9 @@ mod tests {
 
         let fixture = Fixture::new(false);
         let restack = fixture.restack();
-        let new_tip = restack
-            .replay()
-            .await
-            .unwrap_or_else(|_| panic!("the replay verifies"));
+        let new_tip = restack.replay().await.unwrap_or_else(|_| panic!("the replay verifies"));
         assert_ne!(new_tip, fixture.old_tip);
-        let failure = restack
-            .roll_back("the task could not record the restack".to_string())
-            .await;
+        let failure = restack.roll_back("the task could not record the restack".to_string()).await;
         assert!(matches!(failure, RestackFailure::Restored(_)));
         fixture.assert_restored("completed");
     }

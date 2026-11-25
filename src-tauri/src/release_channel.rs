@@ -63,11 +63,7 @@ impl PlainVersion {
         if parts.next().is_some() {
             return None;
         }
-        Some(Self {
-            major,
-            minor,
-            patch,
-        })
+        Some(Self { major, minor, patch })
     }
 }
 
@@ -109,8 +105,9 @@ pub fn parse_declarations(text: &str) -> Result<Vec<Declaration>, String> {
         let [version_text, channel_text] = fields.as_slice() else {
             return Err(format!("line {trimmed:?} must be '<version> <channel>'"));
         };
-        let version = PlainVersion::parse(version_text)
-            .ok_or_else(|| format!("{version_text:?} is not a plain MAJOR.MINOR.PATCH version"))?;
+        let version = PlainVersion::parse(version_text).ok_or_else(|| {
+            format!("{version_text:?} is not a plain MAJOR.MINOR.PATCH version")
+        })?;
         let channel = ReleaseChannel::parse(channel_text).ok_or_else(|| {
             format!("{version} is declared as {channel_text:?}; the channel must be 'prerelease' or 'stable'")
         })?;
@@ -147,26 +144,8 @@ mod tests {
     fn a_plain_version_is_exactly_three_numbers() {
         assert_eq!(PlainVersion::parse("0.0.1"), Some(version("0.0.1")));
         assert_eq!(PlainVersion::parse("10.20.300").unwrap().minor, 20);
-        for bad in [
-            "",
-            "1",
-            "1.2",
-            "1.2.3.4",
-            "1.2.3-1",
-            "1.2.3-rc.1",
-            "1.2.3+1",
-            "v1.2.3",
-            "01.2.3",
-            "1.2.x",
-            "1..3",
-            " 1.2.3",
-            "1.2.3 ",
-        ] {
-            assert_eq!(
-                PlainVersion::parse(bad),
-                None,
-                "{bad:?} must not be a plain version"
-            );
+        for bad in ["", "1", "1.2", "1.2.3.4", "1.2.3-1", "1.2.3-rc.1", "1.2.3+1", "v1.2.3", "01.2.3", "1.2.x", "1..3", " 1.2.3", "1.2.3 "] {
+            assert_eq!(PlainVersion::parse(bad), None, "{bad:?} must not be a plain version");
         }
     }
 
@@ -179,26 +158,16 @@ mod tests {
 
     #[test]
     fn the_declared_channel_is_the_one_the_line_names() {
-        let declarations =
-            parse_declarations("# published\n0.0.1 prerelease\n\n0.0.2 stable\n").unwrap();
-        assert_eq!(
-            channel_for(&declarations, version("0.0.1")),
-            Some(ReleaseChannel::Prerelease)
-        );
-        assert_eq!(
-            channel_for(&declarations, version("0.0.2")),
-            Some(ReleaseChannel::Stable)
-        );
+        let declarations = parse_declarations("# published\n0.0.1 prerelease\n\n0.0.2 stable\n").unwrap();
+        assert_eq!(channel_for(&declarations, version("0.0.1")), Some(ReleaseChannel::Prerelease));
+        assert_eq!(channel_for(&declarations, version("0.0.2")), Some(ReleaseChannel::Stable));
         assert_eq!(channel_for(&declarations, version("0.0.3")), None);
     }
 
     #[test]
     fn a_plain_zero_zero_one_is_a_prerelease_without_any_hyphen() {
         let declarations = parse_declarations("0.0.1 prerelease\n").unwrap();
-        assert_eq!(
-            channel_for(&declarations, version("0.0.1")),
-            Some(ReleaseChannel::Prerelease)
-        );
+        assert_eq!(channel_for(&declarations, version("0.0.1")), Some(ReleaseChannel::Prerelease));
     }
 
     #[test]
@@ -219,10 +188,7 @@ mod tests {
             "0.0.2 stable\n0.0.1 prerelease\n",
         ];
         for text in refused {
-            assert!(
-                parse_declarations(text).is_err(),
-                "{text:?} must be refused"
-            );
+            assert!(parse_declarations(text).is_err(), "{text:?} must be refused");
         }
     }
 
@@ -237,12 +203,8 @@ mod tests {
     #[test]
     fn the_repository_declaration_parses_and_declares_the_app_version() {
         let text = include_str!("../../.github/release-channels.txt");
-        let declarations =
-            parse_declarations(text).expect("the repository's declaration file must parse");
+        let declarations = parse_declarations(text).expect("the repository's declaration file must parse");
         let app_version = version(env!("CARGO_PKG_VERSION"));
-        assert!(
-            channel_for(&declarations, app_version).is_some(),
-            "{app_version} has no declared channel"
-        );
+        assert!(channel_for(&declarations, app_version).is_some(), "{app_version} has no declared channel");
     }
 }

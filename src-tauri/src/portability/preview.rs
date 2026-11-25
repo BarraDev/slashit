@@ -102,8 +102,8 @@ pub(super) fn reviewer_model_for_import(
     task_id: Uuid,
     raw: Option<&str>,
 ) -> Result<(Option<String>, Option<Normalization>), BundleError> {
-    let stored =
-        crate::domain::task::parse_reviewer_model(raw.unwrap_or_default()).map_err(|why| {
+    let stored = crate::domain::task::parse_reviewer_model(raw.unwrap_or_default())
+        .map_err(|why| {
             BundleError::Malformed(format!(
                 "task {task_id} has a reviewer model that cannot be used: {why}"
             ))
@@ -114,10 +114,7 @@ pub(super) fn reviewer_model_for_import(
         Some(_) if stored.is_none() => Some("reviewer_model_cleared"),
         Some(_) => Some("reviewer_model_trimmed"),
     };
-    Ok((
-        stored,
-        reason.map(|reason| Normalization { task_id, reason }),
-    ))
+    Ok((stored, reason.map(|reason| Normalization { task_id, reason })))
 }
 
 /// Validate `bytes` and describe what importing it would do.

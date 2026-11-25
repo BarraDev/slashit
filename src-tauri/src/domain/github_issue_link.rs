@@ -212,19 +212,9 @@ mod tests {
         assert!(project_issue_refusal([&linked], project, &issue)
             .unwrap()
             .contains("#4"));
+        assert_eq!(project_issue_refusal([&linked], Uuid::new_v4(), &issue), None);
         assert_eq!(
-            project_issue_refusal([&linked], Uuid::new_v4(), &issue),
-            None
-        );
-        assert_eq!(
-            project_issue_refusal(
-                [&linked],
-                project,
-                &IssueAddress {
-                    repo: "o/r".into(),
-                    number: 5
-                }
-            ),
+            project_issue_refusal([&linked], project, &IssueAddress { repo: "o/r".into(), number: 5 }),
             None
         );
     }

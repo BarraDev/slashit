@@ -154,16 +154,16 @@ impl SessionStore {
             return Ok(Vec::new());
         }
 
-        let contents =
-            fs::read_to_string(&self.store_path).context("Failed to read sessions file")?;
+        let contents = fs::read_to_string(&self.store_path)
+            .context("Failed to read sessions file")?;
 
         #[derive(Deserialize)]
         struct SessionsFile {
             sessions: Vec<SessionMetadata>,
         }
 
-        let file: SessionsFile =
-            toml::from_str(&contents).context("Failed to parse sessions file")?;
+        let file: SessionsFile = toml::from_str(&contents)
+            .context("Failed to parse sessions file")?;
 
         Ok(file.sessions)
     }
@@ -176,7 +176,8 @@ impl SessionStore {
         }
 
         let file = SessionsFile { sessions };
-        let contents = toml::to_string_pretty(&file).context("Failed to serialize sessions")?;
+        let contents = toml::to_string_pretty(&file)
+            .context("Failed to serialize sessions")?;
 
         // Replaced durably and atomically: a failure before the replacement
         // leaves the previous file whole, so it still loads.
@@ -192,12 +193,10 @@ impl SessionStore {
 
     /// Add or update a session
     pub fn upsert_session(&self, metadata: SessionMetadata) -> Result<()> {
-        self.update(
-            |sessions| match sessions.iter_mut().find(|s| s.id == metadata.id) {
-                Some(existing) => *existing = metadata,
-                None => sessions.push(metadata),
-            },
-        )
+        self.update(|sessions| match sessions.iter_mut().find(|s| s.id == metadata.id) {
+            Some(existing) => *existing = metadata,
+            None => sessions.push(metadata),
+        })
     }
 
     /// Remove a session by ID
@@ -230,10 +229,7 @@ impl SessionStore {
     /// An unreadable file is an error, not an empty list. Writing the change
     /// over it would discard every record it still holds.
     fn update(&self, change: impl FnOnce(&mut Vec<SessionMetadata>)) -> Result<()> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = self.write_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut sessions = self.load_sessions()?;
         change(&mut sessions);
         self.save_sessions(&sessions)
@@ -268,9 +264,7 @@ mod tests {
     fn a_record_keeps_its_project() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SessionStore::at_path(dir.path().join("terminal-sessions.toml"));
-        store
-            .upsert_session(record(Some("project-a")))
-            .expect("write");
+        store.upsert_session(record(Some("project-a"))).expect("write");
         let loaded = store.load_sessions().expect("read");
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].project_id.as_deref(), Some("project-a"));
@@ -298,9 +292,7 @@ mod tests {
     #[test]
     fn concurrent_writers_keep_every_record() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = std::sync::Arc::new(SessionStore::at_path(
-            dir.path().join("terminal-sessions.toml"),
-        ));
+        let store = std::sync::Arc::new(SessionStore::at_path(dir.path().join("terminal-sessions.toml")));
         let writers: Vec<_> = (0..2)
             .map(|_| {
                 let store = store.clone();
@@ -340,10 +332,7 @@ mod tests {
 
         assert!(store.load_sessions().is_err());
         assert!(store.upsert_session(record(Some("project-a"))).is_err());
-        assert!(
-            store.mark_all_dead().is_err(),
-            "startup must not erase an unreadable file"
-        );
+        assert!(store.mark_all_dead().is_err(), "startup must not erase an unreadable file");
         assert!(store.mark_alive(Uuid::new_v4()).is_err());
         assert!(store.remove_session(Uuid::new_v4()).is_err());
 
@@ -356,12 +345,7 @@ mod tests {
     fn a_failed_write_before_publication_keeps_the_last_valid_state() {
         use slashit_durable_fs::{fault, Stage};
 
-        for stage in [
-            Stage::CreateTemp,
-            Stage::WriteTemp,
-            Stage::SyncTemp,
-            Stage::Replace,
-        ] {
+        for stage in [Stage::CreateTemp, Stage::WriteTemp, Stage::SyncTemp, Stage::Replace] {
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join("terminal-sessions.toml");
             let store = SessionStore::at_path(path.clone());
@@ -375,18 +359,9 @@ mod tests {
             );
             drop(armed);
 
-            let restarted = SessionStore::at_path(path)
-                .load_sessions()
-                .expect("the file still loads");
-            assert_eq!(
-                restarted.len(),
-                1,
-                "stage {stage:?} changed the saved records"
-            );
-            assert_eq!(
-                restarted[0].id, kept.id,
-                "stage {stage:?} replaced the saved record"
-            );
+            let restarted = SessionStore::at_path(path).load_sessions().expect("the file still loads");
+            assert_eq!(restarted.len(), 1, "stage {stage:?} changed the saved records");
+            assert_eq!(restarted[0].id, kept.id, "stage {stage:?} replaced the saved record");
         }
     }
 
@@ -399,21 +374,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("terminal-sessions.toml");
         let store = SessionStore::at_path(path.clone());
-        store
-            .upsert_session(record(Some("project-a")))
-            .expect("first write");
+        store.upsert_session(record(Some("project-a"))).expect("first write");
 
         let armed = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
         assert!(store.upsert_session(record(Some("project-b"))).is_err());
         drop(armed);
 
-        let restarted = SessionStore::at_path(path)
-            .load_sessions()
-            .expect("the file still loads");
-        assert_eq!(
-            restarted.len(),
-            2,
-            "the published record is whole and readable"
-        );
+        let restarted = SessionStore::at_path(path).load_sessions().expect("the file still loads");
+        assert_eq!(restarted.len(), 2, "the published record is whole and readable");
     }
 }

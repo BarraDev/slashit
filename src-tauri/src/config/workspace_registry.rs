@@ -11,9 +11,9 @@
 //! [`crate::config::migration::StateMigrator`].
 
 use super::migration::StateMigrator;
+use super::paths::IN_PROJECT_DIR;
 #[cfg(doc)]
 use super::paths::AppPaths;
-use super::paths::IN_PROJECT_DIR;
 use super::storage::{adopt_published, ConfigWriteError};
 use crate::domain::Workspace;
 use serde::{Deserialize, Serialize};
@@ -93,10 +93,7 @@ impl WorkspaceRegistry {
         } else {
             HashMap::new()
         };
-        Ok(Self {
-            workspaces,
-            config_path,
-        })
+        Ok(Self { workspaces, config_path })
     }
 
     pub fn upsert(&mut self, workspace: Workspace) -> Result<(), ConfigWriteError> {
@@ -136,9 +133,7 @@ impl WorkspaceRegistry {
         self.workspaces
             .values()
             .filter_map(|w| w.root_path.as_ref())
-            .filter(|root| {
-                StateMigrator::remove_empty_legacy_dir(&root.as_path().join(IN_PROJECT_DIR))
-            })
+            .filter(|root| StateMigrator::remove_empty_legacy_dir(&root.as_path().join(IN_PROJECT_DIR)))
             .count()
     }
 
@@ -151,22 +146,19 @@ impl WorkspaceRegistry {
         // Durable atomic replacement (see `slashit_durable_fs`): a crash or
         // partial write cannot leave the registry truncated, and a failure
         // after the replacement is reported as such rather than as success.
-        slashit_durable_fs::write_atomic(
-            path,
-            toml_text.as_bytes(),
-            slashit_durable_fs::Permissions::Preserve,
-        )
-        .map(|_| ())
-        .map_err(|e| {
-            let published = e.is_published();
-            let error = anyhow::Error::new(e).context("Failed to write the workspace registry");
-            if published {
-                ConfigWriteError::PublishedNotDurable(error)
-            } else {
-                ConfigWriteError::NotPublished(error)
-            }
-        })
+        slashit_durable_fs::write_atomic(path, toml_text.as_bytes(), slashit_durable_fs::Permissions::Preserve)
+            .map(|_| ())
+            .map_err(|e| {
+                let published = e.is_published();
+                let error = anyhow::Error::new(e).context("Failed to write the workspace registry");
+                if published {
+                    ConfigWriteError::PublishedNotDurable(error)
+                } else {
+                    ConfigWriteError::NotPublished(error)
+                }
+            })
     }
+
 }
 
 #[cfg(test)]
@@ -206,13 +198,7 @@ mod tests {
         drop(fault);
         assert!(error.is_published());
         assert!(registry.get(&id).is_some(), "memory follows the file");
-        assert!(
-            WorkspaceRegistry::load_from(path.clone())
-                .unwrap()
-                .get(&id)
-                .is_some(),
-            "so does a restart"
-        );
+        assert!(WorkspaceRegistry::load_from(path.clone()).unwrap().get(&id).is_some(), "so does a restart");
 
         // The removal is the same story, and the stale map cannot bring it back.
         let fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
@@ -220,10 +206,7 @@ mod tests {
         drop(fault);
         assert!(error.is_published());
         assert!(registry.get(&id).is_none());
-        assert!(WorkspaceRegistry::load_from(path)
-            .unwrap()
-            .get(&id)
-            .is_none());
+        assert!(WorkspaceRegistry::load_from(path).unwrap().get(&id).is_none());
     }
 
     #[test]
@@ -249,8 +232,8 @@ mod tests {
         let path = temp.path().join("workspaces.toml");
         fs::write(&path, "this is not valid toml {{{").expect("write corrupt file");
 
-        let registry = WorkspaceRegistry::load_from(path.clone())
-            .expect("a quarantinable file should still load");
+        let registry =
+            WorkspaceRegistry::load_from(path.clone()).expect("a quarantinable file should still load");
 
         assert!(registry.all().next().is_none());
         assert!(!path.exists(), "corrupt file should have been moved aside");
@@ -260,11 +243,7 @@ mod tests {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().contains("corrupt-"))
             .collect();
-        assert_eq!(
-            quarantined.len(),
-            1,
-            "exactly one quarantine backup should exist"
-        );
+        assert_eq!(quarantined.len(), 1, "exactly one quarantine backup should exist");
     }
 
     #[test]
@@ -281,10 +260,7 @@ mod tests {
 
         let second = unique_quarantine_path(&path, ts);
 
-        assert_ne!(
-            second, first_backup,
-            "a colliding timestamp must not reuse the existing backup's path"
-        );
+        assert_ne!(second, first_backup, "a colliding timestamp must not reuse the existing backup's path");
         fs::write(&second, "second crash's corrupt content\n").unwrap();
         assert_eq!(
             fs::read_to_string(&first_backup).unwrap(),

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
-use crate::domain::{AgentExecution, AgentLogEntry, AgentStatus};
+use crate::domain::{AgentExecution, AgentStatus, AgentLogEntry};
+use uuid::Uuid;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use uuid::Uuid;
 
 type AgentExecutions = Arc<RwLock<HashMap<Uuid, AgentExecution>>>;
 type AgentLogs = Arc<RwLock<HashMap<Uuid, Vec<AgentLogEntry>>>>;
@@ -46,10 +46,7 @@ pub(crate) async fn active_agent_count(
 ) -> usize {
     let (executor_execution_ids, executor_task_ids) = match executor {
         Some(executor) => executor.active_agent_owners().await,
-        None => (
-            std::collections::HashSet::new(),
-            std::collections::HashSet::new(),
-        ),
+        None => (std::collections::HashSet::new(), std::collections::HashSet::new()),
     };
     let unowned_count = executions
         .read()
@@ -66,9 +63,7 @@ pub(crate) async fn active_agent_count(
     // registered, even during the short window before its record exists.
     // Those records are excluded above, so this counts each owned provider
     // exactly once while still covering that pre-record window.
-    executor_execution_ids.len()
-        + executor_task_ids.len()
-        + unowned_count
+    executor_execution_ids.len() + executor_task_ids.len() + unowned_count
         + executor.map_or(0, crate::queue::TaskExecutor::counted_project_run_count)
 }
 
@@ -88,7 +83,9 @@ pub async fn check_claude_cli() -> Result<ClaudeCliStatus, String> {
         .await;
 
     let path = match which_output {
-        Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).trim().to_string()),
+        Ok(o) if o.status.success() => {
+            Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+        }
         _ => None,
     };
 
@@ -107,7 +104,9 @@ pub async fn check_claude_cli() -> Result<ClaudeCliStatus, String> {
         .await;
 
     let version = match version_output {
-        Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).trim().to_string()),
+        Ok(o) if o.status.success() => {
+            Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+        }
         _ => None,
     };
 

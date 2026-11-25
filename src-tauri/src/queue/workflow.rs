@@ -63,6 +63,7 @@ pub enum WorkflowMode {
     Team,
 }
 
+
 /// A workflow execution tracking a task through the agent pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workflow {
@@ -226,24 +227,12 @@ mod tests {
     fn test_valid_transitions() {
         let mut wf = Workflow::new_team(Uuid::new_v4(), Uuid::new_v4());
 
-        assert!(wf
-            .transition(WorkflowState::Developing, "Plan complete".into())
-            .is_ok());
-        assert!(wf
-            .transition(WorkflowState::Reviewing, "Code done".into())
-            .is_ok());
-        assert!(wf
-            .transition(WorkflowState::Developing, "Issues found".into())
-            .is_ok());
-        assert!(wf
-            .transition(WorkflowState::Reviewing, "Fixed".into())
-            .is_ok());
-        assert!(wf
-            .transition(WorkflowState::Committing, "Approved".into())
-            .is_ok());
-        assert!(wf
-            .transition(WorkflowState::Complete, "Committed".into())
-            .is_ok());
+        assert!(wf.transition(WorkflowState::Developing, "Plan complete".into()).is_ok());
+        assert!(wf.transition(WorkflowState::Reviewing, "Code done".into()).is_ok());
+        assert!(wf.transition(WorkflowState::Developing, "Issues found".into()).is_ok());
+        assert!(wf.transition(WorkflowState::Reviewing, "Fixed".into()).is_ok());
+        assert!(wf.transition(WorkflowState::Committing, "Approved".into()).is_ok());
+        assert!(wf.transition(WorkflowState::Complete, "Committed".into()).is_ok());
 
         assert_eq!(wf.transitions.len(), 6);
         assert!(wf.is_terminal());
@@ -254,18 +243,14 @@ mod tests {
         let mut wf = Workflow::new_single(Uuid::new_v4(), Uuid::new_v4());
 
         // Can't go from Planning directly to Complete
-        assert!(wf
-            .transition(WorkflowState::Complete, "skip".into())
-            .is_err());
+        assert!(wf.transition(WorkflowState::Complete, "skip".into()).is_err());
     }
 
     #[test]
     fn test_retry_transition() {
         let mut wf = Workflow::new_single(Uuid::new_v4(), Uuid::new_v4());
-        wf.transition(WorkflowState::Developing, "start".into())
-            .unwrap();
-        wf.transition(WorkflowState::Failed, "error".into())
-            .unwrap();
+        wf.transition(WorkflowState::Developing, "start".into()).unwrap();
+        wf.transition(WorkflowState::Failed, "error".into()).unwrap();
 
         // Can retry back to Planning
         wf.retry_count = 0;

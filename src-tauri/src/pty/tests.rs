@@ -2,8 +2,8 @@
 //! PTY module tests
 //! Run with: cargo test -p slashit-ui
 
-use super::store::ScrollbackBuffer;
 use super::*;
+use super::store::ScrollbackBuffer;
 
 #[cfg(test)]
 mod scrollback_tests {
@@ -20,7 +20,7 @@ mod scrollback_tests {
         let mut buffer = ScrollbackBuffer::new(1000);
         buffer.append(b"Hello");
         buffer.append(b" World");
-
+        
         assert_eq!(buffer.get_data(), b"Hello World");
     }
 
@@ -28,7 +28,7 @@ mod scrollback_tests {
     fn test_scrollback_buffer_max_size() {
         let mut buffer = ScrollbackBuffer::new(10);
         buffer.append(b"Hello World!"); // 12 bytes, exceeds max
-
+        
         // Should be truncated to last 10 bytes
         assert!(buffer.get_data().len() <= 10);
     }
@@ -45,7 +45,7 @@ mod pty_exit_tests {
             exit_code: Some(0),
             reason: "Shell exited normally".to_string(),
         };
-
+        
         assert_eq!(exit.exit_code, Some(0));
         assert_eq!(exit.reason, "Shell exited normally");
     }
@@ -57,7 +57,7 @@ mod pty_exit_tests {
             exit_code: Some(1),
             reason: "Error: Connection reset".to_string(),
         };
-
+        
         assert_eq!(exit.exit_code, Some(1));
         assert!(exit.reason.contains("Error"));
     }
@@ -77,7 +77,7 @@ mod pty_info_tests {
             is_new: true,
             project_id: None,
         };
-
+        
         assert_eq!(info.cols, 80);
         assert_eq!(info.rows, 24);
         assert!(info.is_new);
@@ -94,7 +94,7 @@ mod pty_output_tests {
             session_id: "test-session".to_string(),
             data: vec![0x1b, b'[', b'H'], // ESC [ H - cursor home
         };
-
+        
         assert_eq!(output.data.len(), 3);
         assert_eq!(output.data[0], 0x1b);
     }
@@ -145,14 +145,15 @@ mod pty_spawn_tests {
     #[test]
     #[ignore] // Ignore by default as it spawns real processes
     fn test_spawn_pty_session_success() {
-        let result = spawn_pty_session("Test Terminal".to_string(), 80, 24, None);
-
-        assert!(
-            result.is_ok(),
-            "PTY spawn should succeed: {:?}",
-            result.err()
+        let result = spawn_pty_session(
+            "Test Terminal".to_string(),
+            80,
+            24,
+            None,
         );
-
+        
+        assert!(result.is_ok(), "PTY spawn should succeed: {:?}", result.err());
+        
         let (session, _reader) = result.unwrap();
         assert_eq!(session.name, "Test Terminal");
         assert_eq!(session.cols, 80);
@@ -163,13 +164,15 @@ mod pty_spawn_tests {
     #[test]
     #[ignore] // Ignore by default as it spawns real processes
     fn test_spawn_pty_session_custom_dimensions() {
-        let result = spawn_pty_session("Wide Terminal".to_string(), 120, 40, None);
-
-        assert!(
-            result.is_ok(),
-            "PTY spawn should succeed with custom dimensions"
+        let result = spawn_pty_session(
+            "Wide Terminal".to_string(),
+            120,
+            40,
+            None,
         );
-
+        
+        assert!(result.is_ok(), "PTY spawn should succeed with custom dimensions");
+        
         let (session, _reader) = result.unwrap();
         assert_eq!(session.cols, 120);
         assert_eq!(session.rows, 40);
@@ -187,11 +190,8 @@ mod pty_spawn_tests {
             24,
             Some(temp_dir.to_string_lossy().to_string()),
         );
-
-        assert!(
-            result.is_ok(),
-            "PTY spawn should succeed with working directory"
-        );
+        
+        assert!(result.is_ok(), "PTY spawn should succeed with working directory");
     }
 
     /// Test spawn with non-existent working directory falls back gracefully
@@ -204,25 +204,24 @@ mod pty_spawn_tests {
             24,
             Some("/this/path/definitely/does/not/exist/12345".to_string()),
         );
-
+        
         // Should still succeed, falling back to default directory
-        assert!(
-            result.is_ok(),
-            "PTY spawn should succeed even with invalid working directory"
-        );
+        assert!(result.is_ok(), "PTY spawn should succeed even with invalid working directory");
     }
 
     /// Test minimum valid dimensions
     #[test]
     #[ignore] // Ignore by default as it spawns real processes
     fn test_spawn_pty_session_minimum_dimensions() {
-        let result = spawn_pty_session("Tiny Terminal".to_string(), 1, 1, None);
-
-        // Even with tiny dimensions, spawn should succeed
-        assert!(
-            result.is_ok(),
-            "PTY spawn should succeed with minimum dimensions"
+        let result = spawn_pty_session(
+            "Tiny Terminal".to_string(),
+            1,
+            1,
+            None,
         );
+        
+        // Even with tiny dimensions, spawn should succeed
+        assert!(result.is_ok(), "PTY spawn should succeed with minimum dimensions");
     }
 }
 
@@ -234,10 +233,10 @@ mod pty_spawn_tests {
 mod retry_logic_tests {
     /// Expected maximum number of retry attempts
     const EXPECTED_MAX_RETRIES: u32 = 3;
-
+    
     /// Expected base delay for exponential backoff (milliseconds)
     const EXPECTED_BASE_DELAY_MS: u32 = 200;
-
+    
     /// Expected timeout per spawn attempt (milliseconds)
     const EXPECTED_SPAWN_TIMEOUT_MS: u32 = 5000;
 
@@ -267,7 +266,7 @@ mod retry_logic_tests {
         let total_delay = EXPECTED_BASE_DELAY_MS + (EXPECTED_BASE_DELAY_MS * 2);
         let total_timeout = EXPECTED_MAX_RETRIES * EXPECTED_SPAWN_TIMEOUT_MS;
         let max_wait_time = total_delay + total_timeout;
-
+        
         // Maximum wait time should not exceed 30 seconds
         assert!(
             max_wait_time <= 30000,
@@ -288,12 +287,8 @@ mod retry_logic_tests {
                 }
             })
             .collect();
-
-        assert_eq!(
-            delays,
-            vec![0, 200, 400],
-            "Exponential backoff should be 0, 200ms, 400ms"
-        );
+        
+        assert_eq!(delays, vec![0, 200, 400], "Exponential backoff should be 0, 200ms, 400ms");
     }
 }
 
@@ -307,29 +302,35 @@ mod pty_resize_tests {
     #[test]
     #[ignore] // Ignore by default as it spawns real processes
     fn test_pty_session_resize() {
-        let result = spawn_pty_session("Resizable Terminal".to_string(), 80, 24, None);
-
+        let result = spawn_pty_session(
+            "Resizable Terminal".to_string(),
+            80,
+            24,
+            None,
+        );
+        
         assert!(result.is_ok());
         let (session, _reader) = result.unwrap();
-
+        
         // Resize the session
         let resize_result = session.resize(120, 40);
-        assert!(
-            resize_result.is_ok(),
-            "Resize should succeed: {:?}",
-            resize_result.err()
-        );
+        assert!(resize_result.is_ok(), "Resize should succeed: {:?}", resize_result.err());
     }
 
     /// Test resize with same dimensions (no-op)
     #[test]
     #[ignore] // Ignore by default as it spawns real processes
     fn test_pty_session_resize_same_size() {
-        let result = spawn_pty_session("Terminal".to_string(), 80, 24, None);
-
+        let result = spawn_pty_session(
+            "Terminal".to_string(),
+            80,
+            24,
+            None,
+        );
+        
         assert!(result.is_ok());
         let (session, _reader) = result.unwrap();
-
+        
         // Resize to same dimensions should be fine
         let resize_result = session.resize(80, 24);
         assert!(resize_result.is_ok());
@@ -388,9 +389,7 @@ mod quit_tests {
 
     fn lock_shell() -> ShellGuard {
         let env = crate::config::paths::ENV_LOCK.blocking_lock();
-        let shell = SHELL_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let shell = SHELL_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         ShellGuard {
             prior: std::env::var_os("SHELL"),
             _env: env,
@@ -407,9 +406,7 @@ mod quit_tests {
         }
         match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
             Ok(stat) => !matches!(
-                stat.rsplit(')')
-                    .next()
-                    .and_then(|rest| rest.trim_start().chars().next()),
+                stat.rsplit(')').next().and_then(|rest| rest.trim_start().chars().next()),
                 Some('Z' | 'X')
             ),
             Err(_) => false,
@@ -437,10 +434,7 @@ mod quit_tests {
         // the shell fail with ETXTBSY.
         crate::test_helpers::write_executable(
             &script,
-            &format!(
-                "#!/bin/sh\ntrap '' HUP\nsleep 300 &\necho $$ $! > {}\nwait\n",
-                pids.display()
-            ),
+            &format!("#!/bin/sh\ntrap '' HUP\nsleep 300 &\necho $$ $! > {}\nwait\n", pids.display()),
         );
         std::env::set_var("SHELL", &script);
 
@@ -472,18 +466,12 @@ mod quit_tests {
         drop(reader);
         std::thread::sleep(Duration::from_secs(2));
 
-        let survivors: Vec<i32> = [shell, child]
-            .into_iter()
-            .filter(|pid| is_live(*pid))
-            .collect();
+        let survivors: Vec<i32> = [shell, child].into_iter().filter(|pid| is_live(*pid)).collect();
         for pid in &survivors {
             // Safety: the pids were started by this test and are only killed here.
             unsafe { libc::kill(*pid, libc::SIGKILL) };
         }
-        assert!(
-            survivors.is_empty(),
-            "dropping the session left {survivors:?} running"
-        );
+        assert!(survivors.is_empty(), "dropping the session left {survivors:?} running");
     }
 
     /// The application exits as soon as shutdown returns, so the shutdown path
@@ -503,10 +491,7 @@ mod quit_tests {
         // the shell fail with ETXTBSY.
         crate::test_helpers::write_executable(
             &script,
-            &format!(
-                "#!/bin/sh\ntrap '' HUP\nsleep 300 &\necho $$ $! > {}\nwait\n",
-                pids.display()
-            ),
+            &format!("#!/bin/sh\ntrap '' HUP\nsleep 300 &\necho $$ $! > {}\nwait\n", pids.display()),
         );
         std::env::set_var("SHELL", &script);
 
@@ -541,18 +526,12 @@ mod quit_tests {
         runtime.block_on(crate::pty::manager::end_sessions(vec![session]));
         drop(reader);
 
-        let survivors: Vec<i32> = [shell, child]
-            .into_iter()
-            .filter(|pid| is_live(*pid))
-            .collect();
+        let survivors: Vec<i32> = [shell, child].into_iter().filter(|pid| is_live(*pid)).collect();
         for pid in &survivors {
             // Safety: the pids were started by this test and are only killed here.
             unsafe { libc::kill(*pid, libc::SIGKILL) };
         }
-        assert!(
-            survivors.is_empty(),
-            "ending the sessions at shutdown left {survivors:?} running"
-        );
+        assert!(survivors.is_empty(), "ending the sessions at shutdown left {survivors:?} running");
     }
 
     /// Starts a real interactive bash, which runs a background job and then
@@ -560,13 +539,7 @@ mod quit_tests {
     /// The shell has exited by the time this returns, and the job still runs.
     fn exited_shell_with_background_job(
         name: &str,
-    ) -> (
-        i32,
-        i32,
-        crate::pty::manager::PtySession,
-        Box<dyn std::io::Read + Send>,
-        tempfile::TempDir,
-    ) {
+    ) -> (i32, i32, crate::pty::manager::PtySession, Box<dyn std::io::Read + Send>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let pids = dir.path().join("pids");
         std::env::set_var("SHELL", "/bin/bash");
@@ -602,10 +575,7 @@ mod quit_tests {
             assert!(Instant::now() < deadline, "the shell did not exit");
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert!(
-            is_live(child),
-            "the background job should outlive its shell before the terminal is closed"
-        );
+        assert!(is_live(child), "the background job should outlive its shell before the terminal is closed");
         (shell, child, session, reader, dir)
     }
 
@@ -618,8 +588,7 @@ mod quit_tests {
     #[ignore = "open defect: a background job outlives its exited shell; spawns an interactive bash"]
     fn closing_a_terminal_whose_shell_exited_ends_its_background_job() {
         let _locks = lock_shell();
-        let (_shell_pid, child, session, reader, _dir) =
-            exited_shell_with_background_job("closed-after-exit");
+        let (_shell_pid, child, session, reader, _dir) = exited_shell_with_background_job("closed-after-exit");
 
         drop(session);
         drop(reader);
@@ -630,10 +599,7 @@ mod quit_tests {
             // Safety: the pid was started by this test and is only killed here.
             unsafe { libc::kill(child, libc::SIGKILL) };
         }
-        assert!(
-            !alive,
-            "closing the terminal left its background job {child} running"
-        );
+        assert!(!alive, "closing the terminal left its background job {child} running");
     }
 
     /// Open defect, at application quit: the same job survives `end_sessions`,
@@ -642,8 +608,7 @@ mod quit_tests {
     #[ignore = "open defect: a background job outlives its exited shell; spawns an interactive bash"]
     fn quitting_ends_the_background_job_of_a_shell_that_already_exited() {
         let _locks = lock_shell();
-        let (_shell_pid, child, session, reader, _dir) =
-            exited_shell_with_background_job("quit-after-exit");
+        let (_shell_pid, child, session, reader, _dir) = exited_shell_with_background_job("quit-after-exit");
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -657,10 +622,7 @@ mod quit_tests {
             // Safety: the pid was started by this test and is only killed here.
             unsafe { libc::kill(child, libc::SIGKILL) };
         }
-        assert!(
-            !alive,
-            "quitting left the background job {child} of an exited shell running"
-        );
+        assert!(!alive, "quitting left the background job {child} of an exited shell running");
     }
 }
 
@@ -712,29 +674,17 @@ mod registration_tests {
         let dir = tempfile::tempdir().unwrap();
         // The store path is a directory, so the record cannot be written.
         let state = state_with_store(SessionStore::at_path(dir.path().to_path_buf()));
-        let (session, _reader) =
-            spawn_pty_session("Test Terminal".into(), 80, 24, None).expect("spawn");
+        let (session, _reader) = spawn_pty_session("Test Terminal".into(), 80, 24, None).expect("spawn");
         let id = session.id;
 
         let result = runtime().block_on(async {
-            let result = state
-                .register_session(session, metadata(id, Some("project-a")))
-                .await;
-            assert!(
-                state.sessions.lock().await.get(&id).is_none(),
-                "an unrecorded session was published"
-            );
-            assert!(
-                state.scrollback.get(id).await.is_none(),
-                "an unrecorded terminal kept a scrollback"
-            );
+            let result = state.register_session(session, metadata(id, Some("project-a"))).await;
+            assert!(state.sessions.lock().await.get(&id).is_none(), "an unrecorded session was published");
+            assert!(state.scrollback.get(id).await.is_none(), "an unrecorded terminal kept a scrollback");
             result
         });
         let error = result.expect_err("a terminal without a record must not start");
-        assert!(
-            error.contains("Could not record the terminal session"),
-            "{error}"
-        );
+        assert!(error.contains("Could not record the terminal session"), "{error}");
     }
 
     #[test]
@@ -745,8 +695,7 @@ mod registration_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("terminal-sessions.toml");
         let state = state_with_store(SessionStore::at_path(path.clone()));
-        let (session, _reader) =
-            spawn_pty_session("Test Terminal".into(), 80, 24, None).expect("spawn");
+        let (session, _reader) = spawn_pty_session("Test Terminal".into(), 80, 24, None).expect("spawn");
         let id = session.id;
 
         runtime().block_on(async {

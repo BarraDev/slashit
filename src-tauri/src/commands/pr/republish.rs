@@ -370,11 +370,9 @@ async fn observe(state: &crate::AppState, task_uuid: Uuid) -> Result<Option<Plan
 
     match remote_branch_commit(&working_dir, &branch).await {
         Err(e) => return Err(Refusal::Unknown(format!("{context}. {e}"))),
-        Ok(None) => {
-            return blocked(format!(
+        Ok(None) => return blocked(format!(
             "{context}, but {branch} is not on origin, so there is no published branch to update."
-        ))
-        }
+        )),
         Ok(Some(remote)) if remote != tip => {
             return blocked(format!(
                 "{context}, but {branch} is at {tip} here and {remote} on origin. Push or fetch it \

@@ -98,12 +98,7 @@ impl BuildOutputProbe for GitBuildOutputProbe {
                 .arg(checkout)
                 // The second key is how Git for Windows 2.33 to 2.35 spelled
                 // its built-in monitor; later versions ignore it.
-                .args([
-                    "-c",
-                    "core.fsmonitor=false",
-                    "-c",
-                    "core.useBuiltinFSMonitor=false",
-                ])
+                .args(["-c", "core.fsmonitor=false", "-c", "core.useBuiltinFSMonitor=false"])
                 .args(args)
                 .env("GIT_CEILING_DIRECTORIES", ceiling)
                 .env("GIT_OPTIONAL_LOCKS", "0")
@@ -186,14 +181,8 @@ pub fn measure(inputs: &Inputs<'_>) -> StorageSummary {
     for (path, kind) in [
         (paths.data_dir().to_path_buf(), RootKind::State),
         (paths.config_dir().to_path_buf(), RootKind::State),
-        (
-            paths.cache_dir().to_path_buf(),
-            RootKind::Whole(ConsumerKind::Cache, "Cache"),
-        ),
-        (
-            paths.runtime_dir().to_path_buf(),
-            RootKind::Whole(ConsumerKind::Runtime, "Runtime files"),
-        ),
+        (paths.cache_dir().to_path_buf(), RootKind::Whole(ConsumerKind::Cache, "Cache")),
+        (paths.runtime_dir().to_path_buf(), RootKind::Whole(ConsumerKind::Runtime, "Runtime files")),
     ] {
         if !roots.iter().any(|(seen, _)| *seen == path) {
             roots.push((path, kind));
@@ -205,10 +194,9 @@ pub fn measure(inputs: &Inputs<'_>) -> StorageSummary {
         census.anchor = root.clone();
         match kind {
             RootKind::State => census.state_root(root),
-            RootKind::Whole(kind, label) => census.whole(
-                root,
-                Spec::new(*kind, *label, StorageClassification::Temporary),
-            ),
+            RootKind::Whole(kind, label) => {
+                census.whole(root, Spec::new(*kind, *label, StorageClassification::Temporary))
+            }
         }
     }
 
@@ -260,11 +248,7 @@ struct Spec {
 }
 
 impl Spec {
-    fn new(
-        kind: ConsumerKind,
-        label: impl Into<String>,
-        classification: StorageClassification,
-    ) -> Self {
+    fn new(kind: ConsumerKind, label: impl Into<String>, classification: StorageClassification) -> Self {
         Self {
             kind,
             label: label.into(),
@@ -312,48 +296,16 @@ impl<'a> Census<'a> {
     fn new(inputs: &'a Inputs<'a>) -> Self {
         let p = inputs.paths;
         let known = vec![
-            (
-                p.external_projects_dir(),
-                ConsumerKind::ProjectState,
-                "Project boards",
-            ),
+            (p.external_projects_dir(), ConsumerKind::ProjectState, "Project boards"),
             (p.logs_dir(), ConsumerKind::Logs, "Logs"),
-            (
-                p.pr_helper_logs_dir(),
-                ConsumerKind::Logs,
-                "Pull request helper logs",
-            ),
-            (
-                p.terminal_sessions_file(),
-                ConsumerKind::TerminalSessions,
-                "Terminal sessions",
-            ),
+            (p.pr_helper_logs_dir(), ConsumerKind::Logs, "Pull request helper logs"),
+            (p.terminal_sessions_file(), ConsumerKind::TerminalSessions, "Terminal sessions"),
             (p.config_file(), ConsumerKind::Configuration, "Settings"),
-            (
-                p.workspaces_file(),
-                ConsumerKind::Configuration,
-                "Workspaces",
-            ),
-            (
-                p.credentials_file(),
-                ConsumerKind::Configuration,
-                "Credentials",
-            ),
-            (
-                p.feature_flags_file(),
-                ConsumerKind::Configuration,
-                "Feature flags",
-            ),
-            (
-                p.ipc_config_file(),
-                ConsumerKind::Configuration,
-                "Control channel settings",
-            ),
-            (
-                p.legacy_tasks_dir(),
-                ConsumerKind::ProjectState,
-                "Task files (earlier layout)",
-            ),
+            (p.workspaces_file(), ConsumerKind::Configuration, "Workspaces"),
+            (p.credentials_file(), ConsumerKind::Configuration, "Credentials"),
+            (p.feature_flags_file(), ConsumerKind::Configuration, "Feature flags"),
+            (p.ipc_config_file(), ConsumerKind::Configuration, "Control channel settings"),
+            (p.legacy_tasks_dir(), ConsumerKind::ProjectState, "Task files (earlier layout)"),
         ];
         Self {
             inputs,
@@ -394,12 +346,8 @@ impl<'a> Census<'a> {
     /// per directory inside it.
     fn worktrees(&mut self, dir: &Path) {
         if !is_real_dir(dir) {
-            let spec = Spec::new(
-                ConsumerKind::TaskCheckout,
-                "Task checkouts",
-                StorageClassification::Unknown,
-            )
-            .detail("not a directory of SlashIt's own");
+            let spec = Spec::new(ConsumerKind::TaskCheckout, "Task checkouts", StorageClassification::Unknown)
+                .detail("not a directory of SlashIt's own");
             return self.whole(dir, spec);
         }
         let Some(keys) = self.list(dir, "Task checkouts") else {
@@ -407,10 +355,7 @@ impl<'a> Census<'a> {
         };
         let mut recorded: HashMap<&Path, Vec<&RecordedCheckout>> = HashMap::new();
         for checkout in self.inputs.checkouts {
-            recorded
-                .entry(checkout.path.as_path())
-                .or_default()
-                .push(checkout);
+            recorded.entry(checkout.path.as_path()).or_default().push(checkout);
         }
         for key in keys {
             if !is_real_dir(&key) {
@@ -422,10 +367,7 @@ impl<'a> Census<'a> {
             };
             let key_name = file_name(&key);
             for path in checkouts {
-                let owners = recorded
-                    .get(path.as_path())
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
+                let owners = recorded.get(path.as_path()).map(Vec::as_slice).unwrap_or(&[]);
                 self.checkout(&path, &key_name, owners);
             }
         }
@@ -436,21 +378,13 @@ impl<'a> Census<'a> {
             [] => (None, CheckoutLifecycle::Unrecorded),
             // A task of one project recording a directory under another
             // project's root is not a checkout SlashIt made for it.
-            [only] if only.worktree_root.as_deref() != path.parent() => {
-                (None, CheckoutLifecycle::Misplaced)
+            [only] if only.worktree_root.as_deref() != path.parent() => (None, CheckoutLifecycle::Misplaced),
+            [only] if only.cleanup_in_flight => {
+                (Some(*only), CheckoutLifecycle::CleanupInterrupted { status: only.status.clone() })
             }
-            [only] if only.cleanup_in_flight => (
-                Some(*only),
-                CheckoutLifecycle::CleanupInterrupted {
-                    status: only.status.clone(),
-                },
-            ),
             [only] => (
                 Some(*only),
-                CheckoutLifecycle::Task {
-                    status: only.status.clone(),
-                    agent_attached: only.agent_attached,
-                },
+                CheckoutLifecycle::Task { status: only.status.clone(), agent_attached: only.agent_attached },
             ),
             _ => (None, CheckoutLifecycle::Contested),
         };
@@ -458,13 +392,9 @@ impl<'a> Census<'a> {
         let Some(owner) = owner.filter(|_| is_real_dir(path)) else {
             // Not attributable to one task, or not a directory SlashIt
             // could have made: counted, never owned.
-            let spec = Spec::new(
-                ConsumerKind::TaskCheckout,
-                "Unattributed checkout",
-                StorageClassification::Unknown,
-            )
-            .detail(format!("{key_name}/{}", file_name(path)))
-            .lifecycle(lifecycle);
+            let spec = Spec::new(ConsumerKind::TaskCheckout, "Unattributed checkout", StorageClassification::Unknown)
+                .detail(format!("{key_name}/{}", file_name(path)))
+                .lifecycle(lifecycle);
             return self.whole(path, spec);
         };
 
@@ -488,50 +418,29 @@ impl<'a> Census<'a> {
             Vec::new()
         };
 
-        let mut source = Spec::new(
-            ConsumerKind::TaskCheckout,
-            owner.task_title.clone(),
-            StorageClassification::WorkspaceSource,
-        )
-        .lifecycle(lifecycle.clone());
+        let mut source = Spec::new(ConsumerKind::TaskCheckout, owner.task_title.clone(), StorageClassification::WorkspaceSource)
+            .lifecycle(lifecycle.clone());
         source.detail = owner.project_name.clone();
-        self.push(
-            walk::measure(&self.anchor, path, &outputs, self.inputs.limits),
-            source,
-        );
+        self.push(walk::measure(&self.anchor, path, &outputs, self.inputs.limits), source);
 
         let reclaimable = !lifecycle.may_be_in_use();
         for name in outputs {
-            let spec = Spec::new(
-                ConsumerKind::BuildOutput,
-                owner.task_title.clone(),
-                StorageClassification::Rebuildable,
-            )
-            .detail(format!("{name}/ build output"))
-            .lifecycle(lifecycle.clone())
-            .reclaimable(reclaimable);
-            self.push(
-                walk::measure(&self.anchor, &path.join(name), &[], self.inputs.limits),
-                spec,
-            );
+            let spec = Spec::new(ConsumerKind::BuildOutput, owner.task_title.clone(), StorageClassification::Rebuildable)
+                .detail(format!("{name}/ build output"))
+                .lifecycle(lifecycle.clone())
+                .reclaimable(reclaimable);
+            self.push(walk::measure(&self.anchor, &path.join(name), &[], self.inputs.limits), spec);
         }
     }
 
     fn whole(&mut self, path: &Path, spec: Spec) {
-        self.push(
-            walk::measure(&self.anchor, path, &[], self.inputs.limits),
-            spec,
-        )
+        self.push(walk::measure(&self.anchor, path, &[], self.inputs.limits), spec)
     }
 
     fn push(&mut self, size: Result<TreeSize, WalkError>, spec: Spec) {
         if let Ok(size) = &size {
-            self.links_not_followed = self
-                .links_not_followed
-                .saturating_add(size.links_not_followed);
-            self.mounts_not_entered = self
-                .mounts_not_entered
-                .saturating_add(size.mounts_not_entered);
+            self.links_not_followed = self.links_not_followed.saturating_add(size.links_not_followed);
+            self.mounts_not_entered = self.mounts_not_entered.saturating_add(size.mounts_not_entered);
         }
         let (bytes, measurement) = match size {
             // Something that should be a directory of SlashIt's is a link
@@ -552,11 +461,7 @@ impl<'a> Census<'a> {
                     reason: format!(
                         "{} director{} on another filesystem not measured",
                         size.mounts_not_entered,
-                        if size.mounts_not_entered == 1 {
-                            "y"
-                        } else {
-                            "ies"
-                        }
+                        if size.mounts_not_entered == 1 { "y" } else { "ies" }
                     ),
                 },
             ),
@@ -607,11 +512,7 @@ impl<'a> Census<'a> {
                 self.unlisted = true;
                 self.push(
                     Err(WalkError::Unreadable(e.to_string())),
-                    Spec::new(
-                        ConsumerKind::Unrecognized,
-                        label,
-                        StorageClassification::Unknown,
-                    ),
+                    Spec::new(ConsumerKind::Unrecognized, label, StorageClassification::Unknown),
                 );
                 None
             }
@@ -646,11 +547,7 @@ impl<'a> Census<'a> {
                 if consumer.reclaimable {
                     reclaimable = reclaimable.saturating_add(bytes);
                 }
-                if consumer
-                    .lifecycle
-                    .as_ref()
-                    .is_some_and(CheckoutLifecycle::is_active)
-                {
+                if consumer.lifecycle.as_ref().is_some_and(CheckoutLifecycle::is_active) {
                     active = active.saturating_add(bytes);
                 }
             }
@@ -683,12 +580,7 @@ impl<'a> Census<'a> {
 }
 
 fn unrecognized(path: &Path) -> Spec {
-    Spec::new(
-        ConsumerKind::Unrecognized,
-        "Unrecognized entry",
-        StorageClassification::Unknown,
-    )
-    .detail(file_name(path))
+    Spec::new(ConsumerKind::Unrecognized, "Unrecognized entry", StorageClassification::Unknown).detail(file_name(path))
 }
 
 /// A directory, and not a link or (on Windows) any other reparse point.
@@ -811,11 +703,7 @@ mod tests {
             .current_dir(dir)
             .output()
             .expect("git must be installed to run this test");
-        assert!(
-            out.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     }
 
     /// Incompressible content, so a compressing filesystem cannot make a
@@ -885,15 +773,8 @@ mod tests {
         let target = 1024 * KIB;
         let dist = 512 * KIB;
         assert_near(summary.rebuildable_bytes, target + dist, "rebuildable");
-        assert_eq!(
-            summary.reclaimable_bytes, summary.rebuildable_bytes,
-            "an idle task's build output"
-        );
-        assert_near(
-            summary.unknown_managed_bytes,
-            300 * KIB + 70 * KIB,
-            "unknown",
-        );
+        assert_eq!(summary.reclaimable_bytes, summary.rebuildable_bytes, "an idle task's build output");
+        assert_near(summary.unknown_managed_bytes, 300 * KIB + 70 * KIB, "unknown");
 
         let sources = consumers(&summary, ConsumerKind::TaskCheckout);
         let source: Vec<_> = sources
@@ -950,10 +831,7 @@ mod tests {
         assert!(!output.reclaimable);
         assert_eq!(
             output.lifecycle,
-            Some(CheckoutLifecycle::Task {
-                status: TaskStatus::InProgress,
-                agent_attached: false
-            })
+            Some(CheckoutLifecycle::Task { status: TaskStatus::InProgress, agent_attached: false })
         );
     }
 
@@ -995,10 +873,8 @@ mod tests {
         fs::write(checkout.join(".gitignore"), "/target\n").unwrap();
         write(&checkout.join("target/big"), 128 * KIB);
         // The recording task's own project places checkouts elsewhere.
-        fx.checkouts.last_mut().unwrap().worktree_root = Some(
-            fx.paths
-                .worktrees_root(&ProjectKey::from_stored("other-89abcdef")),
-        );
+        fx.checkouts.last_mut().unwrap().worktree_root =
+            Some(fx.paths.worktrees_root(&ProjectKey::from_stored("other-89abcdef")));
 
         let summary = fx.measure();
         let checkout = &consumers(&summary, ConsumerKind::TaskCheckout)[0];
@@ -1016,11 +892,7 @@ mod tests {
         write(&moved.join("key/task/big"), 1024 * KIB);
         fs::remove_dir_all(fx.paths.worktrees_dir()).unwrap();
         std::os::unix::fs::symlink(&moved, fx.paths.worktrees_dir()).unwrap();
-        fx.record(
-            &fx.paths.worktrees_dir().join("key/task"),
-            "task",
-            TaskStatus::HumanReview,
-        );
+        fx.record(&fx.paths.worktrees_dir().join("key/task"), "task", TaskStatus::HumanReview);
 
         let summary = fx.measure();
         assert!(summary.incomplete, "{summary:#?}");
@@ -1044,19 +916,13 @@ mod tests {
             &hook,
             &format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
         );
-        git(
-            &checkout,
-            &["config", "core.fsmonitor", hook.to_str().unwrap()],
-        );
+        git(&checkout, &["config", "core.fsmonitor", hook.to_str().unwrap()]);
         fs::write(checkout.join(".gitignore"), "/target\n").unwrap();
         write(&checkout.join("target/big"), 128 * KIB);
 
         let summary = fx.measure();
         assert_near(summary.rebuildable_bytes, 128 * KIB, "rebuildable");
-        assert!(
-            !marker.exists(),
-            "measuring ran the repository's fsmonitor hook"
-        );
+        assert!(!marker.exists(), "measuring ran the repository's fsmonitor hook");
     }
 
     #[test]
@@ -1076,8 +942,7 @@ mod tests {
         fs::write(linked.join(".gitignore"), "/target\n").unwrap();
         write(&fx.outside.join("shared-target/big"), 128 * KIB);
         #[cfg(unix)]
-        std::os::unix::fs::symlink(fx.outside.join("shared-target"), linked.join("target"))
-            .unwrap();
+        std::os::unix::fs::symlink(fx.outside.join("shared-target"), linked.join("target")).unwrap();
 
         let summary = fx.measure();
         assert_eq!(summary.rebuildable_bytes, 0, "{summary:#?}");
@@ -1123,18 +988,10 @@ mod tests {
         assert_eq!(contested.classification, StorageClassification::Unknown);
         let cleanup = checkouts
             .iter()
-            .find(|c| {
-                matches!(
-                    c.lifecycle,
-                    Some(CheckoutLifecycle::CleanupInterrupted { .. })
-                )
-            })
+            .find(|c| matches!(c.lifecycle, Some(CheckoutLifecycle::CleanupInterrupted { .. })))
             .unwrap();
         // Owned, but neither broken down nor offered back.
-        assert_eq!(
-            cleanup.classification,
-            StorageClassification::WorkspaceSource
-        );
+        assert_eq!(cleanup.classification, StorageClassification::WorkspaceSource);
         assert_eq!(summary.rebuildable_bytes, 0);
         assert_eq!(summary.reclaimable_bytes, 0);
         assert_eq!(summary.active_workspace_bytes, 0);
@@ -1145,13 +1002,7 @@ mod tests {
         let mut fx = Fixture::new();
         write(&fx.outside.join("secret/big"), 1024 * KIB);
         // Spelled to start with the worktree root but climb out of it.
-        let sneaky = fx
-            .key_dir
-            .join("..")
-            .join("..")
-            .join("..")
-            .join("outside")
-            .join("secret");
+        let sneaky = fx.key_dir.join("..").join("..").join("..").join("outside").join("secret");
         fx.record(&sneaky, "sneaky", TaskStatus::HumanReview);
 
         let summary = fx.measure();
@@ -1173,14 +1024,9 @@ mod tests {
         write(&checkout.join("target/big"), 256 * KIB);
         write(&checkout.join("locked/work"), 64 * KIB);
         write(&fx.paths.logs_dir().join("agent.log"), 32 * KIB);
-        write(
-            &fx.paths.external_projects_dir().join("k/board.toml"),
-            8 * KIB,
-        );
+        write(&fx.paths.external_projects_dir().join("k/board.toml"), 8 * KIB);
 
-        let lock = |path: &Path, mode| {
-            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap()
-        };
+        let lock = |path: &Path, mode| fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
         lock(&checkout.join("locked"), 0o000);
         lock(&fx.paths.logs_dir(), 0o000);
         let summary = fx.measure();
@@ -1189,25 +1035,13 @@ mod tests {
 
         assert!(summary.incomplete);
         let logs = consumers(&summary, ConsumerKind::Logs);
-        assert_eq!(
-            logs[0].bytes, None,
-            "a failed measurement is not zero bytes"
-        );
+        assert_eq!(logs[0].bytes, None, "a failed measurement is not zero bytes");
         assert!(matches!(logs[0].measurement, Measurement::Failed { .. }));
         assert!(!logs[0].reclaimable);
-        assert!(summary
-            .unmeasured
-            .iter()
-            .any(|c| c.kind == ConsumerKind::Logs));
+        assert!(summary.unmeasured.iter().any(|c| c.kind == ConsumerKind::Logs));
 
         let source = consumers(&summary, ConsumerKind::TaskCheckout)[0];
-        assert!(matches!(
-            source.measurement,
-            Measurement::Partial {
-                skipped_entries: 1,
-                ..
-            }
-        ));
+        assert!(matches!(source.measurement, Measurement::Partial { skipped_entries: 1, .. }));
         // The failed task's build output is still measured and offered.
         assert_near(summary.reclaimable_bytes, 256 * KIB, "reclaimable");
         assert_eq!(consumers(&summary, ConsumerKind::ProjectState).len(), 1);
@@ -1229,10 +1063,7 @@ mod tests {
         assert_eq!(summary.pressure, None);
         assert_eq!(summary.filesystem_error.as_deref(), Some("no statvfs"));
 
-        assert_eq!(
-            fx.measure_with(&GitBuildOutputProbe, 10 * GIB).pressure,
-            Some(DiskPressure::Critical)
-        );
+        assert_eq!(fx.measure_with(&GitBuildOutputProbe, 10 * GIB).pressure, Some(DiskPressure::Critical));
     }
 
     /// Settings > Storage reports the threshold [`PressurePolicy`] sets, the
@@ -1244,12 +1075,7 @@ mod tests {
         let total = 100 * GIB;
         let critical = 20 * GIB;
         let at = |available: u64| {
-            let space = move |_: &Path| {
-                Ok(FilesystemSpace {
-                    total_bytes: total,
-                    available_bytes: available,
-                })
-            };
+            let space = move |_: &Path| Ok(FilesystemSpace { total_bytes: total, available_bytes: available });
             measure(&Inputs {
                 paths: &fx.paths,
                 checkouts: &[],
@@ -1261,16 +1087,10 @@ mod tests {
         };
 
         let summary = at(critical);
-        let thresholds = summary
-            .thresholds
-            .expect("thresholds for a readable filesystem");
+        let thresholds = summary.thresholds.expect("thresholds for a readable filesystem");
         assert_eq!(thresholds, PressurePolicy::default().thresholds(total));
         assert_eq!(thresholds.critical_below_bytes, critical);
-        assert_eq!(
-            summary.pressure,
-            Some(DiskPressure::Warning),
-            "exactly at the threshold"
-        );
+        assert_eq!(summary.pressure, Some(DiskPressure::Warning), "exactly at the threshold");
         assert_eq!(at(critical - 1).pressure, Some(DiskPressure::Critical));
     }
 
@@ -1279,20 +1099,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let shared = tmp.path().join("app");
         // As on macOS, where data and configuration share a directory.
-        let paths = AppPaths::with_roots(
-            shared.clone(),
-            shared.clone(),
-            tmp.path().join("cache"),
-            tmp.path().join("run"),
-        );
+        let paths = AppPaths::with_roots(shared.clone(), shared.clone(), tmp.path().join("cache"), tmp.path().join("run"));
         write(&paths.config_file(), 4 * KIB);
         write(&paths.logs_dir().join("a.log"), 40 * KIB);
-        let space = |_: &Path| {
-            Ok(FilesystemSpace {
-                total_bytes: 1000 * GIB,
-                available_bytes: 500 * GIB,
-            })
-        };
+        let space = |_: &Path| Ok(FilesystemSpace { total_bytes: 1000 * GIB, available_bytes: 500 * GIB });
         let summary = measure(&Inputs {
             paths: &paths,
             checkouts: &[],

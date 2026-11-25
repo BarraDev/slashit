@@ -27,7 +27,8 @@ pub const APPLY_STARTED_REASON: &str =
 
 /// Reason when every item so far succeeded and their edits await the one commit.
 /// Display text only: decisions read `awaiting_commit`, not this string.
-pub const APPLY_CLEAN_REASON: &str = "PR review fixes applied and are waiting for their one commit";
+pub const APPLY_CLEAN_REASON: &str =
+    "PR review fixes applied and are waiting for their one commit";
 
 /// Reason while the one commit is being made, and after a stop before its
 /// outcome was recorded. Refused until a person resolves the checkout.
@@ -38,27 +39,17 @@ impl Ledger {
     /// Records that item work of operation `op` may now edit the checkout. Creates
     /// the scope record when none exists; continues it only for the same
     /// operation whose previous item succeeded. Refused for any other record.
-    pub async fn begin_apply_item(
-        &self,
-        task_id: Uuid,
-        op: Uuid,
-        working_dir: &str,
-    ) -> Result<(), String> {
+    pub async fn begin_apply_item(&self, task_id: Uuid, op: Uuid, working_dir: &str) -> Result<(), String> {
         let _gate = record_gate(task_id).await;
         let (branch, existing) = {
             let tasks = self.tasks.read().await;
-            let task = tasks
-                .get(&task_id)
-                .ok_or_else(|| format!("task {task_id} is not on the board"))?;
+            let task = tasks.get(&task_id).ok_or_else(|| format!("task {task_id} is not on the board"))?;
             (task.branch_name.clone(), task.review_fix_residue.clone())
         };
-        let branch = branch
-            .ok_or_else(|| "this Task records no branch, so no fix was started".to_string())?;
+        let branch = branch.ok_or_else(|| "this Task records no branch, so no fix was started".to_string())?;
         let head = crate::worktree::checkout_head_commit(working_dir)
             .await
-            .map_err(|e| {
-                format!("the checkout's HEAD could not be read, so no fix was started: {e}")
-            })?;
+            .map_err(|e| format!("the checkout's HEAD could not be read, so no fix was started: {e}"))?;
         let base_head = match existing {
             None => head,
             // Resumed: a later apply of the same Task, branch and checkout takes over a
@@ -100,12 +91,7 @@ impl Ledger {
 
     /// Settles one item of operation `op`. `None` means its edits, if any, now
     /// await the consolidated commit; `Some(reason)` keeps the checkout unresolved.
-    pub async fn settle_item(
-        &self,
-        task_id: Uuid,
-        op: Uuid,
-        keep: Option<String>,
-    ) -> Result<(), String> {
+    pub async fn settle_item(&self, task_id: Uuid, op: Uuid, keep: Option<String>) -> Result<(), String> {
         let _gate = record_gate(task_id).await;
         let current = open_attempt(&self.tasks, task_id, op).await?;
         if !current.apply_scope {
@@ -113,10 +99,7 @@ impl Ledger {
         }
         // A commit that has started is settled only by a person's resolution, never by an item.
         if current.reason == APPLY_COMMIT_STARTED_REASON {
-            return Err(
-                "the PR review fixes are being committed, so no item can settle them now"
-                    .to_string(),
-            );
+            return Err("the PR review fixes are being committed, so no item can settle them now".to_string());
         }
         let awaiting_commit = keep.is_none();
         let reason = keep.unwrap_or_else(|| APPLY_CLEAN_REASON.to_string());
@@ -124,11 +107,7 @@ impl Ledger {
             &self.tasks,
             &self.storage,
             task_id,
-            Some(ReviewFixResidue {
-                reason,
-                awaiting_commit,
-                ..current
-            }),
+            Some(ReviewFixResidue { reason, awaiting_commit, ..current }),
         )
         .await
     }
@@ -137,12 +116,7 @@ impl Ledger {
     /// to be unknown if SlashIt stops. Written under the gate that admitted the
     /// commit. Refuses further commits until resolved, so a crash here never reads
     /// as "waiting for the commit".
-    pub async fn begin_apply_commit(
-        &self,
-        _gate: &RecordGate,
-        task_id: Uuid,
-        record: &ReviewFixResidue,
-    ) -> Result<(), String> {
+    pub async fn begin_apply_commit(&self, _gate: &RecordGate, task_id: Uuid, record: &ReviewFixResidue) -> Result<(), String> {
         write_record(
             &self.tasks,
             &self.storage,
@@ -158,12 +132,7 @@ impl Ledger {
 
     /// Returns the scope to awaiting its commit after the commit was refused, so
     /// the edits stay admissible. Uses the gate from [`Ledger::admit_apply_commit`].
-    pub async fn restore_apply_clean(
-        &self,
-        _gate: &RecordGate,
-        task_id: Uuid,
-        record: &ReviewFixResidue,
-    ) -> Result<(), String> {
+    pub async fn restore_apply_clean(&self, _gate: &RecordGate, task_id: Uuid, record: &ReviewFixResidue) -> Result<(), String> {
         write_record(
             &self.tasks,
             &self.storage,
@@ -188,17 +157,10 @@ impl Ledger {
         op: Option<Uuid>,
     ) -> Result<(RecordGate, Option<ReviewFixResidue>), String> {
         let gate = record_gate(task_id).await;
-        let record = self
-            .tasks
-            .read()
-            .await
-            .get(&task_id)
-            .and_then(|t| t.review_fix_residue.clone());
+        let record = self.tasks.read().await.get(&task_id).and_then(|t| t.review_fix_residue.clone());
         match record {
             None => Ok((gate, None)),
-            Some(r)
-                if r.apply_scope && r.awaiting_commit && op.is_none_or(|o| o == r.attempt_id) =>
-            {
+            Some(r) if r.apply_scope && r.awaiting_commit && op.is_none_or(|o| o == r.attempt_id) => {
                 Ok((gate, Some(r)))
             }
             Some(r) => Err(format!(
@@ -210,12 +172,7 @@ impl Ledger {
 
     /// Clears the scope record `record` after its consolidated commit was made.
     /// The gate from [`Ledger::admit_apply_commit`] must still be held.
-    pub async fn clear_apply(
-        &self,
-        _gate: &RecordGate,
-        task_id: Uuid,
-        record: &ReviewFixResidue,
-    ) -> Result<(), String> {
+    pub async fn clear_apply(&self, _gate: &RecordGate, task_id: Uuid, record: &ReviewFixResidue) -> Result<(), String> {
         open_attempt(&self.tasks, task_id, record.attempt_id).await?;
         write_record(&self.tasks, &self.storage, task_id, None).await
     }
@@ -231,18 +188,12 @@ impl Ledger {
         error: &str,
     ) -> Result<(), String> {
         open_attempt(&self.tasks, task_id, record.attempt_id).await?;
-        let reason = format!(
-            "PR review fixes were committed, but their record could not be cleared: {error}"
-        );
+        let reason = format!("PR review fixes were committed, but their record could not be cleared: {error}");
         write_record(
             &self.tasks,
             &self.storage,
             task_id,
-            Some(ReviewFixResidue {
-                reason,
-                awaiting_commit: false,
-                ..record.clone()
-            }),
+            Some(ReviewFixResidue { reason, awaiting_commit: false, ..record.clone() }),
         )
         .await
     }
@@ -280,11 +231,7 @@ async fn is_ancestor(base: &str, head: &str, checkout: &str) -> bool {
 /// `owned`, the commits SlashIt's own fix plan made. Commits SlashIt did not
 /// make, such as an agent's own commit, make the proof fail, so a later commit
 /// or push cannot publish them.
-pub async fn history_since_is_owned(
-    checkout: &str,
-    base: &str,
-    owned: &[String],
-) -> Result<(), String> {
+pub async fn history_since_is_owned(checkout: &str, base: &str, owned: &[String]) -> Result<(), String> {
     // A detached HEAD (a rebase in progress, or a checkout left detached) is refused
     // by the commit's own guard with its own diagnosis, so there is nothing to prove.
     let on_branch = crate::host_process::tokio_command("git")
@@ -340,11 +287,7 @@ mod tests {
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .output()
             .expect("git runs");
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
@@ -357,9 +300,7 @@ mod tests {
             tmp.path().join("cache"),
             tmp.path().join("runtime"),
         ));
-        let (state, _report) = crate::app_core::build_state_with_paths(paths)
-            .await
-            .expect("build state");
+        let (state, _report) = crate::app_core::build_state_with_paths(paths).await.expect("build state");
         let checkout = tmp.path().join("checkout");
         std::fs::create_dir_all(&checkout).unwrap();
         git(&checkout, &["init", "-q", "-b", "main"]);
@@ -379,14 +320,7 @@ mod tests {
         let task_id = task.id;
         state.task.tasks.write().await.insert(task_id, task);
         let ledger = Ledger::of(&state);
-        Fx {
-            _tmp: tmp,
-            state,
-            ledger,
-            project_id,
-            task_id,
-            checkout,
-        }
+        Fx { _tmp: tmp, state, ledger, project_id, task_id, checkout }
     }
 
     fn dir(fx: &Fx) -> String {
@@ -394,13 +328,7 @@ mod tests {
     }
 
     async fn record(fx: &Fx) -> Option<ReviewFixResidue> {
-        fx.state
-            .task
-            .tasks
-            .read()
-            .await
-            .get(&fx.task_id)
-            .and_then(|t| t.review_fix_residue.clone())
+        fx.state.task.tasks.read().await.get(&fx.task_id).and_then(|t| t.review_fix_residue.clone())
     }
 
     /// The record the next process would load from the durable board.
@@ -426,10 +354,7 @@ mod tests {
     async fn two_successful_items_share_one_scope_and_one_consolidated_commit() {
         let fx = fixture().await;
         let op = Uuid::new_v4();
-        fx.ledger
-            .begin_apply_item(fx.task_id, op, &dir(&fx))
-            .await
-            .unwrap();
+        fx.ledger.begin_apply_item(fx.task_id, op, &dir(&fx)).await.unwrap();
         edit(&fx, "one.txt");
         fx.ledger.settle_item(fx.task_id, op, None).await.unwrap();
         fx.ledger
@@ -439,23 +364,11 @@ mod tests {
         edit(&fx, "two.txt");
         fx.ledger.settle_item(fx.task_id, op, None).await.unwrap();
 
-        let (gate, scope) = fx
-            .ledger
-            .admit_apply_commit(fx.task_id, Some(op))
-            .await
-            .expect("the operation commits");
+        let (gate, scope) = fx.ledger.admit_apply_commit(fx.task_id, Some(op)).await.expect("the operation commits");
         let scope = scope.expect("its scope record");
-        let outcome = crate::worktree::commit_checkout(&dir(&fx), "task-x", "task: fixes")
-            .await
-            .unwrap();
-        assert!(
-            matches!(outcome, CheckoutCommit::Committed { .. }),
-            "{outcome:?}"
-        );
-        fx.ledger
-            .clear_apply(&gate, fx.task_id, &scope)
-            .await
-            .unwrap();
+        let outcome = crate::worktree::commit_checkout(&dir(&fx), "task-x", "task: fixes").await.unwrap();
+        assert!(matches!(outcome, CheckoutCommit::Committed { .. }), "{outcome:?}");
+        fx.ledger.clear_apply(&gate, fx.task_id, &scope).await.unwrap();
         drop(gate);
 
         assert!(record(&fx).await.is_none(), "cleared only after the commit");
@@ -467,91 +380,38 @@ mod tests {
     async fn a_failed_item_after_a_success_keeps_its_edits_and_blocks_every_commit() {
         let fx = fixture().await;
         let op = Uuid::new_v4();
-        fx.ledger
-            .begin_apply_item(fx.task_id, op, &dir(&fx))
-            .await
-            .unwrap();
+        fx.ledger.begin_apply_item(fx.task_id, op, &dir(&fx)).await.unwrap();
         edit(&fx, "one.txt");
         fx.ledger.settle_item(fx.task_id, op, None).await.unwrap();
-        fx.ledger
-            .begin_apply_item(fx.task_id, op, &dir(&fx))
-            .await
-            .unwrap();
+        fx.ledger.begin_apply_item(fx.task_id, op, &dir(&fx)).await.unwrap();
         edit(&fx, "partial.txt");
-        fx.ledger
-            .settle_item(fx.task_id, op, Some("the fix did not finish".into()))
-            .await
-            .unwrap();
+        fx.ledger.settle_item(fx.task_id, op, Some("the fix did not finish".into())).await.unwrap();
 
-        assert!(
-            fx.ledger
-                .begin_apply_item(fx.task_id, op, &dir(&fx))
-                .await
-                .is_err(),
-            "no later item runs"
-        );
-        assert!(
-            fx.ledger
-                .admit_apply_commit(fx.task_id, Some(op))
-                .await
-                .is_err(),
-            "no commit absorbs the partial edit"
-        );
-        assert!(
-            fx.ledger
-                .admit_apply_commit(fx.task_id, None)
-                .await
-                .is_err(),
-            "nor commit-only continuation"
-        );
+        assert!(fx.ledger.begin_apply_item(fx.task_id, op, &dir(&fx)).await.is_err(), "no later item runs");
+        assert!(fx.ledger.admit_apply_commit(fx.task_id, Some(op)).await.is_err(), "no commit absorbs the partial edit");
+        assert!(fx.ledger.admit_apply_commit(fx.task_id, None).await.is_err(), "nor commit-only continuation");
         assert_eq!(commits(&fx), "1", "no commit was made");
-        assert!(
-            fx.checkout.join("partial.txt").exists(),
-            "the partial edit is preserved"
-        );
-        assert_eq!(
-            record(&fx).await.map(|r| r.reason),
-            Some("the fix did not finish".to_string())
-        );
+        assert!(fx.checkout.join("partial.txt").exists(), "the partial edit is preserved");
+        assert_eq!(record(&fx).await.map(|r| r.reason), Some("the fix did not finish".to_string()));
     }
 
     #[tokio::test]
     async fn a_crash_between_items_keeps_the_scope_on_record_and_refuses_other_work() {
         let fx = fixture().await;
         let op = Uuid::new_v4();
-        fx.ledger
-            .begin_apply_item(fx.task_id, op, &dir(&fx))
-            .await
-            .unwrap();
+        fx.ledger.begin_apply_item(fx.task_id, op, &dir(&fx)).await.unwrap();
         edit(&fx, "one.txt");
         fx.ledger.settle_item(fx.task_id, op, None).await.unwrap();
         // The process stops here. The next process loads the scope record.
         let restarted = reloaded(&fx).expect("the scope survives the restart");
         assert!(restarted.apply_scope);
         assert_eq!(restarted.attempt_id, op);
+        assert!(fx.ledger.admit_commit(fx.task_id).await.is_err(), "an ordinary Worker commit is refused");
+        assert!(fx.ledger.begin_attempt(fx.task_id, &dir(&fx)).await.is_err(), "an AI Review fix is refused");
         assert!(
-            fx.ledger.admit_commit(fx.task_id).await.is_err(),
-            "an ordinary Worker commit is refused"
-        );
-        assert!(
-            fx.ledger
-                .begin_attempt(fx.task_id, &dir(&fx))
+            resolve(&fx.ledger.authority, &fx.state.task.tasks, &fx.state.project.projects, &fx.state.storage, fx.task_id, op, None)
                 .await
                 .is_err(),
-            "an AI Review fix is refused"
-        );
-        assert!(
-            resolve(
-                &fx.ledger.authority,
-                &fx.state.task.tasks,
-                &fx.state.project.projects,
-                &fx.state.storage,
-                fx.task_id,
-                op,
-                None
-            )
-            .await
-            .is_err(),
             "uncommitted successful edits cannot be resolved away"
         );
     }
@@ -563,53 +423,23 @@ mod tests {
     async fn a_later_operation_resumes_the_scope_and_the_earlier_one_loses_its_commit() {
         let fx = fixture().await;
         let op = Uuid::new_v4();
-        fx.ledger
-            .begin_apply_item(fx.task_id, op, &dir(&fx))
-            .await
-            .unwrap();
+        fx.ledger.begin_apply_item(fx.task_id, op, &dir(&fx)).await.unwrap();
         edit(&fx, "one.txt");
         fx.ledger.settle_item(fx.task_id, op, None).await.unwrap();
 
         let other = Uuid::new_v4();
-        fx.ledger
-            .begin_apply_item(fx.task_id, other, &dir(&fx))
-            .await
-            .expect("resumed");
-        assert!(
-            fx.ledger
-                .admit_apply_commit(fx.task_id, Some(op))
-                .await
-                .is_err(),
-            "the superseded operation cannot commit"
-        );
-        assert!(
-            fx.ledger
-                .admit_apply_commit(fx.task_id, Some(other))
-                .await
-                .is_err(),
-            "not clean while its item is running"
-        );
-        fx.ledger
-            .settle_item(fx.task_id, other, None)
-            .await
-            .unwrap();
-        assert!(
-            fx.ledger
-                .admit_apply_commit(fx.task_id, Some(other))
-                .await
-                .is_ok(),
-            "the resumed operation may commit"
-        );
+        fx.ledger.begin_apply_item(fx.task_id, other, &dir(&fx)).await.expect("resumed");
+        assert!(fx.ledger.admit_apply_commit(fx.task_id, Some(op)).await.is_err(), "the superseded operation cannot commit");
+        assert!(fx.ledger.admit_apply_commit(fx.task_id, Some(other)).await.is_err(), "not clean while its item is running");
+        fx.ledger.settle_item(fx.task_id, other, None).await.unwrap();
+        assert!(fx.ledger.admit_apply_commit(fx.task_id, Some(other)).await.is_ok(), "the resumed operation may commit");
     }
 
     #[tokio::test]
     async fn a_crash_before_the_final_commit_allows_only_plan_owned_continuation() {
         let fx = fixture().await;
         let op = Uuid::new_v4();
-        fx.ledger
-            .begin_apply_item(fx.task_id, op, &dir(&fx))
-            .await
-            .unwrap();
+        fx.ledger.begin_apply_item(fx.task_id, op, &dir(&fx)).await.unwrap();
         edit(&fx, "one.txt");
         fx.ledger.settle_item(fx.task_id, op, None).await.unwrap();
         // A later operation that runs no agent may commit the owed edits, and its
@@ -621,64 +451,33 @@ mod tests {
             .expect("commit-only continuation of a clean scope");
         assert_eq!(scope.map(|r| r.attempt_id), Some(op));
         drop(gate);
-        assert!(
-            reloaded(&fx).is_some(),
-            "still protected until the commit is made"
-        );
+        assert!(reloaded(&fx).is_some(), "still protected until the commit is made");
     }
 
     #[tokio::test]
     async fn a_scope_kept_after_its_commit_is_refused_until_resolved() {
         let fx = fixture().await;
         let op = Uuid::new_v4();
-        fx.ledger
-            .begin_apply_item(fx.task_id, op, &dir(&fx))
-            .await
-            .unwrap();
+        fx.ledger.begin_apply_item(fx.task_id, op, &dir(&fx)).await.unwrap();
         edit(&fx, "one.txt");
         fx.ledger.settle_item(fx.task_id, op, None).await.unwrap();
         git(&fx.checkout, &["add", "-A"]);
         git(&fx.checkout, &["commit", "-q", "-m", "fixes"]);
-        let (gate, scope) = fx
-            .ledger
-            .admit_apply_commit(fx.task_id, Some(op))
-            .await
-            .unwrap();
+        let (gate, scope) = fx.ledger.admit_apply_commit(fx.task_id, Some(op)).await.unwrap();
         fx.ledger
             .keep_committed_apply(&gate, fx.task_id, &scope.unwrap(), "disk full")
             .await
             .unwrap();
         drop(gate);
 
-        assert!(
-            fx.ledger
-                .admit_apply_commit(fx.task_id, None)
-                .await
-                .is_err(),
-            "a continuation is refused"
-        );
+        assert!(fx.ledger.admit_apply_commit(fx.task_id, None).await.is_err(), "a continuation is refused");
         assert!(fx.ledger.admit_commit(fx.task_id).await.is_err());
-        resolve(
-            &fx.ledger.authority,
-            &fx.state.task.tasks,
-            &fx.state.project.projects,
-            &fx.state.storage,
-            fx.task_id,
-            op,
-            None,
-        )
-        .await
-        .expect("the clean checkout on the Task branch reconciles");
+        resolve(&fx.ledger.authority, &fx.state.task.tasks, &fx.state.project.projects, &fx.state.storage, fx.task_id, op, None)
+            .await
+            .expect("the clean checkout on the Task branch reconciles");
         assert!(record(&fx).await.is_none());
         assert_eq!(
-            fx.state
-                .task
-                .tasks
-                .read()
-                .await
-                .get(&fx.task_id)
-                .unwrap()
-                .status,
+            fx.state.task.tasks.read().await.get(&fx.task_id).unwrap().status,
             TaskStatus::HumanReview,
             "reconciling is not approval"
         );
@@ -688,15 +487,8 @@ mod tests {
     /// recorded as unknown first, then the commit is made. Returns the commit
     /// count after it, and leaves the record as a stop after the commit would.
     async fn stop_after_commit(fx: &Fx, op: Uuid) -> String {
-        let (gate, scope) = fx
-            .ledger
-            .admit_apply_commit(fx.task_id, Some(op))
-            .await
-            .unwrap();
-        fx.ledger
-            .begin_apply_commit(&gate, fx.task_id, &scope.unwrap())
-            .await
-            .unwrap();
+        let (gate, scope) = fx.ledger.admit_apply_commit(fx.task_id, Some(op)).await.unwrap();
+        fx.ledger.begin_apply_commit(&gate, fx.task_id, &scope.unwrap()).await.unwrap();
         drop(gate);
         git(&fx.checkout, &["add", "-A"]);
         git(&fx.checkout, &["commit", "-q", "-m", "fixes"]);
@@ -707,37 +499,21 @@ mod tests {
     async fn after_a_crash_past_the_final_commit_no_second_commit_can_land() {
         let fx = fixture().await;
         let op = Uuid::new_v4();
-        fx.ledger
-            .begin_apply_item(fx.task_id, op, &dir(&fx))
-            .await
-            .unwrap();
+        fx.ledger.begin_apply_item(fx.task_id, op, &dir(&fx)).await.unwrap();
         edit(&fx, "one.txt");
         fx.ledger.settle_item(fx.task_id, op, None).await.unwrap();
         let made = stop_after_commit(&fx, op).await;
         // The process stops after the commit. The next process loads the scope.
         let restarted = reloaded(&fx).expect("the scope survives the restart");
-        assert!(
-            !restarted.awaiting_commit,
-            "a stop after the commit is not waiting for it"
-        );
+        assert!(!restarted.awaiting_commit, "a stop after the commit is not waiting for it");
         assert_eq!(restarted.reason, APPLY_COMMIT_STARTED_REASON);
 
+        assert!(fx.ledger.admit_commit(fx.task_id).await.is_err(), "an ordinary commit is refused");
         assert!(
-            fx.ledger.admit_commit(fx.task_id).await.is_err(),
-            "an ordinary commit is refused"
-        );
-        assert!(
-            fx.ledger
-                .admit_apply_commit(fx.task_id, None)
-                .await
-                .is_err(),
+            fx.ledger.admit_apply_commit(fx.task_id, None).await.is_err(),
             "a continuation is refused until a person resolves the checkout"
         );
-        assert!(fx
-            .ledger
-            .admit_apply_commit(fx.task_id, Some(Uuid::new_v4()))
-            .await
-            .is_err());
+        assert!(fx.ledger.admit_apply_commit(fx.task_id, Some(Uuid::new_v4())).await.is_err());
         assert_eq!(commits(&fx), made, "no duplicate commit was made");
     }
 
@@ -745,88 +521,41 @@ mod tests {
     async fn a_refused_commit_returns_the_scope_to_awaiting_its_commit() {
         let fx = fixture().await;
         let op = Uuid::new_v4();
-        fx.ledger
-            .begin_apply_item(fx.task_id, op, &dir(&fx))
-            .await
-            .unwrap();
+        fx.ledger.begin_apply_item(fx.task_id, op, &dir(&fx)).await.unwrap();
         edit(&fx, "one.txt");
         fx.ledger.settle_item(fx.task_id, op, None).await.unwrap();
-        let (gate, scope) = fx
-            .ledger
-            .admit_apply_commit(fx.task_id, Some(op))
-            .await
-            .unwrap();
+        let (gate, scope) = fx.ledger.admit_apply_commit(fx.task_id, Some(op)).await.unwrap();
         let scope = scope.unwrap();
         // A failed marker write makes no commit: the scope is unchanged and admissible.
-        let fault = slashit_durable_fs::fault::fail_at(
-            slashit_durable_fs::Stage::Replace,
-            std::io::ErrorKind::Other,
-        );
-        assert!(fx
-            .ledger
-            .begin_apply_commit(&gate, fx.task_id, &scope)
-            .await
-            .is_err());
+        let fault = slashit_durable_fs::fault::fail_at(slashit_durable_fs::Stage::Replace, std::io::ErrorKind::Other);
+        assert!(fx.ledger.begin_apply_commit(&gate, fx.task_id, &scope).await.is_err());
         drop(fault);
-        assert!(
-            record(&fx).await.unwrap().awaiting_commit,
-            "a failed marker leaves the scope as it was"
-        );
+        assert!(record(&fx).await.unwrap().awaiting_commit, "a failed marker leaves the scope as it was");
 
-        fx.ledger
-            .begin_apply_commit(&gate, fx.task_id, &scope)
-            .await
-            .unwrap();
-        fx.ledger
-            .restore_apply_clean(&gate, fx.task_id, &scope)
-            .await
-            .unwrap();
+        fx.ledger.begin_apply_commit(&gate, fx.task_id, &scope).await.unwrap();
+        fx.ledger.restore_apply_clean(&gate, fx.task_id, &scope).await.unwrap();
         drop(gate);
         let restored = record(&fx).await.unwrap();
         assert!(restored.awaiting_commit && restored.reason == APPLY_CLEAN_REASON);
-        assert!(
-            fx.ledger.admit_apply_commit(fx.task_id, None).await.is_ok(),
-            "the edits are admissible again"
-        );
+        assert!(fx.ledger.admit_apply_commit(fx.task_id, None).await.is_ok(), "the edits are admissible again");
     }
 
     #[tokio::test]
     async fn a_stop_that_fails_both_record_writes_after_the_commit_stays_refused_and_resolvable() {
         let fx = fixture().await;
         let op = Uuid::new_v4();
-        fx.ledger
-            .begin_apply_item(fx.task_id, op, &dir(&fx))
-            .await
-            .unwrap();
+        fx.ledger.begin_apply_item(fx.task_id, op, &dir(&fx)).await.unwrap();
         edit(&fx, "one.txt");
         fx.ledger.settle_item(fx.task_id, op, None).await.unwrap();
-        let (gate, scope) = fx
-            .ledger
-            .admit_apply_commit(fx.task_id, Some(op))
-            .await
-            .unwrap();
+        let (gate, scope) = fx.ledger.admit_apply_commit(fx.task_id, Some(op)).await.unwrap();
         let scope = scope.unwrap();
-        fx.ledger
-            .begin_apply_commit(&gate, fx.task_id, &scope)
-            .await
-            .unwrap();
+        fx.ledger.begin_apply_commit(&gate, fx.task_id, &scope).await.unwrap();
         git(&fx.checkout, &["add", "-A"]);
         git(&fx.checkout, &["commit", "-q", "-m", "fixes"]);
         // Every record write now fails: the clearing write, then the fallback.
-        let fault = slashit_durable_fs::fault::fail_every(
-            slashit_durable_fs::Stage::Replace,
-            std::io::ErrorKind::Other,
-        );
-        assert!(fx
-            .ledger
-            .clear_apply(&gate, fx.task_id, &scope)
-            .await
-            .is_err());
-        assert!(fx
-            .ledger
-            .keep_committed_apply(&gate, fx.task_id, &scope, "disk full")
-            .await
-            .is_err());
+        let fault = slashit_durable_fs::fault::fail_every(slashit_durable_fs::Stage::Replace, std::io::ErrorKind::Other);
+        assert!(fx.ledger.clear_apply(&gate, fx.task_id, &scope).await.is_err());
+        assert!(fx.ledger.keep_committed_apply(&gate, fx.task_id, &scope, "disk full").await.is_err());
         drop(fault);
         drop(gate);
 
@@ -834,39 +563,16 @@ mod tests {
         let durable = reloaded(&fx).expect("the record survives both failures");
         assert_eq!(durable.reason, APPLY_COMMIT_STARTED_REASON);
         assert!(!durable.awaiting_commit);
-        assert_eq!(
-            record(&fx).await.as_ref(),
-            Some(&durable),
-            "memory matches the durable record"
-        );
-        assert!(fx
-            .ledger
-            .admit_apply_commit(fx.task_id, None)
-            .await
-            .is_err());
+        assert_eq!(record(&fx).await.as_ref(), Some(&durable), "memory matches the durable record");
+        assert!(fx.ledger.admit_apply_commit(fx.task_id, None).await.is_err());
         assert!(fx.ledger.admit_commit(fx.task_id).await.is_err());
 
-        resolve(
-            &fx.ledger.authority,
-            &fx.state.task.tasks,
-            &fx.state.project.projects,
-            &fx.state.storage,
-            fx.task_id,
-            op,
-            None,
-        )
-        .await
-        .expect("the clean checkout on the Task branch reconciles after a restart");
+        resolve(&fx.ledger.authority, &fx.state.task.tasks, &fx.state.project.projects, &fx.state.storage, fx.task_id, op, None)
+            .await
+            .expect("the clean checkout on the Task branch reconciles after a restart");
         assert!(record(&fx).await.is_none());
         assert_eq!(
-            fx.state
-                .task
-                .tasks
-                .read()
-                .await
-                .get(&fx.task_id)
-                .unwrap()
-                .status,
+            fx.state.task.tasks.read().await.get(&fx.task_id).unwrap().status,
             TaskStatus::HumanReview,
             "reconciling is not approval"
         );
@@ -876,36 +582,18 @@ mod tests {
     async fn a_crash_after_the_final_commit_reconciles_without_approving_the_task() {
         let fx = fixture().await;
         let op = Uuid::new_v4();
-        fx.ledger
-            .begin_apply_item(fx.task_id, op, &dir(&fx))
-            .await
-            .unwrap();
+        fx.ledger.begin_apply_item(fx.task_id, op, &dir(&fx)).await.unwrap();
         edit(&fx, "one.txt");
         fx.ledger.settle_item(fx.task_id, op, None).await.unwrap();
         stop_after_commit(&fx, op).await;
         // The process stops after the commit and before the scope settles.
         assert!(reloaded(&fx).is_some());
-        resolve(
-            &fx.ledger.authority,
-            &fx.state.task.tasks,
-            &fx.state.project.projects,
-            &fx.state.storage,
-            fx.task_id,
-            op,
-            None,
-        )
-        .await
-        .expect("a clean checkout on the Task branch reconciles");
+        resolve(&fx.ledger.authority, &fx.state.task.tasks, &fx.state.project.projects, &fx.state.storage, fx.task_id, op, None)
+            .await
+            .expect("a clean checkout on the Task branch reconciles");
         assert!(record(&fx).await.is_none());
         assert_eq!(
-            fx.state
-                .task
-                .tasks
-                .read()
-                .await
-                .get(&fx.task_id)
-                .unwrap()
-                .status,
+            fx.state.task.tasks.read().await.get(&fx.task_id).unwrap().status,
             TaskStatus::HumanReview,
             "reconciling is not approval"
         );
@@ -916,10 +604,7 @@ mod tests {
         let fx = fixture().await;
         let op = Uuid::new_v4();
         let base = git(&fx.checkout, &["rev-parse", "HEAD"]);
-        fx.ledger
-            .begin_apply_item(fx.task_id, op, &dir(&fx))
-            .await
-            .unwrap();
+        fx.ledger.begin_apply_item(fx.task_id, op, &dir(&fx)).await.unwrap();
         // An agent commits on the Task branch by itself, and the item's edit follows.
         edit(&fx, "agent.txt");
         git(&fx.checkout, &["add", "-A"]);
@@ -929,54 +614,29 @@ mod tests {
         fx.ledger.settle_item(fx.task_id, op, None).await.unwrap();
 
         let no_owned: Vec<String> = Vec::new();
-        assert!(
-            history_since_is_owned(&dir(&fx), &base, &no_owned)
-                .await
-                .is_err(),
-            "the agent commit is not ours"
-        );
+        assert!(history_since_is_owned(&dir(&fx), &base, &no_owned).await.is_err(), "the agent commit is not ours");
         let plan_owned = vec![agent.clone()];
-        assert!(
-            history_since_is_owned(&dir(&fx), &base, &plan_owned)
-                .await
-                .is_ok(),
-            "a plan commit is ours"
-        );
+        assert!(history_since_is_owned(&dir(&fx), &base, &plan_owned).await.is_ok(), "a plan commit is ours");
     }
 
     #[tokio::test]
     async fn an_operation_without_uncommitted_work_clears_its_scope_only_when_clean() {
         let fx = fixture().await;
         let op = Uuid::new_v4();
-        fx.ledger
-            .begin_apply_item(fx.task_id, op, &dir(&fx))
-            .await
-            .unwrap();
+        fx.ledger.begin_apply_item(fx.task_id, op, &dir(&fx)).await.unwrap();
         fx.ledger.settle_item(fx.task_id, op, None).await.unwrap();
         edit(&fx, "left.txt");
-        fx.ledger
-            .clear_apply_if_clean(fx.task_id, op)
-            .await
-            .unwrap();
-        assert!(
-            record(&fx).await.is_some(),
-            "a dirty checkout keeps its scope"
-        );
+        fx.ledger.clear_apply_if_clean(fx.task_id, op).await.unwrap();
+        assert!(record(&fx).await.is_some(), "a dirty checkout keeps its scope");
         std::fs::remove_file(fx.checkout.join("left.txt")).unwrap();
-        fx.ledger
-            .clear_apply_if_clean(fx.task_id, op)
-            .await
-            .unwrap();
+        fx.ledger.clear_apply_if_clean(fx.task_id, op).await.unwrap();
         assert!(record(&fx).await.is_none(), "a clean checkout releases it");
     }
 
     /// One successful item of `op` leaves a clean scope record, as an apply does
     /// before its consolidated commit is refused or fails.
     async fn clean_scope_of(fx: &Fx, op: Uuid) -> ReviewFixResidue {
-        fx.ledger
-            .begin_apply_item(fx.task_id, op, &dir(fx))
-            .await
-            .unwrap();
+        fx.ledger.begin_apply_item(fx.task_id, op, &dir(fx)).await.unwrap();
         edit(fx, "one.txt");
         fx.ledger.settle_item(fx.task_id, op, None).await.unwrap();
         record(fx).await.expect("the clean scope record")
@@ -987,19 +647,10 @@ mod tests {
         let fx = fixture().await;
         let first = clean_scope_of(&fx, Uuid::new_v4()).await;
         let next = Uuid::new_v4();
-        fx.ledger
-            .begin_apply_item(fx.task_id, next, &dir(&fx))
-            .await
-            .expect("resumed");
+        fx.ledger.begin_apply_item(fx.task_id, next, &dir(&fx)).await.expect("resumed");
         let resumed = record(&fx).await.expect("one record");
-        assert_eq!(
-            resumed.attempt_id, next,
-            "the record now belongs to the new apply"
-        );
-        assert_eq!(
-            resumed.base_head, first.base_head,
-            "the commit base is kept"
-        );
+        assert_eq!(resumed.attempt_id, next, "the record now belongs to the new apply");
+        assert_eq!(resumed.base_head, first.base_head, "the commit base is kept");
         assert!(resumed.apply_scope && resumed.reason == APPLY_STARTED_REASON);
     }
 
@@ -1008,19 +659,8 @@ mod tests {
         let fx = fixture().await;
         let mut scope = clean_scope_of(&fx, Uuid::new_v4()).await;
         scope.checkout_path = "/elsewhere".to_string();
-        write_record(
-            &fx.ledger.tasks,
-            &fx.ledger.storage,
-            fx.task_id,
-            Some(scope),
-        )
-        .await
-        .unwrap();
-        assert!(fx
-            .ledger
-            .begin_apply_item(fx.task_id, Uuid::new_v4(), &dir(&fx))
-            .await
-            .is_err());
+        write_record(&fx.ledger.tasks, &fx.ledger.storage, fx.task_id, Some(scope)).await.unwrap();
+        assert!(fx.ledger.begin_apply_item(fx.task_id, Uuid::new_v4(), &dir(&fx)).await.is_err());
     }
 
     #[tokio::test]
@@ -1028,19 +668,8 @@ mod tests {
         let fx = fixture().await;
         let mut scope = clean_scope_of(&fx, Uuid::new_v4()).await;
         scope.base_head = "0".repeat(40);
-        write_record(
-            &fx.ledger.tasks,
-            &fx.ledger.storage,
-            fx.task_id,
-            Some(scope),
-        )
-        .await
-        .unwrap();
-        let error = fx
-            .ledger
-            .begin_apply_item(fx.task_id, Uuid::new_v4(), &dir(&fx))
-            .await
-            .unwrap_err();
+        write_record(&fx.ledger.tasks, &fx.ledger.storage, fx.task_id, Some(scope)).await.unwrap();
+        let error = fx.ledger.begin_apply_item(fx.task_id, Uuid::new_v4(), &dir(&fx)).await.unwrap_err();
         assert!(error.contains("not in the checkout's history"), "{error}");
     }
 
@@ -1049,14 +678,7 @@ mod tests {
         let fx = fixture().await;
         let op = Uuid::new_v4();
         clean_scope_of(&fx, op).await;
-        fx.ledger
-            .settle_item(fx.task_id, op, Some("an item failed".to_string()))
-            .await
-            .unwrap();
-        assert!(fx
-            .ledger
-            .begin_apply_item(fx.task_id, Uuid::new_v4(), &dir(&fx))
-            .await
-            .is_err());
+        fx.ledger.settle_item(fx.task_id, op, Some("an item failed".to_string())).await.unwrap();
+        assert!(fx.ledger.begin_apply_item(fx.task_id, Uuid::new_v4(), &dir(&fx)).await.is_err());
     }
 }

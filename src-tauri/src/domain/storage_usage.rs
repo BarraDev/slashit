@@ -73,10 +73,7 @@ pub enum CheckoutLifecycle {
     /// this checkout. `agent_attached` says whether an agent (an execution,
     /// an AI review or a pull request helper) was working in it when it was
     /// measured, which the status alone cannot say.
-    Task {
-        status: TaskStatus,
-        agent_attached: bool,
-    },
+    Task { status: TaskStatus, agent_attached: bool },
     /// The task recording it started a cleanup that never recorded its
     /// outcome, so part of the checkout may already be gone.
     CleanupInterrupted { status: TaskStatus },
@@ -98,21 +95,12 @@ impl CheckoutLifecycle {
     /// Says nothing about what the user runs there themselves.
     pub fn may_be_in_use(&self) -> bool {
         match self {
-            Self::Task {
-                status,
-                agent_attached,
-            } => {
+            Self::Task { status, agent_attached } => {
                 *agent_attached
-                    || matches!(
-                        status,
-                        TaskStatus::InProgress | TaskStatus::AiReview | TaskStatus::Queue
-                    )
+                    || matches!(status, TaskStatus::InProgress | TaskStatus::AiReview | TaskStatus::Queue)
             }
             // Not attributable, so not provably idle.
-            Self::CleanupInterrupted { .. }
-            | Self::Unrecorded
-            | Self::Contested
-            | Self::Misplaced => true,
+            Self::CleanupInterrupted { .. } | Self::Unrecorded | Self::Contested | Self::Misplaced => true,
         }
     }
 
@@ -133,14 +121,9 @@ pub enum Measurement {
     Complete,
     /// Some entries could not be read, or the walk stopped at a limit. The
     /// byte count is a lower bound.
-    Partial {
-        skipped_entries: u64,
-        reason: String,
-    },
+    Partial { skipped_entries: u64, reason: String },
     /// Nothing could be measured. The consumer's bytes are `None`.
-    Failed {
-        reason: String,
-    },
+    Failed { reason: String },
 }
 
 /// One directory or file SlashIt accounts for.
@@ -273,12 +256,12 @@ impl PressurePolicy {
     /// filesystem. Only [`DiskPressure::Critical`] blocks; Warning does not.
     pub fn start_block(&self, space: Result<FilesystemSpace, String>) -> Option<StartBlock> {
         match space {
-            Ok(space) => {
-                (self.classify(space) == DiskPressure::Critical).then(|| StartBlock::CriticalDisk {
+            Ok(space) => (self.classify(space) == DiskPressure::Critical).then(|| {
+                StartBlock::CriticalDisk {
                     available_bytes: space.available_bytes,
                     critical_below_bytes: self.thresholds(space.total_bytes).critical_below_bytes,
-                })
-            }
+                }
+            }),
             Err(reason) => Some(StartBlock::DiskSpaceUnavailable { reason }),
         }
     }
@@ -287,10 +270,7 @@ impl PressurePolicy {
 impl std::fmt::Display for StartBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StartBlock::CriticalDisk {
-                available_bytes,
-                critical_below_bytes,
-            } => write!(
+            StartBlock::CriticalDisk { available_bytes, critical_below_bytes } => write!(
                 f,
                 "New work paused: critically low disk space ({} free; new tasks can start \
                  again at {} free). Settings > Storage shows what SlashIt uses.",
@@ -385,41 +365,17 @@ mod tests {
     fn levels_apply_strictly_below_their_thresholds() {
         let policy = PressurePolicy::default();
         let total = 500 * GIB;
-        assert_eq!(
-            policy.classify(space(total, 120 * GIB)),
-            DiskPressure::Normal
-        );
-        assert_eq!(
-            policy.classify(space(total, 120 * GIB - 1)),
-            DiskPressure::Warning
-        );
-        assert_eq!(
-            policy.classify(space(total, 40 * GIB)),
-            DiskPressure::Warning
-        );
-        assert_eq!(
-            policy.classify(space(total, 40 * GIB - 1)),
-            DiskPressure::Critical
-        );
+        assert_eq!(policy.classify(space(total, 120 * GIB)), DiskPressure::Normal);
+        assert_eq!(policy.classify(space(total, 120 * GIB - 1)), DiskPressure::Warning);
+        assert_eq!(policy.classify(space(total, 40 * GIB)), DiskPressure::Warning);
+        assert_eq!(policy.classify(space(total, 40 * GIB - 1)), DiskPressure::Critical);
         assert_eq!(policy.classify(space(total, 0)), DiskPressure::Critical);
 
         let total = 2000 * GIB;
-        assert_eq!(
-            policy.classify(space(total, 300 * GIB)),
-            DiskPressure::Normal
-        );
-        assert_eq!(
-            policy.classify(space(total, 300 * GIB - 1)),
-            DiskPressure::Warning
-        );
-        assert_eq!(
-            policy.classify(space(total, 100 * GIB)),
-            DiskPressure::Warning
-        );
-        assert_eq!(
-            policy.classify(space(total, 100 * GIB - 1)),
-            DiskPressure::Critical
-        );
+        assert_eq!(policy.classify(space(total, 300 * GIB)), DiskPressure::Normal);
+        assert_eq!(policy.classify(space(total, 300 * GIB - 1)), DiskPressure::Warning);
+        assert_eq!(policy.classify(space(total, 100 * GIB)), DiskPressure::Warning);
+        assert_eq!(policy.classify(space(total, 100 * GIB - 1)), DiskPressure::Critical);
     }
 
     /// The critical floor is capped at a fifth of the filesystem, so a disk
@@ -429,20 +385,16 @@ mod tests {
     fn the_critical_floor_is_capped_at_a_fifth_of_a_small_disk() {
         let policy = PressurePolicy::default();
         for (total, critical) in [
-            (20 * GIB, 4 * GIB),          // 20% of 20 GiB, below the 40 GiB floor
-            (64 * GIB, 13_743_895_347),   // 20% of 64 GiB, 12.8 GiB
-            (100 * GIB, 20 * GIB),        // 20% of 100 GiB
-            (200 * GIB, 40 * GIB),        // 20% is exactly the floor
-            (500 * GIB, 40 * GIB),        // the floor; 5% is 25 GiB
-            (1024 * GIB, 54_975_581_388), // 5% of 1 TiB, 51.2 GiB, above the floor
-            (2000 * GIB, 100 * GIB),      // 5% of 2000 GiB
+            (20 * GIB, 4 * GIB),             // 20% of 20 GiB, below the 40 GiB floor
+            (64 * GIB, 13_743_895_347),      // 20% of 64 GiB, 12.8 GiB
+            (100 * GIB, 20 * GIB),           // 20% of 100 GiB
+            (200 * GIB, 40 * GIB),           // 20% is exactly the floor
+            (500 * GIB, 40 * GIB),           // the floor; 5% is 25 GiB
+            (1024 * GIB, 54_975_581_388),    // 5% of 1 TiB, 51.2 GiB, above the floor
+            (2000 * GIB, 100 * GIB),         // 5% of 2000 GiB
         ] {
             let label = format!("{} GiB", total / GIB);
-            assert_eq!(
-                policy.thresholds(total).critical_below_bytes,
-                critical,
-                "{label}"
-            );
+            assert_eq!(policy.thresholds(total).critical_below_bytes, critical, "{label}");
             // Warning is unchanged by the cap.
             assert_eq!(
                 policy.thresholds(total).warning_below_bytes,
@@ -451,21 +403,9 @@ mod tests {
             );
 
             // Exactly at the threshold is not Critical; one byte below is.
-            assert_eq!(
-                policy.classify(space(total, critical)),
-                DiskPressure::Warning,
-                "{label}"
-            );
-            assert_eq!(
-                policy.classify(space(total, critical - 1)),
-                DiskPressure::Critical,
-                "{label}"
-            );
-            assert_eq!(
-                policy.start_block(Ok(space(total, critical))),
-                None,
-                "{label}"
-            );
+            assert_eq!(policy.classify(space(total, critical)), DiskPressure::Warning, "{label}");
+            assert_eq!(policy.classify(space(total, critical - 1)), DiskPressure::Critical, "{label}");
+            assert_eq!(policy.start_block(Ok(space(total, critical))), None, "{label}");
             assert_eq!(
                 policy.start_block(Ok(space(total, critical - 1))),
                 Some(StartBlock::CriticalDisk {
@@ -500,15 +440,10 @@ mod tests {
         let block = PressurePolicy::default().start_block(Err("permission denied".to_string()));
         assert_eq!(
             block,
-            Some(StartBlock::DiskSpaceUnavailable {
-                reason: "permission denied".to_string()
-            })
+            Some(StartBlock::DiskSpaceUnavailable { reason: "permission denied".to_string() })
         );
         let message = block.unwrap().to_string();
-        assert!(
-            message.contains("couldn't verify free disk space"),
-            "{message}"
-        );
+        assert!(message.contains("couldn't verify free disk space"), "{message}");
         assert!(!message.contains("critically"), "{message}");
     }
 
@@ -519,10 +454,7 @@ mod tests {
             critical_below_bytes: 40 * GIB,
         }
         .to_string();
-        assert!(
-            message.starts_with("New work paused: critically low disk space"),
-            "{message}"
-        );
+        assert!(message.starts_with("New work paused: critically low disk space"), "{message}");
         assert!(message.contains("12.5 GiB free"), "{message}");
         assert!(message.contains("40.0 GiB"), "{message}");
         assert!(message.contains("Settings > Storage"), "{message}");
@@ -532,36 +464,20 @@ mod tests {
     fn a_share_of_the_largest_filesystem_does_not_overflow() {
         let policy = PressurePolicy::default();
         let thresholds = policy.thresholds(u64::MAX);
-        assert_eq!(
-            thresholds.warning_below_bytes,
-            u64::MAX / 100 * 15 + 15 * (u64::MAX % 100) / 100
-        );
-        assert_eq!(
-            policy.classify(space(u64::MAX, u64::MAX)),
-            DiskPressure::Normal
-        );
-        assert_eq!(
-            share(u64::MAX, 255),
-            u64::MAX,
-            "saturates rather than wrapping"
-        );
+        assert_eq!(thresholds.warning_below_bytes, u64::MAX / 100 * 15 + 15 * (u64::MAX % 100) / 100);
+        assert_eq!(policy.classify(space(u64::MAX, u64::MAX)), DiskPressure::Normal);
+        assert_eq!(share(u64::MAX, 255), u64::MAX, "saturates rather than wrapping");
     }
 
     #[test]
     fn only_idle_attributed_checkouts_are_out_of_use() {
         use TaskStatus::*;
-        let task = |status: &TaskStatus, agent_attached| CheckoutLifecycle::Task {
-            status: status.clone(),
-            agent_attached,
-        };
+        let task = |status: &TaskStatus, agent_attached| CheckoutLifecycle::Task { status: status.clone(), agent_attached };
         for status in [Backlog, HumanReview, PrCreated, Error, Done] {
             assert!(!task(&status, false).may_be_in_use(), "{status:?}");
             // A pull request helper works in a PR Created task's checkout
             // without changing its status.
-            assert!(
-                task(&status, true).may_be_in_use(),
-                "{status:?} with an agent"
-            );
+            assert!(task(&status, true).may_be_in_use(), "{status:?} with an agent");
         }
         for status in [Queue, InProgress, AiReview] {
             assert!(task(&status, false).may_be_in_use(), "{status:?}");
@@ -576,19 +492,16 @@ mod tests {
     /// shape; change both together.
     #[test]
     fn the_wire_shape_is_what_the_frontend_reads() {
-        let consumer =
-            |kind, label: &str, bytes, classification, lifecycle, reclaimable, measurement| {
-                StorageConsumer {
-                    kind,
-                    label: label.to_string(),
-                    detail: None,
-                    bytes,
-                    classification,
-                    lifecycle,
-                    reclaimable,
-                    measurement,
-                }
-            };
+        let consumer = |kind, label: &str, bytes, classification, lifecycle, reclaimable, measurement| StorageConsumer {
+            kind,
+            label: label.to_string(),
+            detail: None,
+            bytes,
+            classification,
+            lifecycle,
+            reclaimable,
+            measurement,
+        };
         let status = StorageStatus {
             summary: Some(StorageSummary {
                 measured_at: "2026-09-28T12:00:00Z".parse().unwrap(),
@@ -596,10 +509,7 @@ mod tests {
                 filesystem: Some(space(100, 50)),
                 filesystem_error: None,
                 pressure: Some(DiskPressure::Warning),
-                thresholds: Some(PressureThresholds {
-                    warning_below_bytes: 60,
-                    critical_below_bytes: 20,
-                }),
+                thresholds: Some(PressureThresholds { warning_below_bytes: 60, critical_below_bytes: 20 }),
                 slashit_owned_bytes: 10,
                 active_workspace_bytes: 5,
                 rebuildable_bytes: 3,
@@ -616,15 +526,9 @@ mod tests {
                         "Fix login",
                         Some(3),
                         StorageClassification::Rebuildable,
-                        Some(CheckoutLifecycle::Task {
-                            status: TaskStatus::HumanReview,
-                            agent_attached: false,
-                        }),
+                        Some(CheckoutLifecycle::Task { status: TaskStatus::HumanReview, agent_attached: false }),
                         true,
-                        Measurement::Partial {
-                            skipped_entries: 1,
-                            reason: "x".to_string(),
-                        },
+                        Measurement::Partial { skipped_entries: 1, reason: "x".to_string() },
                     )
                 }],
                 unmeasured: vec![consumer(
@@ -634,9 +538,7 @@ mod tests {
                     StorageClassification::AppData,
                     None,
                     false,
-                    Measurement::Failed {
-                        reason: "denied".to_string(),
-                    },
+                    Measurement::Failed { reason: "denied".to_string() },
                 )],
             }),
             measuring: false,
@@ -688,21 +590,10 @@ mod tests {
 
     #[test]
     fn done_and_unattributed_checkouts_are_not_active() {
-        assert!(CheckoutLifecycle::Task {
-            status: TaskStatus::HumanReview,
-            agent_attached: false
-        }
-        .is_active());
-        assert!(!CheckoutLifecycle::Task {
-            status: TaskStatus::Done,
-            agent_attached: false
-        }
-        .is_active());
+        assert!(CheckoutLifecycle::Task { status: TaskStatus::HumanReview, agent_attached: false }.is_active());
+        assert!(!CheckoutLifecycle::Task { status: TaskStatus::Done, agent_attached: false }.is_active());
         assert!(!CheckoutLifecycle::Unrecorded.is_active());
         assert!(!CheckoutLifecycle::Contested.is_active());
-        assert!(!CheckoutLifecycle::CleanupInterrupted {
-            status: TaskStatus::InProgress
-        }
-        .is_active());
+        assert!(!CheckoutLifecycle::CleanupInterrupted { status: TaskStatus::InProgress }.is_active());
     }
 }

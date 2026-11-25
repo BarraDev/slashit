@@ -8,9 +8,7 @@ mod release_channel;
 mod source_provenance;
 
 use release_channel::{channel_for, parse_declarations, PlainVersion};
-use source_provenance::{
-    classify, encode, is_commit_id, parse, tree_from_status, Provenance, Tree,
-};
+use source_provenance::{classify, encode, is_commit_id, parse, tree_from_status, Provenance, Tree};
 use std::path::PathBuf;
 
 fn main() {
@@ -27,19 +25,12 @@ fn main() {
         .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
     let declarations =
         parse_declarations(&text).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-    let version = PlainVersion::parse(&version_text).unwrap_or_else(|| {
-        panic!("the package version {version_text} is not plain MAJOR.MINOR.PATCH")
-    });
+    let version = PlainVersion::parse(&version_text)
+        .unwrap_or_else(|| panic!("the package version {version_text} is not plain MAJOR.MINOR.PATCH"));
     let channel = channel_for(&declarations, version).unwrap_or_else(|| {
-        panic!(
-            "{version} has no channel in {}; declare it there",
-            path.display()
-        )
+        panic!("{version} has no channel in {}; declare it there", path.display())
     });
-    println!(
-        "cargo:rustc-env=SLASHIT_RELEASE_CHANNEL={}",
-        channel.as_str()
-    );
+    println!("cargo:rustc-env=SLASHIT_RELEASE_CHANNEL={}", channel.as_str());
 
     // Where this binary's source came from, for the About dialog. Taken at
     // build time only; the application never runs Git. Set
@@ -55,11 +46,7 @@ fn main() {
     if let Some(recorded) = encode(&provenance) {
         // The application reads this value with the same parser, so a value it
         // could not read back is a build error, not a silent Unknown.
-        assert_eq!(
-            parse(&recorded),
-            Some(provenance.clone()),
-            "{recorded} does not read back"
-        );
+        assert_eq!(parse(&recorded), Some(provenance.clone()), "{recorded} does not read back");
         println!("cargo:rustc-env=SLASHIT_SOURCE_PROVENANCE={recorded}");
     }
 }

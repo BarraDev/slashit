@@ -198,8 +198,7 @@ impl CheckSequence {
 
     pub fn is_current(&self, ticket: CheckTicket) -> bool {
         use std::sync::atomic::Ordering::SeqCst;
-        self.generation.load(SeqCst) == ticket.generation
-            && self.started.load(SeqCst) == ticket.sequence
+        self.generation.load(SeqCst) == ticket.generation && self.started.load(SeqCst) == ticket.sequence
     }
 
     /// The channel generation now in force.
@@ -209,8 +208,7 @@ impl CheckSequence {
 
     /// Invalidate every check in flight and every update found before now.
     pub fn supersede(&self) {
-        self.generation
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -797,23 +795,17 @@ async fn find_update(
             &format!("the running version {current_version} is not a plain MAJOR.MINOR.PATCH"),
         )
     })?;
-    let endpoints =
-        update_feed::endpoints().map_err(|detail| err(UpdaterErrorKind::NotConfigured, &detail))?;
+    let endpoints = update_feed::endpoints()
+        .map_err(|detail| err(UpdaterErrorKind::NotConfigured, &detail))?;
     let feed = cached_feed(state, &endpoints).await?;
     let Selection { chosen, notices } = update_feed::select(&feed, channel, current);
     let Some(chosen) = chosen else {
-        return Ok(Found {
-            update: None,
-            notices,
-        });
+        return Ok(Found { update: None, notices });
     };
 
     let manifest = update_feed::manifest_url(&endpoints.download_base, &chosen.tag);
     let endpoint = tauri::Url::parse(&manifest).map_err(|error| {
-        err(
-            UpdaterErrorKind::NotConfigured,
-            &format!("the release manifest URL is invalid: {error}"),
-        )
+        err(UpdaterErrorKind::NotConfigured, &format!("the release manifest URL is invalid: {error}"))
     })?;
     let updater = app
         .updater_builder()
@@ -917,18 +909,11 @@ pub async fn updater_set_channel(
     channel: String,
 ) -> Result<(), String> {
     let channel = ReleaseChannel::parse(&channel).ok_or_else(|| {
-        err(
-            UpdaterErrorKind::NotConfigured,
-            &format!("{channel:?} is not an update channel"),
-        )
+        err(UpdaterErrorKind::NotConfigured, &format!("{channel:?} is not an update channel"))
     })?;
 
     let mut pending = state.updater.pending.lock().await;
-    if state
-        .updater
-        .installing
-        .load(std::sync::atomic::Ordering::SeqCst)
-    {
+    if state.updater.installing.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(err(
             UpdaterErrorKind::Install,
             "An update is being installed. Change the channel after it finishes.",
@@ -1252,9 +1237,7 @@ pub fn app_about(
         source_commit,
         source_state,
         operating_system: std::env::consts::OS.to_string(),
-        executable_path: std::env::current_exe()
-            .ok()
-            .map(|path| path.display().to_string()),
+        executable_path: std::env::current_exe().ok().map(|path| path.display().to_string()),
         data_dir: state.paths.data_dir().display().to_string(),
     })
 }
@@ -1287,11 +1270,7 @@ mod tests {
         assert_eq!(value["sourceState"], "unknown");
         assert_eq!(value["executablePath"], "/opt/slashit/slashit-ui");
         assert_eq!(value["dataDir"], "/home/user/.local/share/slashit");
-        assert_eq!(
-            value.as_object().unwrap().len(),
-            8,
-            "only the About fields are exposed"
-        );
+        assert_eq!(value.as_object().unwrap().len(), 8, "only the About fields are exposed");
     }
 
     #[test]
@@ -1304,21 +1283,14 @@ mod tests {
     fn each_source_provenance_reports_its_commit_and_its_state() {
         let commit = "14f170b13b0f864a6322576f4512dadfb18482a2".to_string();
         assert_eq!(
-            source_facts(&Provenance::Modified {
-                commit: commit.clone()
-            }),
+            source_facts(&Provenance::Modified { commit: commit.clone() }),
             (Some(commit.clone()), SourceState::Modified)
         );
         assert_eq!(
-            source_facts(&Provenance::Unverified {
-                commit: commit.clone()
-            }),
+            source_facts(&Provenance::Unverified { commit: commit.clone() }),
             (Some(commit), SourceState::Unverified)
         );
-        assert_eq!(
-            source_facts(&Provenance::Unknown),
-            (None, SourceState::Unknown)
-        );
+        assert_eq!(source_facts(&Provenance::Unknown), (None, SourceState::Unknown));
     }
 
     #[test]
@@ -1327,10 +1299,7 @@ mod tests {
         let background = checks.begin();
         assert!(checks.is_current(background));
         let manual = checks.begin();
-        assert!(
-            !checks.is_current(background),
-            "a later check makes the earlier answer stale"
-        );
+        assert!(!checks.is_current(background), "a later check makes the earlier answer stale");
         assert!(checks.is_current(manual));
     }
 
@@ -1340,10 +1309,7 @@ mod tests {
         let ticket = checks.begin();
         let before = ticket.generation();
         checks.supersede();
-        assert!(
-            !checks.is_current(ticket),
-            "a late answer from the old channel must not be stored"
-        );
+        assert!(!checks.is_current(ticket), "a late answer from the old channel must not be stored");
         assert_eq!(checks.generation(), before + 1);
         let fresh = checks.begin();
         assert!(checks.is_current(fresh));
@@ -1359,22 +1325,11 @@ mod tests {
         let mut pending = Some("found under stable");
         let ticket = checks.begin();
 
-        adopt_channel(
-            &mut selected,
-            &mut pending,
-            &checks,
-            ReleaseChannel::Prerelease,
-        );
+        adopt_channel(&mut selected, &mut pending, &checks, ReleaseChannel::Prerelease);
 
         assert_eq!(selected, ReleaseChannel::Prerelease);
-        assert!(
-            pending.is_none(),
-            "an update found under the old channel must be dropped"
-        );
-        assert!(
-            !checks.is_current(ticket),
-            "a check started under the old channel must not store"
-        );
+        assert!(pending.is_none(), "an update found under the old channel must be dropped");
+        assert!(!checks.is_current(ticket), "a check started under the old channel must not store");
     }
 
     #[test]
@@ -1394,13 +1349,9 @@ mod tests {
     #[test]
     fn an_install_of_a_different_release_than_accepted_is_refused() {
         assert!(accepted_version_refusal("0.0.2", "0.0.2").is_none());
-        let refusal =
-            accepted_version_refusal("0.0.3", "0.0.2").expect("a mismatch must be refused");
+        let refusal = accepted_version_refusal("0.0.3", "0.0.2").expect("a mismatch must be refused");
         assert!(refusal.starts_with("superseded: "), "{refusal}");
-        assert!(
-            refusal.contains("0.0.3") && refusal.contains("0.0.2"),
-            "{refusal}"
-        );
+        assert!(refusal.contains("0.0.3") && refusal.contains("0.0.2"), "{refusal}");
     }
 
     #[test]
@@ -1499,15 +1450,8 @@ mod tests {
         }
         let needle = [".download_and", "_install("].concat();
         let mut hits = Vec::new();
-        walk(
-            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-            &mut hits,
-            &needle,
-        );
-        assert!(
-            hits.is_empty(),
-            "the combined call bypasses the drain on Windows: {hits:?}"
-        );
+        walk(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut hits, &needle);
+        assert!(hits.is_empty(), "the combined call bypasses the drain on Windows: {hits:?}");
     }
 
     fn probe(os: &'static str, install: InstallKind) -> InstallProbe {

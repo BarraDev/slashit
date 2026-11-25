@@ -32,10 +32,7 @@ pub struct RunTools {
 
 impl RunTools {
     pub fn new(run: u32) -> Self {
-        Self {
-            run,
-            entries: Vec::new(),
-        }
+        Self { run, entries: Vec::new() }
     }
 
     pub fn run(&self) -> u32 {
@@ -43,13 +40,7 @@ impl RunTools {
     }
 
     /// Record one tool call, if it is one the timeline keeps.
-    pub fn push(
-        &mut self,
-        at: DateTime<Utc>,
-        tool: &str,
-        input: &serde_json::Value,
-        working_dir: &str,
-    ) {
+    pub fn push(&mut self, at: DateTime<Utc>, tool: &str, input: &serde_json::Value, working_dir: &str) {
         if let Some((name, detail)) = describe(tool, input, working_dir) {
             slashit_activity::record_tool(&mut self.entries, at, self.run, name, detail.as_deref());
         }
@@ -68,40 +59,15 @@ impl RunTools {
 /// Every detail is free text the agent chose, so every one takes the same
 /// path: reduced to the one field worth showing, with the checkout and home
 /// directory written as `.` and `~`, then [`slashit_activity::sanitize`]d.
-pub fn describe(
-    tool: &str,
-    input: &serde_json::Value,
-    working_dir: &str,
-) -> Option<(&'static str, Option<String>)> {
-    let field = |key: &str| {
-        input
-            .get(key)
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-    };
+pub fn describe(tool: &str, input: &serde_json::Value, working_dir: &str) -> Option<(&'static str, Option<String>)> {
+    let field = |key: &str| input.get(key).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
     let (name, detail) = match tool {
         "Bash" => ("Bash", field("command").map(first_line)),
-        "Read" => (
-            "Read",
-            field("file_path").map(|p| display_path(p, working_dir)),
-        ),
-        "Edit" => (
-            "Edit",
-            field("file_path").map(|p| display_path(p, working_dir)),
-        ),
-        "MultiEdit" => (
-            "Edit",
-            field("file_path").map(|p| display_path(p, working_dir)),
-        ),
-        "Write" => (
-            "Write",
-            field("file_path").map(|p| display_path(p, working_dir)),
-        ),
-        "NotebookEdit" => (
-            "Edit",
-            field("notebook_path").map(|p| display_path(p, working_dir)),
-        ),
+        "Read" => ("Read", field("file_path").map(|p| display_path(p, working_dir))),
+        "Edit" => ("Edit", field("file_path").map(|p| display_path(p, working_dir))),
+        "MultiEdit" => ("Edit", field("file_path").map(|p| display_path(p, working_dir))),
+        "Write" => ("Write", field("file_path").map(|p| display_path(p, working_dir))),
+        "NotebookEdit" => ("Edit", field("notebook_path").map(|p| display_path(p, working_dir))),
         "Glob" => ("Glob", field("pattern").map(str::to_string)),
         "Grep" => ("Grep", field("pattern").map(str::to_string)),
         "WebFetch" => ("WebFetch", field("url").map(str::to_string)),
@@ -110,22 +76,14 @@ pub fn describe(
         _ => return None,
     };
     let detail = detail.map(|d| {
-        slashit_activity::sanitize(
-            &without_private_paths(&d, working_dir),
-            slashit_activity::MAX_DETAIL_CHARS,
-        )
+        slashit_activity::sanitize(&without_private_paths(&d, working_dir), slashit_activity::MAX_DETAIL_CHARS)
     });
     Some((name, detail.filter(|d| !d.is_empty())))
 }
 
 /// The first non-blank line of a shell command.
 fn first_line(command: &str) -> String {
-    command
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or_default()
-        .to_string()
+    command.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or_default().to_string()
 }
 
 /// `text` with the task's checkout written as `.` and the home directory as
@@ -133,11 +91,7 @@ fn first_line(command: &str) -> String {
 /// does not record the layout of the user's machine.
 fn without_private_paths(text: &str, working_dir: &str) -> String {
     let root = working_dir.trim_end_matches('/');
-    let text = if root.is_empty() {
-        text.to_string()
-    } else {
-        text.replace(root, ".")
-    };
+    let text = if root.is_empty() { text.to_string() } else { text.replace(root, ".") };
     crate::domain::task::without_home_dir(&text)
 }
 
@@ -145,19 +99,13 @@ fn without_private_paths(text: &str, working_dir: &str) -> String {
 /// is inside it, otherwise only its file name.
 fn display_path(path: &str, working_dir: &str) -> String {
     let root = working_dir.trim_end_matches('/');
-    if let Some(inside) = path
-        .strip_prefix(root)
-        .and_then(|rest| rest.strip_prefix('/'))
-    {
+    if let Some(inside) = path.strip_prefix(root).and_then(|rest| rest.strip_prefix('/')) {
         return inside.to_string();
     }
     if !path.starts_with('/') && !path.starts_with('~') && !path.contains(':') {
         return path.to_string();
     }
-    path.rsplit(['/', '\\'])
-        .find(|s| !s.is_empty())
-        .unwrap_or(path)
-        .to_string()
+    path.rsplit(['/', '\\']).find(|s| !s.is_empty()).unwrap_or(path).to_string()
 }
 
 #[cfg(test)]
@@ -174,54 +122,33 @@ mod tests {
     #[test]
     fn commands_keep_their_first_line_only() {
         assert_eq!(
-            detail(
-                "Bash",
-                json!({"command": "\n  cargo test -p slashit-ui\ncat secret.txt", "timeout": 5})
-            ),
+            detail("Bash", json!({"command": "\n  cargo test -p slashit-ui\ncat secret.txt", "timeout": 5})),
             Some(("Bash", Some("cargo test -p slashit-ui".to_string())))
         );
         let long = "echo ".to_string() + &"x".repeat(500);
         let (_, d) = detail("Bash", json!({ "command": long })).unwrap();
-        assert_eq!(
-            d.unwrap().chars().count(),
-            slashit_activity::MAX_DETAIL_CHARS
-        );
+        assert_eq!(d.unwrap().chars().count(), slashit_activity::MAX_DETAIL_CHARS);
     }
 
     #[test]
     fn paths_are_relative_to_the_checkout_or_just_a_file_name() {
         assert_eq!(
-            detail(
-                "Read",
-                json!({"file_path": format!("{WD}/src-tauri/src/queue/executor.rs")})
-            ),
+            detail("Read", json!({"file_path": format!("{WD}/src-tauri/src/queue/executor.rs")})),
             Some(("Read", Some("src-tauri/src/queue/executor.rs".to_string())))
         );
         assert_eq!(
-            detail(
-                "Edit",
-                json!({"file_path": "/home/someone/.ssh/config", "old_string": "a", "new_string": "b"})
-            ),
+            detail("Edit", json!({"file_path": "/home/someone/.ssh/config", "old_string": "a", "new_string": "b"})),
             Some(("Edit", Some("config".to_string())))
         );
         assert_eq!(
-            detail(
-                "Write",
-                json!({"file_path": "src/components/task_drawer.rs", "content": "all of it"})
-            ),
+            detail("Write", json!({"file_path": "src/components/task_drawer.rs", "content": "all of it"})),
             Some(("Write", Some("src/components/task_drawer.rs".to_string())))
         );
     }
 
     #[test]
     fn bookkeeping_tools_are_not_kept() {
-        for tool in [
-            "TodoWrite",
-            "ToolSearch",
-            "ListMcpResourcesTool",
-            "mcp__github__create_issue",
-            "Skill",
-        ] {
+        for tool in ["TodoWrite", "ToolSearch", "ListMcpResourcesTool", "mcp__github__create_issue", "Skill"] {
             assert_eq!(detail(tool, json!({"anything": "x"})), None, "{tool}");
         }
     }
@@ -229,42 +156,24 @@ mod tests {
     #[test]
     fn a_tool_without_the_expected_field_is_kept_without_detail() {
         assert_eq!(detail("Bash", json!({})), Some(("Bash", None)));
-        assert_eq!(
-            detail("Grep", json!({"pattern": "   "})),
-            Some(("Grep", None))
-        );
+        assert_eq!(detail("Grep", json!({"pattern": "   "})), Some(("Grep", None)));
     }
 
     #[test]
     fn credentials_in_commands_are_masked() {
         let cases = [
-            (
-                "GITHUB_TOKEN=ghp_abcdefghijklmnop gh pr list",
-                "GITHUB_TOKEN=*** gh pr list",
-            ),
+            ("GITHUB_TOKEN=ghp_abcdefghijklmnop gh pr list", "GITHUB_TOKEN=*** gh pr list"),
             ("export API_KEY=hunter2", "export API_KEY=***"),
             (
                 "curl -H \"Authorization: Bearer abc.def\" https://api.example.com",
                 "curl -H \"Authorization: *** ***\" https://api.example.com",
             ),
-            (
-                "mysql --password hunter2 -u root",
-                "mysql --password *** -u root",
-            ),
-            (
-                "git clone https://user:pw@github.com/o/r.git",
-                "git clone https://***@github.com/o/r.git",
-            ),
+            ("mysql --password hunter2 -u root", "mysql --password *** -u root"),
+            ("git clone https://user:pw@github.com/o/r.git", "git clone https://***@github.com/o/r.git"),
             ("echo sk-0123456789abcdef", "echo ***"),
             ("curl -u admin:hunter2 https://x", "curl -u *** https://x"),
-            (
-                "curl -H X-Api-Key:abc123 https://x",
-                "curl -H X-Api-Key:*** https://x",
-            ),
-            (
-                "gh api -H 'Authorization: token abc' /user",
-                "gh api -H 'Authorization: *** ***' /user",
-            ),
+            ("curl -H X-Api-Key:abc123 https://x", "curl -H X-Api-Key:*** https://x"),
+            ("gh api -H 'Authorization: token abc' /user", "gh api -H 'Authorization: *** ***' /user"),
             ("cargo test -p slashit-ui", "cargo test -p slashit-ui"),
         ];
         for (input, expected) in cases {
@@ -276,42 +185,15 @@ mod tests {
     #[test]
     fn authorization_headers_are_masked_however_they_are_written() {
         let cases = [
-            (
-                "curl -H \"Authorization:Bearer abc\" https://x",
-                "curl -H \"Authorization:*** ***\" https://x",
-            ),
-            (
-                "curl -H 'Authorization:Basic dXNlcjpw' https://x",
-                "curl -H 'Authorization:*** ***' https://x",
-            ),
-            (
-                "curl -H \"Authorization:token abc def\" https://x",
-                "curl -H \"Authorization:*** *** ***\" https://x",
-            ),
-            (
-                "curl -H Authorization:Bearer abc https://x",
-                "curl -H Authorization:*** *** https://x",
-            ),
-            (
-                "curl -H Authorization:token abc https://x",
-                "curl -H Authorization:*** *** https://x",
-            ),
-            (
-                "curl -H Authorization: Bearer abc https://x",
-                "curl -H Authorization: *** *** https://x",
-            ),
-            (
-                "curl -H Authorization: Basic abc https://x",
-                "curl -H Authorization: *** *** https://x",
-            ),
-            (
-                "curl -H Authorization: token abc https://x",
-                "curl -H Authorization: *** *** https://x",
-            ),
-            (
-                "curl -H \"Authorization: Basic abc\" https://x",
-                "curl -H \"Authorization: *** ***\" https://x",
-            ),
+            ("curl -H \"Authorization:Bearer abc\" https://x", "curl -H \"Authorization:*** ***\" https://x"),
+            ("curl -H 'Authorization:Basic dXNlcjpw' https://x", "curl -H 'Authorization:*** ***' https://x"),
+            ("curl -H \"Authorization:token abc def\" https://x", "curl -H \"Authorization:*** *** ***\" https://x"),
+            ("curl -H Authorization:Bearer abc https://x", "curl -H Authorization:*** *** https://x"),
+            ("curl -H Authorization:token abc https://x", "curl -H Authorization:*** *** https://x"),
+            ("curl -H Authorization: Bearer abc https://x", "curl -H Authorization: *** *** https://x"),
+            ("curl -H Authorization: Basic abc https://x", "curl -H Authorization: *** *** https://x"),
+            ("curl -H Authorization: token abc https://x", "curl -H Authorization: *** *** https://x"),
+            ("curl -H \"Authorization: Basic abc\" https://x", "curl -H \"Authorization: *** ***\" https://x"),
         ];
         for (input, expected) in cases {
             let (_, d) = detail("Bash", json!({ "command": input })).unwrap();
@@ -324,24 +206,12 @@ mod tests {
     fn every_free_text_detail_is_sanitized() {
         let token = "ghp_0123456789abcdefghij";
         for (tool, input) in [
-            (
-                "WebSearch",
-                json!({ "query": format!("why does {token} fail") }),
-            ),
-            (
-                "Grep",
-                json!({ "pattern": format!("GITHUB_TOKEN={token}") }),
-            ),
+            ("WebSearch", json!({ "query": format!("why does {token} fail") })),
+            ("Grep", json!({ "pattern": format!("GITHUB_TOKEN={token}") })),
             ("Grep", json!({ "pattern": token })),
             ("Glob", json!({ "pattern": format!("**/{token}/*.rs") })),
-            (
-                "Task",
-                json!({ "description": format!("check the key {token}") }),
-            ),
-            (
-                "Agent",
-                json!({ "description": format!("use Bearer {token}") }),
-            ),
+            ("Task", json!({ "description": format!("check the key {token}") })),
+            ("Agent", json!({ "description": format!("use Bearer {token}") })),
             ("Read", json!({ "file_path": format!("{WD}/{token}.txt") })),
         ] {
             let (_, d) = detail(tool, input.clone()).unwrap();
@@ -355,58 +225,25 @@ mod tests {
     fn signed_urls_keep_neither_query_nor_fragment() {
         let url = "https://bucket.s3.amazonaws.com/o?X-Amz-Signature=abc123&X-Amz-Credential=AKIA0123456789ABCDEF#k";
         assert_eq!(
-            detail(
-                "Bash",
-                json!({ "command": format!("curl -o out \"{url}\"") })
-            ),
-            Some((
-                "Bash",
-                Some("curl -o out \"https://bucket.s3.amazonaws.com/o\"".to_string())
-            ))
+            detail("Bash", json!({ "command": format!("curl -o out \"{url}\"") })),
+            Some(("Bash", Some("curl -o out \"https://bucket.s3.amazonaws.com/o\"".to_string())))
         );
         assert_eq!(
             detail("WebSearch", json!({ "query": format!("{url} expired") })),
-            Some((
-                "WebSearch",
-                Some("https://bucket.s3.amazonaws.com/o expired".to_string())
-            ))
+            Some(("WebSearch", Some("https://bucket.s3.amazonaws.com/o expired".to_string())))
         );
     }
 
     #[test]
     fn ordinary_text_stays_useful() {
         for (tool, input, expected) in [
-            (
-                "WebSearch",
-                json!({"query": "rust token parser basic usage"}),
-                "rust token parser basic usage",
-            ),
-            (
-                "Task",
-                json!({"description": "Explore the auth module"}),
-                "Explore the auth module",
-            ),
-            (
-                "Grep",
-                json!({"pattern": "fn record_tool"}),
-                "fn record_tool",
-            ),
-            (
-                "Bash",
-                json!({"command": "git log --author=rui -5"}),
-                "git log --author=rui -5",
-            ),
-            (
-                "WebFetch",
-                json!({"url": "https://docs.rs/chrono/latest/chrono/"}),
-                "https://docs.rs/chrono/latest/chrono/",
-            ),
+            ("WebSearch", json!({"query": "rust token parser basic usage"}), "rust token parser basic usage"),
+            ("Task", json!({"description": "Explore the auth module"}), "Explore the auth module"),
+            ("Grep", json!({"pattern": "fn record_tool"}), "fn record_tool"),
+            ("Bash", json!({"command": "git log --author=rui -5"}), "git log --author=rui -5"),
+            ("WebFetch", json!({"url": "https://docs.rs/chrono/latest/chrono/"}), "https://docs.rs/chrono/latest/chrono/"),
         ] {
-            assert_eq!(
-                detail(tool, input),
-                Some((describe_name(tool), Some(expected.to_string()))),
-                "{tool}"
-            );
+            assert_eq!(detail(tool, input), Some((describe_name(tool), Some(expected.to_string()))), "{tool}");
         }
     }
 
@@ -424,20 +261,14 @@ mod tests {
     #[test]
     fn commands_and_patterns_do_not_record_where_the_checkout_lives() {
         assert_eq!(
-            detail(
-                "Bash",
-                json!({"command": format!("cd {WD}/src && cargo build")})
-            ),
+            detail("Bash", json!({"command": format!("cd {WD}/src && cargo build")})),
             Some(("Bash", Some("cd ./src && cargo build".to_string())))
         );
         assert_eq!(
             detail("Glob", json!({"pattern": format!("{WD}/**/*.rs")})),
             Some(("Glob", Some("./**/*.rs".to_string())))
         );
-        if let Some(home) = dirs::home_dir()
-            .and_then(|h| h.into_os_string().into_string().ok())
-            .filter(|h| h.len() > 1)
-        {
+        if let Some(home) = dirs::home_dir().and_then(|h| h.into_os_string().into_string().ok()).filter(|h| h.len() > 1) {
             assert_eq!(
                 detail("Grep", json!({"pattern": format!("{home}/notes")})),
                 Some(("Grep", Some("~/notes".to_string())))
@@ -448,10 +279,7 @@ mod tests {
     #[test]
     fn fetched_urls_lose_their_query_and_credentials() {
         assert_eq!(
-            detail(
-                "WebFetch",
-                json!({"url": "https://u:p@example.com/docs?token=abc#x", "prompt": "summarize"})
-            ),
+            detail("WebFetch", json!({"url": "https://u:p@example.com/docs?token=abc#x", "prompt": "summarize"})),
             Some(("WebFetch", Some("https://***@example.com/docs".to_string())))
         );
     }
@@ -463,35 +291,17 @@ mod tests {
         tools.push(now, "Bash", &json!({"command": "cargo test"}), WD);
         tools.push(now, "Bash", &json!({"command": "cargo test"}), WD);
         tools.push(now, "TodoWrite", &json!({"todos": []}), WD);
-        tools.push(
-            now,
-            "Read",
-            &json!({"file_path": format!("{WD}/Cargo.toml")}),
-            WD,
-        );
+        tools.push(now, "Read", &json!({"file_path": format!("{WD}/Cargo.toml")}), WD);
 
         let mut task = crate::test_helpers::create_test_task("t");
-        task.record_activity(slashit_activity::Kind::RunStarted {
-            run: 3,
-            addressing_feedback: false,
-        });
+        task.record_activity(slashit_activity::Kind::RunStarted { run: 3, addressing_feedback: false });
         tools.apply_to(&mut task);
         let kinds: Vec<_> = task.activity.iter().map(|e| e.kind.clone()).collect();
         assert_eq!(
             kinds[1..],
             [
-                slashit_activity::Kind::ToolUsed {
-                    run: 3,
-                    tool: "Bash".into(),
-                    detail: Some("cargo test".into()),
-                    count: 2
-                },
-                slashit_activity::Kind::ToolUsed {
-                    run: 3,
-                    tool: "Read".into(),
-                    detail: Some("Cargo.toml".into()),
-                    count: 1
-                },
+                slashit_activity::Kind::ToolUsed { run: 3, tool: "Bash".into(), detail: Some("cargo test".into()), count: 2 },
+                slashit_activity::Kind::ToolUsed { run: 3, tool: "Read".into(), detail: Some("Cargo.toml".into()), count: 1 },
             ]
         );
         assert!(task.activity.windows(2).all(|w| w[0].seq < w[1].seq));

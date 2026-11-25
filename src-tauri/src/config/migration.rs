@@ -273,16 +273,15 @@ impl StateMigrator {
             .entries
             .iter()
             .filter_map(|(rel, source_is_dir)| {
-                dest.entries
-                    .iter()
-                    .find(|(d, _)| d == rel)
-                    .and_then(|(_, dest_is_dir)| {
+                dest.entries.iter().find(|(d, _)| d == rel).and_then(
+                    |(_, dest_is_dir)| {
                         if *source_is_dir && *dest_is_dir {
                             None
                         } else {
                             Some(rel.clone())
                         }
-                    })
+                    },
+                )
             })
             .take(50)
             .collect();
@@ -334,9 +333,7 @@ impl StateMigrator {
         // at; recovering it here — under the lock, before `plan` — means a
         // retry can never silently start a fresh migration that ignores it.
         for outcome in Self::recover(to) {
-            warnings.push(format!(
-                "resolved an interrupted previous migration: {outcome:?}"
-            ));
+            warnings.push(format!("resolved an interrupted previous migration: {outcome:?}"));
         }
 
         // Authoritative: computed under the lock and after recovery, so a
@@ -394,9 +391,8 @@ impl StateMigrator {
                 io::Error::from(io::ErrorKind::InvalidInput),
             )
         })?;
-        let parent_entries = slashit_durable_fs::create_dir_all_durable(parent).map_err(|e| {
-            MigrationError::io(format!("creating {}", parent.display()), e.into_io())
-        })?;
+        let parent_entries = slashit_durable_fs::create_dir_all_durable(parent)
+            .map_err(|e| MigrationError::io(format!("creating {}", parent.display()), e.into_io()))?;
 
         // Scoped to this exact destination and this exact call, so a second
         // migration running concurrently for a sibling destination under the
@@ -696,8 +692,7 @@ fn next_transaction_id() -> String {
 }
 
 fn ensure_state_dir(dir: &Path) -> Result<()> {
-    fs::create_dir_all(dir)
-        .map_err(|e| MigrationError::io(format!("creating {}", dir.display()), e))
+    fs::create_dir_all(dir).map_err(|e| MigrationError::io(format!("creating {}", dir.display()), e))
 }
 
 fn write_marker(dir: &Path, warnings: &mut Vec<String>) {
@@ -759,13 +754,8 @@ fn archive(dir: &Path, warnings: &mut Vec<String>) -> Result<Option<PathBuf>> {
 /// only other copy.
 fn destination_is_durable(to: &Path) -> bool {
     let parent = to.parent().unwrap_or(Path::new("."));
-    matches!(
-        slashit_durable_fs::sync_tree(to),
-        Ok(slashit_durable_fs::DirectorySync::Synced)
-    ) && matches!(
-        slashit_durable_fs::sync_directory(parent),
-        Ok(slashit_durable_fs::DirectorySync::Synced)
-    )
+    matches!(slashit_durable_fs::sync_tree(to), Ok(slashit_durable_fs::DirectorySync::Synced))
+        && matches!(slashit_durable_fs::sync_directory(parent), Ok(slashit_durable_fs::DirectorySync::Synced))
 }
 
 /// Decide and act on the fate of one transaction's leftovers, per
@@ -928,8 +918,9 @@ fn copy_entry(from: &Path, to: &Path, meta: &fs::Metadata) -> Result<()> {
         {
             let target = fs::read_link(from)
                 .map_err(|e| MigrationError::io(format!("readlink {}", from.display()), e))?;
-            std::os::unix::fs::symlink(target, to)
-                .map_err(|e| MigrationError::io(format!("symlinking {}", to.display()), e))?;
+            std::os::unix::fs::symlink(target, to).map_err(|e| {
+                MigrationError::io(format!("symlinking {}", to.display()), e)
+            })?;
         }
         #[cfg(not(unix))]
         {
@@ -1057,10 +1048,7 @@ mod tests {
             MigrationOutcome::Migrated { files: 3, .. }
         ));
         assert!(!from.exists(), "source must be gone after success");
-        assert_eq!(
-            fs::read_to_string(to.join("tasks/a.toml")).unwrap(),
-            "id = 1\n"
-        );
+        assert_eq!(fs::read_to_string(to.join("tasks/a.toml")).unwrap(), "id = 1\n");
         assert!(to.join(STATE_MARKER).is_file(), "marker identifies our dir");
     }
 
@@ -1070,18 +1058,9 @@ mod tests {
 
     /// The migrated state, complete and byte-identical, at `to`.
     fn assert_seeded_at(to: &Path) {
-        assert_eq!(
-            fs::read_to_string(to.join("tasks/a.toml")).unwrap(),
-            "id = 1\n"
-        );
-        assert_eq!(
-            fs::read_to_string(to.join("tasks/b.toml")).unwrap(),
-            "id = 2\n"
-        );
-        assert_eq!(
-            fs::read_to_string(to.join("roadmap.toml")).unwrap(),
-            "features = []\n"
-        );
+        assert_eq!(fs::read_to_string(to.join("tasks/a.toml")).unwrap(), "id = 1\n");
+        assert_eq!(fs::read_to_string(to.join("tasks/b.toml")).unwrap(), "id = 2\n");
+        assert_eq!(fs::read_to_string(to.join("roadmap.toml")).unwrap(), "features = []\n");
     }
 
     fn leftovers(parent: &Path) -> Vec<String> {
@@ -1105,28 +1084,11 @@ mod tests {
         let stages = trace.stages();
 
         // 3 seeded files plus the marker; the root and `tasks/` are the directories.
-        assert_eq!(
-            stages.iter().filter(|s| **s == Stage::SyncTreeFile).count(),
-            4,
-            "{stages:?}"
-        );
-        assert_eq!(
-            stages
-                .iter()
-                .filter(|s| **s == Stage::SyncTreeDirectory)
-                .count(),
-            2,
-            "{stages:?}"
-        );
+        assert_eq!(stages.iter().filter(|s| **s == Stage::SyncTreeFile).count(), 4, "{stages:?}");
+        assert_eq!(stages.iter().filter(|s| **s == Stage::SyncTreeDirectory).count(), 2, "{stages:?}");
         // Contents first, the parent's entries (the renames) after.
-        let last_tree = stages
-            .iter()
-            .rposition(|s| matches!(s, Stage::SyncTreeFile | Stage::SyncTreeDirectory))
-            .unwrap();
-        let parent_sync = stages
-            .iter()
-            .rposition(|s| *s == Stage::SyncDirectory)
-            .expect("the swap is synchronized");
+        let last_tree = stages.iter().rposition(|s| matches!(s, Stage::SyncTreeFile | Stage::SyncTreeDirectory)).unwrap();
+        let parent_sync = stages.iter().rposition(|s| *s == Stage::SyncDirectory).expect("the swap is synchronized");
         assert!(last_tree < parent_sync, "{stages:?}");
         assert!(!from.exists());
     }
@@ -1145,18 +1107,9 @@ mod tests {
 
             assert!(error.to_string().contains("durable"), "{stage:?}: {error}");
             assert_seeded_at(&from);
-            assert_eq!(
-                fs::read_to_string(to.join("destination_only.toml")).unwrap(),
-                "keep\n"
-            );
-            assert!(
-                !to.join("tasks").exists(),
-                "nothing was installed at the destination"
-            );
-            assert!(
-                leftovers(to.parent().unwrap()).is_empty(),
-                "staging is removed: {stage:?}"
-            );
+            assert_eq!(fs::read_to_string(to.join("destination_only.toml")).unwrap(), "keep\n");
+            assert!(!to.join("tasks").exists(), "nothing was installed at the destination");
+            assert!(leftovers(to.parent().unwrap()).is_empty(), "staging is removed: {stage:?}");
         }
     }
 
@@ -1171,24 +1124,11 @@ mod tests {
         let _fault = fault::fail_at(Stage::SyncDirectory, io::ErrorKind::Other);
         let report = StateMigrator::migrate(&from, &to, ConflictPolicy::Abort).unwrap();
 
-        assert!(matches!(
-            report.outcome,
-            MigrationOutcome::Migrated { files: 3, .. }
-        ));
-        assert!(
-            report
-                .warnings
-                .iter()
-                .any(|w| w.contains("could not confirm") && w.contains("was kept")),
-            "{:?}",
-            report.warnings
-        );
+        assert!(matches!(report.outcome, MigrationOutcome::Migrated { files: 3, .. }));
+        assert!(report.warnings.iter().any(|w| w.contains("could not confirm") && w.contains("was kept")), "{:?}", report.warnings);
         assert_seeded_at(&from);
         assert_seeded_at(&to);
-        assert_eq!(
-            fs::read_to_string(to.join("destination_only.toml")).unwrap(),
-            "keep\n"
-        );
+        assert_eq!(fs::read_to_string(to.join("destination_only.toml")).unwrap(), "keep\n");
         let kept = leftovers(to.parent().unwrap());
         assert_eq!(kept.len(), 1, "the retired destination is kept: {kept:?}");
         assert!(kept[0].contains("-old-"), "{kept:?}");
@@ -1204,15 +1144,8 @@ mod tests {
         let _fault = fault::fail_every(Stage::SyncTreeDirectory, io::ErrorKind::Unsupported);
         let report = StateMigrator::migrate(&from, &to, ConflictPolicy::Abort).unwrap();
 
-        assert!(matches!(
-            report.outcome,
-            MigrationOutcome::Migrated { files: 3, .. }
-        ));
-        assert!(
-            report.warnings.iter().any(|w| w.contains("was kept")),
-            "{:?}",
-            report.warnings
-        );
+        assert!(matches!(report.outcome, MigrationOutcome::Migrated { files: 3, .. }));
+        assert!(report.warnings.iter().any(|w| w.contains("was kept")), "{:?}", report.warnings);
         assert_seeded_at(&from);
         assert_seeded_at(&to);
     }
@@ -1229,15 +1162,8 @@ mod tests {
         let _fault = fault::fail_at(Stage::SyncCreatedDirectory, io::ErrorKind::Unsupported);
         let report = StateMigrator::migrate(&from, &to, ConflictPolicy::Abort).unwrap();
 
-        assert!(matches!(
-            report.outcome,
-            MigrationOutcome::Migrated { files: 3, .. }
-        ));
-        assert!(
-            report.warnings.iter().any(|w| w.contains("was kept")),
-            "{:?}",
-            report.warnings
-        );
+        assert!(matches!(report.outcome, MigrationOutcome::Migrated { files: 3, .. }));
+        assert!(report.warnings.iter().any(|w| w.contains("was kept")), "{:?}", report.warnings);
         assert_seeded_at(&from);
         assert_seeded_at(&to);
     }
@@ -1251,18 +1177,12 @@ mod tests {
         write(&retired.join("roadmap.toml"), "previous\n");
 
         let unproven = fault::fail_every(Stage::SyncTreeDirectory, io::ErrorKind::Unsupported);
-        assert_eq!(
-            StateMigrator::recover(&to),
-            vec![RecoveryOutcome::LeftForManualReview]
-        );
+        assert_eq!(StateMigrator::recover(&to), vec![RecoveryOutcome::LeftForManualReview]);
         assert!(retired.exists(), "the only other copy stays");
         drop(unproven);
 
         // Once the destination can be confirmed, the stale copy goes as before.
-        assert_eq!(
-            StateMigrator::recover(&to),
-            vec![RecoveryOutcome::RemovedStaleRetired]
-        );
+        assert_eq!(StateMigrator::recover(&to), vec![RecoveryOutcome::RemovedStaleRetired]);
         assert!(!retired.exists());
     }
 
@@ -1276,15 +1196,9 @@ mod tests {
         write(&retired.join("roadmap.toml"), "previous\n");
 
         let _fault = fault::fail_every(Stage::SyncTreeDirectory, io::ErrorKind::Unsupported);
-        assert_eq!(
-            StateMigrator::recover(&to),
-            vec![RecoveryOutcome::LeftForManualReview]
-        );
+        assert_eq!(StateMigrator::recover(&to), vec![RecoveryOutcome::LeftForManualReview]);
         assert!(retired.exists());
-        assert_eq!(
-            fs::read_to_string(to.join("roadmap.toml")).unwrap(),
-            "new\n"
-        );
+        assert_eq!(fs::read_to_string(to.join("roadmap.toml")).unwrap(), "new\n");
     }
 
     #[test]
@@ -1340,14 +1254,8 @@ mod tests {
         assert!(matches!(err, MigrationError::Conflict(_)));
 
         // Both sides survive, byte for byte.
-        assert_eq!(
-            fs::read_to_string(from.join("tasks/a.toml")).unwrap(),
-            "id = 1\n"
-        );
-        assert_eq!(
-            fs::read_to_string(to.join("tasks/a.toml")).unwrap(),
-            "id = 999\n"
-        );
+        assert_eq!(fs::read_to_string(from.join("tasks/a.toml")).unwrap(), "id = 1\n");
+        assert_eq!(fs::read_to_string(to.join("tasks/a.toml")).unwrap(), "id = 999\n");
     }
 
     #[test]
@@ -1358,7 +1266,8 @@ mod tests {
         seed(&from);
         write(&to.join("tasks/a.toml"), "id = 999\n");
 
-        let report = StateMigrator::migrate(&from, &to, ConflictPolicy::PreferDestination).unwrap();
+        let report =
+            StateMigrator::migrate(&from, &to, ConflictPolicy::PreferDestination).unwrap();
         match report.outcome {
             MigrationOutcome::KeptDestination { archived_source } => {
                 let archived = archived_source.expect("source archived, never deleted");
@@ -1366,10 +1275,7 @@ mod tests {
             }
             other => panic!("unexpected outcome: {other:?}"),
         }
-        assert_eq!(
-            fs::read_to_string(to.join("tasks/a.toml")).unwrap(),
-            "id = 999\n"
-        );
+        assert_eq!(fs::read_to_string(to.join("tasks/a.toml")).unwrap(), "id = 999\n");
         assert!(!from.exists(), "source was moved aside");
     }
 
@@ -1383,14 +1289,9 @@ mod tests {
 
         StateMigrator::migrate(&from, &to, ConflictPolicy::PreferSource).unwrap();
 
-        assert_eq!(
-            fs::read_to_string(to.join("tasks/a.toml")).unwrap(),
-            "id = 1\n"
-        );
+        assert_eq!(fs::read_to_string(to.join("tasks/a.toml")).unwrap(), "id = 1\n");
         assert!(
-            to.with_file_name("to.superseded")
-                .join("tasks/a.toml")
-                .is_file(),
+            to.with_file_name("to.superseded").join("tasks/a.toml").is_file(),
             "old destination is recoverable"
         );
     }
@@ -1405,10 +1306,7 @@ mod tests {
 
         let report = StateMigrator::migrate(&from, &to, ConflictPolicy::Abort).unwrap();
         assert!(matches!(report.outcome, MigrationOutcome::Migrated { .. }));
-        assert_eq!(
-            fs::read_to_string(to.join("notes.md")).unwrap(),
-            "keep me\n"
-        );
+        assert_eq!(fs::read_to_string(to.join("notes.md")).unwrap(), "keep me\n");
         assert!(to.join("tasks/a.toml").is_file());
     }
 
@@ -1469,10 +1367,7 @@ mod tests {
         let outcomes = StateMigrator::recover(&to);
         assert_eq!(outcomes, vec![RecoveryOutcome::RemovedIncompleteScratch]);
         assert!(!junk.exists());
-        assert!(
-            keep.exists(),
-            "recovery must not touch unrelated directories"
-        );
+        assert!(keep.exists(), "recovery must not touch unrelated directories");
     }
 
     #[test]
@@ -1495,10 +1390,7 @@ mod tests {
         assert!(!staging.exists());
 
         let r = StateMigrator::migrate(&from, &to, ConflictPolicy::Abort).unwrap();
-        assert!(matches!(
-            r.outcome,
-            MigrationOutcome::Migrated { files: 3, .. }
-        ));
+        assert!(matches!(r.outcome, MigrationOutcome::Migrated { files: 3, .. }));
     }
 
     #[test]
@@ -1543,10 +1435,7 @@ mod tests {
 
         fs::create_dir_all(to.parent().unwrap()).unwrap();
         let scratch = scratch_dir_for(&to, "9001");
-        write(
-            &scratch.join("recovered.toml"),
-            "from the interrupted swap\n",
-        );
+        write(&scratch.join("recovered.toml"), "from the interrupted swap\n");
         let retired = retired_dir_for(&to, "9001");
         fs::create_dir_all(&retired).unwrap();
 
@@ -1564,10 +1453,7 @@ mod tests {
             to.join("tasks/a.toml").is_file(),
             "the retried migration's own data must still land on top of the recovered state"
         );
-        assert!(
-            !from.exists(),
-            "source removed only after everything landed"
-        );
+        assert!(!from.exists(), "source removed only after everything landed");
         assert!(!scratch.exists());
         assert!(!retired.exists());
         assert!(
@@ -1596,14 +1482,8 @@ mod tests {
         let report_a = StateMigrator::migrate(&from_a, &to_a, ConflictPolicy::Abort).unwrap();
         let report_b = StateMigrator::migrate(&from_b, &to_b, ConflictPolicy::Abort).unwrap();
 
-        assert!(matches!(
-            report_a.outcome,
-            MigrationOutcome::Migrated { .. }
-        ));
-        assert!(matches!(
-            report_b.outcome,
-            MigrationOutcome::Migrated { .. }
-        ));
+        assert!(matches!(report_a.outcome, MigrationOutcome::Migrated { .. }));
+        assert!(matches!(report_b.outcome, MigrationOutcome::Migrated { .. }));
         assert!(to_a.join("tasks/a.toml").is_file());
         assert!(to_b.join("tasks/a.toml").is_file());
         assert_ne!(
@@ -1618,10 +1498,7 @@ mod tests {
             .flatten()
             .filter(|e| e.file_name().to_string_lossy().starts_with(STAGING_PREFIX))
             .collect();
-        assert!(
-            leftovers.is_empty(),
-            "no scratch or retired dirs should survive success"
-        );
+        assert!(leftovers.is_empty(), "no scratch or retired dirs should survive success");
     }
 
     #[test]
@@ -1642,10 +1519,7 @@ mod tests {
         write(&b_scratch.join("roadmap.toml"), "b candidate\n");
         let b_retired = retired_dir_for(&to_b, "42");
         fs::create_dir_all(&b_retired).unwrap();
-        assert!(
-            !to_b.exists(),
-            "b's destination is missing, as after a crash"
-        );
+        assert!(!to_b.exists(), "b's destination is missing, as after a crash");
 
         let outcomes = StateMigrator::recover(&to_a);
 
@@ -1653,18 +1527,9 @@ mod tests {
             outcomes.is_empty(),
             "recovering a's destination must find nothing of its own to resolve"
         );
-        assert!(
-            b_scratch.exists(),
-            "b's stranded scratch must survive untouched"
-        );
-        assert!(
-            b_retired.exists(),
-            "b's stranded retired copy must survive untouched"
-        );
-        assert!(
-            !to_b.exists(),
-            "b's destination must not be silently installed by a's recovery"
-        );
+        assert!(b_scratch.exists(), "b's stranded scratch must survive untouched");
+        assert!(b_retired.exists(), "b's stranded retired copy must survive untouched");
+        assert!(!to_b.exists(), "b's destination must not be silently installed by a's recovery");
         assert_eq!(
             fs::read_to_string(to_a.join("roadmap.toml")).unwrap(),
             "a is already installed\n",
@@ -1716,14 +1581,8 @@ mod tests {
             StateMigrator::recover(&to_old_x).is_empty(),
             "old-x must not mistake x's retired copy for a scratch candidate of its own"
         );
-        assert!(
-            x_retired.exists(),
-            "x's retired copy must survive old-x's recovery untouched"
-        );
-        assert!(
-            !to_old_x.exists(),
-            "old-x must not be silently installed by this"
-        );
+        assert!(x_retired.exists(), "x's retired copy must survive old-x's recovery untouched");
+        assert!(!to_old_x.exists(), "old-x must not be silently installed by this");
 
         // Recovering "x" still works normally: its own retired copy is
         // restored as the destination.
@@ -1862,15 +1721,9 @@ mod tests {
         // Restore before asserting so the tempdir can always be cleaned up.
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
 
-        assert!(
-            result.is_err(),
-            "must not report success it did not achieve"
-        );
+        assert!(result.is_err(), "must not report success it did not achieve");
         assert!(from.join("tasks/a.toml").is_file(), "source intact");
-        assert!(
-            !to.join("tasks/a.toml").exists(),
-            "no partial state installed"
-        );
+        assert!(!to.join("tasks/a.toml").exists(), "no partial state installed");
     }
 
     #[cfg(unix)]
@@ -1911,10 +1764,7 @@ mod tests {
         assert!(plan.source_bytes > 0);
         // Nothing changed on disk.
         assert!(from.join("tasks/b.toml").is_file());
-        assert_eq!(
-            fs::read_to_string(to.join("tasks/a.toml")).unwrap(),
-            "conflict\n"
-        );
+        assert_eq!(fs::read_to_string(to.join("tasks/a.toml")).unwrap(), "conflict\n");
     }
 
     #[test]
@@ -1981,14 +1831,8 @@ mod tests {
             matches!(err, MigrationError::Conflict(_)),
             "a stale preview must never let a new conflict through as source-wins"
         );
-        assert_eq!(
-            fs::read_to_string(from.join("tasks/a.toml")).unwrap(),
-            "id = 1\n"
-        );
-        assert_eq!(
-            fs::read_to_string(to.join("tasks/a.toml")).unwrap(),
-            "raced in\n"
-        );
+        assert_eq!(fs::read_to_string(from.join("tasks/a.toml")).unwrap(), "id = 1\n");
+        assert_eq!(fs::read_to_string(to.join("tasks/a.toml")).unwrap(), "raced in\n");
     }
 
     #[test]
@@ -2027,14 +1871,8 @@ mod tests {
             .flatten()
             .filter(|e| e.file_name().to_string_lossy().starts_with(STAGING_PREFIX))
             .collect();
-        assert!(
-            leftovers.is_empty(),
-            "no scratch or retired dirs should survive success"
-        );
-        assert_eq!(
-            fs::read_to_string(to.join("notes.md")).unwrap(),
-            "keep me\n"
-        );
+        assert!(leftovers.is_empty(), "no scratch or retired dirs should survive success");
+        assert_eq!(fs::read_to_string(to.join("notes.md")).unwrap(), "keep me\n");
         assert!(to.join("tasks/a.toml").is_file());
     }
 
@@ -2074,9 +1912,6 @@ mod tests {
             .flatten()
             .filter(|e| e.file_name().to_string_lossy().starts_with(STAGING_PREFIX))
             .collect();
-        assert!(
-            leftovers.is_empty(),
-            "staging must be cleaned up after failure"
-        );
+        assert!(leftovers.is_empty(), "staging must be cleaned up after failure");
     }
 }

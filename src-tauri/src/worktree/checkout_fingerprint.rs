@@ -98,15 +98,10 @@ impl fmt::Display for FingerprintError {
             ),
             Self::Unmerged(path) => write!(f, "{path} has unresolved conflicts."),
             Self::NonUtf8Path => write!(f, "A changed path is not valid UTF-8."),
-            Self::Unsupported { path, reason } => {
-                write!(f, "{path} cannot be inspected: {reason}.")
-            }
+            Self::Unsupported { path, reason } => write!(f, "{path} cannot be inspected: {reason}."),
             Self::Unreadable { path, reason } => write!(f, "{path} could not be read: {reason}."),
             Self::TooLarge { path, limit } => {
-                write!(
-                    f,
-                    "{path} is larger than the {limit}-byte inspection limit."
-                )
+                write!(f, "{path} is larger than the {limit}-byte inspection limit.")
             }
             Self::TooMuchData { limit } => write!(
                 f,
@@ -179,11 +174,7 @@ pub async fn fingerprint_with(
     for marker in IN_PROGRESS_MARKERS {
         let out = git(&dir, &["rev-parse", "--git-path", marker]).await?;
         let raw = PathBuf::from(String::from_utf8_lossy(&out).trim_end().to_string());
-        let full = if raw.is_absolute() {
-            raw
-        } else {
-            checkout.join(raw)
-        };
+        let full = if raw.is_absolute() { raw } else { checkout.join(raw) };
         if full.exists() {
             return Err(FingerprintError::InProgress(marker.to_string()));
         }
@@ -237,9 +228,7 @@ async fn git(dir: &str, args: &[&str]) -> Result<Vec<u8>, FingerprintError> {
         .await
         .map_err(|e| FingerprintError::Git(format!("failed to run git: {e}")))?;
     if !ran.output.status.success() {
-        let stderr = String::from_utf8_lossy(&ran.output.stderr)
-            .trim()
-            .to_string();
+        let stderr = String::from_utf8_lossy(&ran.output.stderr).trim().to_string();
         return Err(FingerprintError::Git(stderr));
     }
     Ok(ran.output.stdout)
@@ -271,9 +260,9 @@ fn parse_status(out: &[u8]) -> Result<BTreeMap<Vec<u8>, [u8; 2]>, FingerprintErr
         }
         entries.insert(path, xy);
         if matches!(xy[0], b'R' | b'C') || matches!(xy[1], b'R' | b'C') {
-            let source = fields
-                .next()
-                .ok_or_else(|| FingerprintError::Git("a rename had no source path".into()))?;
+            let source = fields.next().ok_or_else(|| {
+                FingerprintError::Git("a rename had no source path".into())
+            })?;
             // The source may also be listed with its own status. Keep that
             // entry rather than replacing it with the rename's status.
             entries.entry(source.to_vec()).or_insert(xy);
@@ -523,10 +512,7 @@ mod tests {
         fs::remove_dir_all(repo.path.join("vendor")).expect("remove dir");
         std::os::unix::fs::symlink(&outside, repo.path.join("vendor")).expect("symlink");
         let err = fingerprint(&repo.path).await.expect_err("refused");
-        assert!(
-            matches!(err, FingerprintError::Unsupported { .. }),
-            "{err:?}"
-        );
+        assert!(matches!(err, FingerprintError::Unsupported { .. }), "{err:?}");
     }
 
     #[tokio::test]
@@ -566,15 +552,13 @@ mod tests {
     async fn a_merge_in_progress_is_refused_and_nothing_is_written() {
         let repo = repo();
         write(&repo, "a.txt", b"edited\n");
-        fs::write(repo.path.join(".git").join("MERGE_HEAD"), "0".repeat(40)).expect("marker");
+        fs::write(repo.path.join(".git").join("MERGE_HEAD"), "0".repeat(40))
+            .expect("marker");
         let file_before = fs::read(repo.path.join("a.txt")).expect("read");
         let index_before = fs::read(repo.path.join(".git").join("index")).expect("read");
         let err = fingerprint(&repo.path).await.expect_err("refused");
         assert_eq!(err, FingerprintError::InProgress("MERGE_HEAD".into()));
-        assert_eq!(
-            fs::read(repo.path.join("a.txt")).expect("read"),
-            file_before
-        );
+        assert_eq!(fs::read(repo.path.join("a.txt")).expect("read"), file_before);
         assert_eq!(
             fs::read(repo.path.join(".git").join("index")).expect("read"),
             index_before
@@ -635,9 +619,7 @@ mod tests {
             max_file_bytes: 4,
             max_total_bytes: 1024,
         };
-        let err = fingerprint_with(&repo.path, limits)
-            .await
-            .expect_err("refused");
+        let err = fingerprint_with(&repo.path, limits).await.expect_err("refused");
         assert!(matches!(err, FingerprintError::TooLarge { .. }));
     }
 
@@ -650,9 +632,7 @@ mod tests {
             max_file_bytes: 1024,
             max_total_bytes: 4,
         };
-        let err = fingerprint_with(&repo.path, limits)
-            .await
-            .expect_err("refused");
+        let err = fingerprint_with(&repo.path, limits).await.expect_err("refused");
         assert_eq!(err, FingerprintError::TooMuchData { limit: 4 });
     }
 
@@ -730,13 +710,7 @@ mod tests {
 
     #[tokio::test]
     async fn every_in_progress_git_operation_marker_refuses_the_fingerprint() {
-        for marker in [
-            "REBASE_HEAD",
-            "CHERRY_PICK_HEAD",
-            "REVERT_HEAD",
-            "BISECT_LOG",
-            "index.lock",
-        ] {
+        for marker in ["REBASE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG", "index.lock"] {
             let repo = repo();
             write(&repo, "a.txt", b"edited\n");
             fs::write(repo.path.join(".git").join(marker), "x").expect("marker");

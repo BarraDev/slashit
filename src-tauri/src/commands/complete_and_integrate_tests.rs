@@ -14,8 +14,8 @@ use uuid::Uuid;
 
 use crate::commands::human_review;
 use crate::commands::integration::{
-    complete_and_integrate, discard, integrate, preview, reconfirm, resume,
-    IntegrationConfirmation, IntegrationPreview, PreviewState,
+    complete_and_integrate, discard, integrate, preview, reconfirm, resume, IntegrationConfirmation,
+    IntegrationPreview, PreviewState,
 };
 use crate::domain::task::ActivityKind;
 use crate::domain::{IntegrationState, IntegrationStrategy, Task, TaskStatus};
@@ -29,11 +29,7 @@ fn run(dir: &Path, args: &[&str]) -> String {
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .output()
         .expect("run git");
-    assert!(
-        out.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
@@ -87,9 +83,7 @@ async fn fixture_with(detach: bool, remote: Option<&str>) -> Fx {
         tmp.path().join("cache"),
         tmp.path().join("runtime"),
     ));
-    let (state, _) = crate::app_core::build_state_with_paths(paths.clone())
-        .await
-        .expect("state");
+    let (state, _) = crate::app_core::build_state_with_paths(paths.clone()).await.expect("state");
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     run(&repo, &["init", "-q", "-b", "main"]);
@@ -114,9 +108,7 @@ async fn fixture_with(detach: bool, remote: Option<&str>) -> Fx {
             created_at: chrono::Utc::now(),
         },
     );
-    let base = crate::domain::project::ProjectBase::LocalBranch {
-        branch: "main".to_string(),
-    };
+    let base = crate::domain::project::ProjectBase::LocalBranch { branch: "main".to_string() };
     state.project.projects.write().await.insert(
         project_id,
         crate::domain::Project {
@@ -155,44 +147,20 @@ async fn fixture_with(detach: bool, remote: Option<&str>) -> Fx {
     run(&worktree, &["commit", "-q", "-m", "task work"]);
     let tip = run(&worktree, &["rev-parse", "HEAD"]);
 
-    let mut task = create_test_task_full(
-        "complete and integrate",
-        project_id,
-        TaskStatus::HumanReview,
-        0,
-    );
+    let mut task = create_test_task_full("complete and integrate", project_id, TaskStatus::HumanReview, 0);
     task.branch_name = Some(branch.clone());
     task.worktree_path = Some(info.path.clone());
     task.overall_progress = 90;
     task.human_review.record_arrival();
     let task_id = task.id;
     state.task.tasks.write().await.insert(task_id, task.clone());
-    state
-        .storage
-        .save_project_tasks(project_id, &[task])
-        .expect("seed the board");
+    state.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
     if detach {
         run(&repo, &["checkout", "-q", "--detach"]);
     }
-    let fx = Fx {
-        _tmp: tmp,
-        paths,
-        state,
-        repo,
-        worktree,
-        project_id,
-        task_id,
-        branch,
-        tip,
-    };
-    human_review::approve_shown(&fx.state, fx.task_id, false)
-        .await
-        .expect("approved");
-    assert_eq!(
-        current(&fx).await.human_review.approved_tip(),
-        Some(fx.tip.as_str()),
-        "the approval records the commit"
-    );
+    let fx = Fx { _tmp: tmp, paths, state, repo, worktree, project_id, task_id, branch, tip };
+    human_review::approve_shown(&fx.state, fx.task_id, false).await.expect("approved");
+    assert_eq!(current(&fx).await.human_review.approved_tip(), Some(fx.tip.as_str()), "the approval records the commit");
     fx
 }
 
@@ -201,14 +169,7 @@ async fn fixture() -> Fx {
 }
 
 async fn current(fx: &Fx) -> Task {
-    fx.state
-        .task
-        .tasks
-        .read()
-        .await
-        .get(&fx.task_id)
-        .cloned()
-        .expect("the task")
+    fx.state.task.tasks.read().await.get(&fx.task_id).cloned().expect("the task")
 }
 
 fn on_disk(fx: &Fx) -> Task {
@@ -239,9 +200,7 @@ fn count(task: &Task, wanted: fn(&ActivityKind) -> bool) -> usize {
 }
 
 fn integrations(task: &Task) -> usize {
-    count(task, |k| {
-        matches!(k, ActivityKind::IntegratedLocally { .. })
-    })
+    count(task, |k| matches!(k, ActivityKind::IntegratedLocally { .. }))
 }
 
 fn completions(task: &Task) -> usize {
@@ -250,20 +209,13 @@ fn completions(task: &Task) -> usize {
 
 /// Nothing happened: the target, the Task and its file are as they were.
 async fn assert_untouched(fx: &Fx, main_before: &str) {
-    assert_eq!(
-        tip_of(&fx.repo, "main"),
-        main_before,
-        "the destination did not move"
-    );
+    assert_eq!(tip_of(&fx.repo, "main"), main_before, "the destination did not move");
     let task = current(fx).await;
     assert_eq!(task.status, TaskStatus::HumanReview);
     assert!(task.local_integration.is_none(), "no record");
     assert_eq!(integrations(&task) + completions(&task), 0, "no activity");
     assert!(fx.worktree.exists(), "the Task Checkout is kept");
-    assert!(
-        !ref_exists(&fx.repo, &git::pin_ref(fx.task_id)),
-        "no pin is left"
-    );
+    assert!(!ref_exists(&fx.repo, &git::pin_ref(fx.task_id)), "no pin is left");
     assert_eq!(on_disk(fx).local_integration, None);
 }
 
@@ -275,27 +227,13 @@ fn assert_done_and_integrated(fx: &Fx, done: &Task, strategy: IntegrationStrateg
     assert!(!done.cleanup_in_flight);
     assert!(done.worktree_path.is_none());
     assert!(!fx.worktree.exists(), "the Task Checkout is removed");
-    assert_eq!(
-        tip_of(&fx.repo, &fx.branch),
-        fx.tip,
-        "the Task branch and its commits are kept"
-    );
-    let record = done
-        .local_integration
-        .clone()
-        .expect("an integration record");
+    assert_eq!(tip_of(&fx.repo, &fx.branch), fx.tip, "the Task branch and its commits are kept");
+    let record = done.local_integration.clone().expect("an integration record");
     assert_eq!(record.state, IntegrationState::Integrated);
     assert_eq!(record.strategy, strategy);
-    assert_eq!(
-        record.approved_tip, fx.tip,
-        "the record names the approved commit"
-    );
+    assert_eq!(record.approved_tip, fx.tip, "the record names the approved commit");
     assert!(record.completes_task);
-    assert_eq!(
-        record.result_oid,
-        tip_of(&fx.repo, "main"),
-        "the record names the result the destination holds"
-    );
+    assert_eq!(record.result_oid, tip_of(&fx.repo, "main"), "the record names the result the destination holds");
     assert_eq!(integrations(done), 1, "integration is on the timeline once");
     assert_eq!(completions(done), 1, "completion is on the timeline once");
     let order: Vec<_> = done
@@ -308,21 +246,11 @@ fn assert_done_and_integrated(fx: &Fx, done: &Task, strategy: IntegrationStrateg
         })
         .collect();
     assert_eq!(order, ["integrated", "completed"]);
-    assert!(
-        done.pr_url.is_none() && done.external_refs.iter().all(|r| !r.is_pr()),
-        "no pull request"
-    );
-    assert!(
-        !ref_exists(&fx.repo, &git::pin_ref(fx.task_id)),
-        "the pin is released"
-    );
+    assert!(done.pr_url.is_none() && done.external_refs.iter().all(|r| !r.is_pr()), "no pull request");
+    assert!(!ref_exists(&fx.repo, &git::pin_ref(fx.task_id)), "the pin is released");
     let disk = on_disk(fx);
     assert_eq!(disk.status, TaskStatus::Done);
-    assert_eq!(
-        disk.local_integration,
-        Some(record),
-        "the file the next start reads says the same"
-    );
+    assert_eq!(disk.local_integration, Some(record), "the file the next start reads says the same");
     assert_eq!(disk.activity, done.activity);
 }
 
@@ -343,19 +271,11 @@ async fn an_approved_task_is_fast_forwarded_and_completed_in_one_action() {
     assert_eq!(tip_of(&fx.repo, "main"), before, "a preview moves nothing");
     assert!(fx.worktree.exists(), "and removes nothing");
 
-    let done = complete_and_integrate(&fx.state, fx.task_id, confirmation(&p))
-        .await
-        .expect("completed");
+    let done = complete_and_integrate(&fx.state, fx.task_id, confirmation(&p)).await.expect("completed");
     assert_eq!(tip_of(&fx.repo, "main"), fx.tip);
     assert_done_and_integrated(&fx, &done, IntegrationStrategy::FastForward);
-    assert_eq!(
-        done.human_review, history,
-        "the approval history is preserved"
-    );
-    assert!(
-        !ref_exists(&fx.repo, "refs/remotes/origin/main"),
-        "nothing was fetched or pushed"
-    );
+    assert_eq!(done.human_review, history, "the approval history is preserved");
+    assert!(!ref_exists(&fx.repo, "refs/remotes/origin/main"), "nothing was fetched or pushed");
     assert_eq!(shown(&fx).await.state, PreviewState::Integrated);
 }
 
@@ -366,18 +286,12 @@ async fn a_diverged_destination_gets_a_merge_commit_and_the_task_completes() {
     let p = shown(&fx).await;
     assert_eq!(p.strategy, Some(IntegrationStrategy::MergeCommit));
 
-    let done = complete_and_integrate(&fx.state, fx.task_id, confirmation(&p))
-        .await
-        .expect("completed");
+    let done = complete_and_integrate(&fx.state, fx.task_id, confirmation(&p)).await.expect("completed");
     assert_done_and_integrated(&fx, &done, IntegrationStrategy::MergeCommit);
     let merged = tip_of(&fx.repo, "main");
     let parents = run(&fx.repo, &["rev-list", "--parents", "-n", "1", &merged]);
     let parents: Vec<_> = parents.split(' ').skip(1).collect();
-    assert_eq!(
-        parents,
-        [moved.as_str(), fx.tip.as_str()],
-        "both lines are kept, neither rewritten"
-    );
+    assert_eq!(parents, [moved.as_str(), fx.tip.as_str()], "both lines are kept, neither rewritten");
 }
 
 #[tokio::test]
@@ -386,9 +300,7 @@ async fn a_destination_that_already_holds_the_work_completes_without_moving() {
     run(&fx.repo, &["branch", "-f", "main", &fx.tip]);
     let p = shown(&fx).await;
     assert_eq!(p.state, PreviewState::AlreadyContained);
-    let done = complete_and_integrate(&fx.state, fx.task_id, confirmation(&p))
-        .await
-        .expect("completed");
+    let done = complete_and_integrate(&fx.state, fx.task_id, confirmation(&p)).await.expect("completed");
     assert_done_and_integrated(&fx, &done, IntegrationStrategy::AlreadyContained);
     assert_eq!(tip_of(&fx.repo, "main"), fx.tip);
 }
@@ -406,25 +318,14 @@ async fn a_checked_out_destination_is_advanced_only_in_the_checkout_that_was_sho
     // Without naming that checkout, nothing is touched.
     let mut unnamed = confirmation(&p);
     unnamed.checkout_path = None;
-    let refused = complete_and_integrate(&fx.state, fx.task_id, unnamed)
-        .await
-        .expect_err("not confirmed");
+    let refused = complete_and_integrate(&fx.state, fx.task_id, unnamed).await.expect_err("not confirmed");
     assert!(refused.contains("checked out"), "{refused}");
     assert_untouched(&fx, &before).await;
 
-    let done = complete_and_integrate(&fx.state, fx.task_id, confirmation(&p))
-        .await
-        .expect("completed");
+    let done = complete_and_integrate(&fx.state, fx.task_id, confirmation(&p)).await.expect("completed");
     assert_done_and_integrated(&fx, &done, IntegrationStrategy::FastForward);
-    assert_eq!(
-        done.local_integration.unwrap().checkout_path.as_deref(),
-        Some(shown_at.as_str())
-    );
-    assert_eq!(
-        std::fs::read_to_string(fx.repo.join("work.txt")).unwrap(),
-        "work\n",
-        "the checkout moved with the branch"
-    );
+    assert_eq!(done.local_integration.unwrap().checkout_path.as_deref(), Some(shown_at.as_str()));
+    assert_eq!(std::fs::read_to_string(fx.repo.join("work.txt")).unwrap(), "work\n", "the checkout moved with the branch");
     assert_eq!(run(&fx.repo, &["status", "--porcelain"]), "");
 }
 
@@ -436,23 +337,14 @@ async fn a_destination_checkout_that_became_dirty_after_the_preview_refuses_and_
     let confirmed = confirmation(&p);
     std::fs::write(fx.repo.join("README.md"), "edited by a person\n").unwrap();
 
-    let refused = complete_and_integrate(&fx.state, fx.task_id, confirmed)
-        .await
-        .expect_err("dirty");
+    let refused = complete_and_integrate(&fx.state, fx.task_id, confirmed).await.expect_err("dirty");
     assert!(refused.contains("uncommitted changes"), "{refused}");
     assert_untouched(&fx, &before).await;
-    assert_eq!(
-        std::fs::read_to_string(fx.repo.join("README.md")).unwrap(),
-        "edited by a person\n",
-        "their work is intact"
-    );
+    assert_eq!(std::fs::read_to_string(fx.repo.join("README.md")).unwrap(), "edited by a person\n", "their work is intact");
 
     let p = shown(&fx).await;
     assert_eq!(p.state, PreviewState::Refused, "and the preview says why");
-    assert!(p
-        .checkout_problems
-        .iter()
-        .any(|m| m.contains("uncommitted changes")));
+    assert!(p.checkout_problems.iter().any(|m| m.contains("uncommitted changes")));
 }
 
 #[tokio::test]
@@ -479,15 +371,10 @@ async fn conflicts_refuse_before_anything_moves() {
     let guess = IntegrationConfirmation {
         target_branch: "main".into(),
         target_tip: main_before.clone(),
-        approved_tip: p
-            .approved_tip
-            .clone()
-            .expect("the approved commit is shown even when refused"),
+        approved_tip: p.approved_tip.clone().expect("the approved commit is shown even when refused"),
         checkout_path: None,
     };
-    let refused = complete_and_integrate(&fx.state, fx.task_id, guess)
-        .await
-        .expect_err("conflicts");
+    let refused = complete_and_integrate(&fx.state, fx.task_id, guess).await.expect_err("conflicts");
     assert!(refused.to_lowercase().contains("conflict"), "{refused}");
     assert_untouched(&fx, &main_before).await;
 }
@@ -505,9 +392,7 @@ async fn a_destination_that_moved_after_the_preview_refuses_and_changes_nothing(
     let confirmed = confirmation(&p);
     let moved = commit_on_main(&fx.repo, "late.txt", "late\n");
 
-    let refused = complete_and_integrate(&fx.state, fx.task_id, confirmed)
-        .await
-        .expect_err("stale");
+    let refused = complete_and_integrate(&fx.state, fx.task_id, confirmed).await.expect_err("stale");
     assert!(refused.contains("moved after"), "{refused}");
     assert_untouched(&fx, &moved).await;
 }
@@ -520,9 +405,7 @@ async fn an_approval_that_is_not_the_one_shown_refuses_and_changes_nothing() {
     let mut confirmed = confirmation(&p);
     confirmed.approved_tip = "0".repeat(40);
 
-    let refused = complete_and_integrate(&fx.state, fx.task_id, confirmed)
-        .await
-        .expect_err("another commit");
+    let refused = complete_and_integrate(&fx.state, fx.task_id, confirmed).await.expect_err("another commit");
     assert!(refused.contains("not the one that was shown"), "{refused}");
     assert_untouched(&fx, &before).await;
 }
@@ -534,15 +417,9 @@ async fn an_approval_withdrawn_after_the_preview_refuses() {
     let confirmed = confirmation(&shown(&fx).await);
     {
         let mut tasks = fx.state.task.tasks.write().await;
-        tasks
-            .get_mut(&fx.task_id)
-            .unwrap()
-            .human_review
-            .withdraw_approval();
+        tasks.get_mut(&fx.task_id).unwrap().human_review.withdraw_approval();
     }
-    let refused = complete_and_integrate(&fx.state, fx.task_id, confirmed)
-        .await
-        .expect_err("not approved");
+    let refused = complete_and_integrate(&fx.state, fx.task_id, confirmed).await.expect_err("not approved");
     assert!(refused.contains("no approval"), "{refused}");
     assert_untouched(&fx, &before).await;
 }
@@ -552,18 +429,10 @@ async fn a_task_branch_rewritten_after_the_approval_is_not_integrated() {
     let fx = fixture().await;
     let before = tip_of(&fx.repo, "main");
     let confirmed = confirmation(&shown(&fx).await);
-    run(
-        &fx.worktree,
-        &["commit", "-q", "--amend", "-m", "rewritten"],
-    );
+    run(&fx.worktree, &["commit", "-q", "--amend", "-m", "rewritten"]);
 
-    let refused = complete_and_integrate(&fx.state, fx.task_id, confirmed)
-        .await
-        .expect_err("rewritten");
-    assert!(
-        refused.contains("no longer on the task's branch"),
-        "{refused}"
-    );
+    let refused = complete_and_integrate(&fx.state, fx.task_id, confirmed).await.expect_err("rewritten");
+    assert!(refused.contains("no longer on the task's branch"), "{refused}");
     assert_untouched(&fx, &before).await;
 }
 
@@ -576,19 +445,9 @@ async fn commits_after_the_approval_are_reported_and_not_integrated() {
     let p = shown(&fx).await;
     assert_eq!(p.unapproved_commits, 1);
 
-    let done = complete_and_integrate(&fx.state, fx.task_id, confirmation(&p))
-        .await
-        .expect("completed");
-    assert_eq!(
-        tip_of(&fx.repo, "main"),
-        fx.tip,
-        "only the approved commit reached the destination"
-    );
-    assert_ne!(
-        tip_of(&fx.repo, &fx.branch),
-        fx.tip,
-        "the later commit is still on the Task branch"
-    );
+    let done = complete_and_integrate(&fx.state, fx.task_id, confirmation(&p)).await.expect("completed");
+    assert_eq!(tip_of(&fx.repo, "main"), fx.tip, "only the approved commit reached the destination");
+    assert_ne!(tip_of(&fx.repo, &fx.branch), fx.tip, "the later commit is still on the Task branch");
     assert_eq!(done.local_integration.unwrap().approved_tip, fx.tip);
 }
 
@@ -605,11 +464,7 @@ async fn a_legacy_approval_has_to_be_reconfirmed_before_it_can_be_completed() {
     }
     let p = shown(&fx).await;
     assert_eq!(p.state, PreviewState::NeedsReconfirmation);
-    let shown_tip = p
-        .reconfirm
-        .clone()
-        .expect("the commit to confirm")
-        .branch_tip;
+    let shown_tip = p.reconfirm.clone().expect("the commit to confirm").branch_tip;
     assert_eq!(shown_tip, fx.tip);
 
     let guess = IntegrationConfirmation {
@@ -618,38 +473,19 @@ async fn a_legacy_approval_has_to_be_reconfirmed_before_it_can_be_completed() {
         approved_tip: fx.tip.clone(),
         checkout_path: None,
     };
-    let refused = complete_and_integrate(&fx.state, fx.task_id, guess)
-        .await
-        .expect_err("no commit on record");
+    let refused = complete_and_integrate(&fx.state, fx.task_id, guess).await.expect_err("no commit on record");
     assert!(refused.contains("did not record which commit"), "{refused}");
     assert_untouched(&fx, &before).await;
 
     // Confirming a commit that is not the branch tip is refused.
-    assert!(reconfirm(&fx.state, fx.task_id, &"1".repeat(40))
-        .await
-        .is_err());
-    let confirmed = reconfirm(&fx.state, fx.task_id, &shown_tip)
-        .await
-        .expect("confirmed");
-    assert_eq!(
-        confirmed.status,
-        TaskStatus::HumanReview,
-        "confirming completes nothing"
-    );
-    assert!(
-        confirmed
-            .human_review
-            .entries
-            .last()
-            .unwrap()
-            .tip_reconfirmed
-    );
+    assert!(reconfirm(&fx.state, fx.task_id, &"1".repeat(40)).await.is_err());
+    let confirmed = reconfirm(&fx.state, fx.task_id, &shown_tip).await.expect("confirmed");
+    assert_eq!(confirmed.status, TaskStatus::HumanReview, "confirming completes nothing");
+    assert!(confirmed.human_review.entries.last().unwrap().tip_reconfirmed);
 
     let p = shown(&fx).await;
     assert_eq!(p.state, PreviewState::Ready);
-    let done = complete_and_integrate(&fx.state, fx.task_id, confirmation(&p))
-        .await
-        .expect("completed");
+    let done = complete_and_integrate(&fx.state, fx.task_id, confirmation(&p)).await.expect("completed");
     assert_done_and_integrated(&fx, &done, IntegrationStrategy::FastForward);
 }
 
@@ -663,42 +499,23 @@ async fn only_an_approved_task_in_human_review_can_be_completed_and_integrated()
 
     // An integration after completion is the other action, and refuses a
     // task that is still in review.
-    let refused = integrate(&fx.state, fx.task_id, confirmed.clone())
-        .await
-        .expect_err("still in review");
+    let refused = integrate(&fx.state, fx.task_id, confirmed.clone()).await.expect_err("still in review");
     assert!(refused.contains("completed locally"), "{refused}");
     assert_untouched(&fx, &before).await;
 
     // Undecided.
     {
         let mut tasks = fx.state.task.tasks.write().await;
-        tasks
-            .get_mut(&fx.task_id)
-            .unwrap()
-            .human_review
-            .withdraw_approval();
+        tasks.get_mut(&fx.task_id).unwrap().human_review.withdraw_approval();
     }
     assert_eq!(shown(&fx).await.state, PreviewState::Refused);
-    assert!(
-        complete_and_integrate(&fx.state, fx.task_id, confirmed.clone())
-            .await
-            .is_err()
-    );
+    assert!(complete_and_integrate(&fx.state, fx.task_id, confirmed.clone()).await.is_err());
 
     // Completed without integration: the other action integrates it.
-    human_review::approve_shown(&fx.state, fx.task_id, false)
-        .await
-        .unwrap();
-    human_review::complete_locally(&fx.state, fx.task_id, true)
-        .await
-        .expect("completed locally");
-    let refused = complete_and_integrate(&fx.state, fx.task_id, confirmed)
-        .await
-        .expect_err("already completed");
-    assert!(
-        refused.contains("without its approved work being integrated"),
-        "{refused}"
-    );
+    human_review::approve_shown(&fx.state, fx.task_id, false).await.unwrap();
+    human_review::complete_locally(&fx.state, fx.task_id, true).await.expect("completed locally");
+    let refused = complete_and_integrate(&fx.state, fx.task_id, confirmed).await.expect_err("already completed");
+    assert!(refused.contains("without its approved work being integrated"), "{refused}");
 }
 
 #[tokio::test]
@@ -709,18 +526,14 @@ async fn a_task_with_a_pull_request_or_one_being_opened_is_not_integrated_locall
     {
         let _mark = fx.state.task.deliveries.start(fx.task_id);
         assert_eq!(shown(&fx).await.state, PreviewState::Refused);
-        let refused = complete_and_integrate(&fx.state, fx.task_id, confirmed.clone())
-            .await
-            .expect_err("being opened");
+        let refused = complete_and_integrate(&fx.state, fx.task_id, confirmed.clone()).await.expect_err("being opened");
         assert!(refused.contains("pull request"), "{refused}");
     }
     {
         let mut tasks = fx.state.task.tasks.write().await;
         tasks.get_mut(&fx.task_id).unwrap().pr_url = Some("https://github.com/o/r/pull/1".into());
     }
-    let refused = complete_and_integrate(&fx.state, fx.task_id, confirmed)
-        .await
-        .expect_err("has one");
+    let refused = complete_and_integrate(&fx.state, fx.task_id, confirmed).await.expect_err("has one");
     assert!(refused.contains("pull request"), "{refused}");
     assert_eq!(tip_of(&fx.repo, "main"), before);
     assert!(current(&fx).await.local_integration.is_none());
@@ -736,15 +549,10 @@ async fn uncommitted_work_in_the_task_checkout_refuses_before_anything_moves() {
     let p = shown(&fx).await;
     assert_eq!(p.state, PreviewState::Refused);
     assert!(p.reason.unwrap().contains("uncommitted changes"));
-    let refused = complete_and_integrate(&fx.state, fx.task_id, confirmed)
-        .await
-        .expect_err("uncommitted");
+    let refused = complete_and_integrate(&fx.state, fx.task_id, confirmed).await.expect_err("uncommitted");
     assert!(refused.contains("unsaved.txt"), "{refused}");
     assert_untouched(&fx, &before).await;
-    assert!(
-        fx.worktree.join("unsaved.txt").exists(),
-        "their work is intact"
-    );
+    assert!(fx.worktree.join("unsaved.txt").exists(), "their work is intact");
 }
 
 #[tokio::test]
@@ -753,15 +561,11 @@ async fn an_agent_still_running_for_the_task_refuses_before_anything_moves() {
     let before = tip_of(&fx.repo, "main");
     let confirmed = confirmation(&shown(&fx).await);
     let executor = crate::test_helpers::attach_test_executor(&fx.state);
-    executor
-        .register_fake_reviewing_owner_for_test(fx.task_id)
-        .await;
+    executor.register_fake_reviewing_owner_for_test(fx.task_id).await;
 
     let p = shown(&fx).await;
     assert_eq!(p.state, PreviewState::Refused);
-    let refused = complete_and_integrate(&fx.state, fx.task_id, confirmed)
-        .await
-        .expect_err("an agent owns the task");
+    let refused = complete_and_integrate(&fx.state, fx.task_id, confirmed).await.expect_err("an agent owns the task");
     assert!(refused.contains("still running"), "{refused}");
     assert_untouched(&fx, &before).await;
 }
@@ -776,10 +580,7 @@ async fn two_requests_at_once_integrate_and_complete_once() {
         complete_and_integrate(&fx.state, fx.task_id, confirmed.clone()),
         complete_and_integrate(&fx.state, fx.task_id, confirmed.clone()),
     );
-    let (a, b) = (
-        a.expect("one completes"),
-        b.expect("the other sees it done"),
-    );
+    let (a, b) = (a.expect("one completes"), b.expect("the other sees it done"));
     assert_eq!(a.status, TaskStatus::Done);
     assert_eq!(b.status, TaskStatus::Done);
     let task = current(&fx).await;
@@ -790,16 +591,12 @@ async fn two_requests_at_once_integrate_and_complete_once() {
 async fn asking_again_once_it_is_done_changes_nothing() {
     let fx = fixture().await;
     let confirmed = confirmation(&shown(&fx).await);
-    let first = complete_and_integrate(&fx.state, fx.task_id, confirmed.clone())
-        .await
-        .unwrap();
+    let first = complete_and_integrate(&fx.state, fx.task_id, confirmed.clone()).await.unwrap();
     let on_disk_first = serde_json::to_value(on_disk(&fx)).unwrap();
     let main_after = tip_of(&fx.repo, "main");
 
     for _ in 0..2 {
-        let again = complete_and_integrate(&fx.state, fx.task_id, confirmed.clone())
-            .await
-            .expect("idempotent");
+        let again = complete_and_integrate(&fx.state, fx.task_id, confirmed.clone()).await.expect("idempotent");
         assert_eq!(again.activity, first.activity);
         assert_eq!(again.updated_at, first.updated_at, "nothing was written");
     }
@@ -822,9 +619,7 @@ async fn a_second_task_cannot_interleave_into_the_same_destination() {
     let mut second = create_test_task_full("second", fx.project_id, TaskStatus::HumanReview, 1);
     second.branch_name = Some("task-two".into());
     second.human_review.record_arrival();
-    second
-        .human_review
-        .approve(Some(two_tip), chrono::Utc::now());
+    second.human_review.approve(Some(two_tip), chrono::Utc::now());
     let second_id = second.id;
     fx.state.task.tasks.write().await.insert(second_id, second);
 
@@ -836,10 +631,7 @@ async fn a_second_task_cannot_interleave_into_the_same_destination() {
     );
     // Both asked against the same destination commit, so exactly one plan
     // can hold; the other is told to look again and changed nothing.
-    assert!(
-        a.is_ok() ^ b.is_ok(),
-        "exactly one integrates: {a:?} / {b:?}"
-    );
+    assert!(a.is_ok() ^ b.is_ok(), "exactly one integrates: {a:?} / {b:?}");
     let loser = a.err().or(b.err()).unwrap();
     assert!(loser.contains("moved after"), "{loser}");
 }
@@ -849,9 +641,7 @@ async fn a_second_task_cannot_interleave_into_the_same_destination() {
 /// A pending record, as a crash right after it was persisted leaves it.
 async fn pending_unmoved(fx: &Fx) -> git::Plan {
     let c = confirmation(&shown(fx).await);
-    let plan = git::plan(&fx.repo, &c.target_branch, &c.approved_tip, "m", true)
-        .await
-        .unwrap();
+    let plan = git::plan(&fx.repo, &c.target_branch, &c.approved_tip, "m", true).await.unwrap();
     git::pin(&fx.repo, fx.task_id, &plan.result).await.unwrap();
     let record = crate::domain::LocalIntegration {
         state: IntegrationState::Pending,
@@ -866,12 +656,8 @@ async fn pending_unmoved(fx: &Fx) -> git::Plan {
         completes_task: true,
     };
     let id = fx.task_id;
-    let amend = move |s: &mut HashMap<Uuid, Task>| {
-        s.get_mut(&id).unwrap().local_integration = Some(record.clone())
-    };
-    crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, id, &amend)
-        .await
-        .unwrap();
+    let amend = move |s: &mut HashMap<Uuid, Task>| s.get_mut(&id).unwrap().local_integration = Some(record.clone());
+    crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, id, &amend).await.unwrap();
     plan
 }
 
@@ -880,19 +666,9 @@ async fn a_crash_before_the_destination_moved_is_finished_by_resuming_and_comple
     let fx = fixture().await;
     let plan = pending_unmoved(&fx).await;
     let p = shown(&fx).await;
-    assert_eq!(
-        (p.state, p.observed.as_deref()),
-        (PreviewState::Pending, Some("unmoved"))
-    );
-    assert!(
-        p.integration.unwrap().completes_task,
-        "the pending record carries the intent to complete"
-    );
-    assert_eq!(
-        current(&fx).await.status,
-        TaskStatus::HumanReview,
-        "not Done while only intended"
-    );
+    assert_eq!((p.state, p.observed.as_deref()), (PreviewState::Pending, Some("unmoved")));
+    assert!(p.integration.unwrap().completes_task, "the pending record carries the intent to complete");
+    assert_eq!(current(&fx).await.status, TaskStatus::HumanReview, "not Done while only intended");
 
     let done = resume(&fx.state, fx.task_id).await.expect("resumed");
     assert_eq!(tip_of(&fx.repo, "main"), plan.result);
@@ -903,14 +679,9 @@ async fn a_crash_before_the_destination_moved_is_finished_by_resuming_and_comple
 async fn a_crash_after_the_destination_moved_records_it_and_completes_without_moving_again() {
     let fx = fixture().await;
     let plan = pending_unmoved(&fx).await;
-    git::advance(fx.repo.to_str().unwrap(), &plan, None)
-        .await
-        .unwrap();
+    git::advance(fx.repo.to_str().unwrap(), &plan, None).await.unwrap();
     assert_eq!(shown(&fx).await.observed.as_deref(), Some("applied"));
-    assert!(discard(&fx.state, fx.task_id)
-        .await
-        .unwrap_err()
-        .contains("already holds"));
+    assert!(discard(&fx.state, fx.task_id).await.unwrap_err().contains("already holds"));
 
     // Asking for the action again is the same as resuming.
     let confirmed = IntegrationConfirmation {
@@ -919,9 +690,7 @@ async fn a_crash_after_the_destination_moved_records_it_and_completes_without_mo
         approved_tip: fx.tip.clone(),
         checkout_path: None,
     };
-    let done = complete_and_integrate(&fx.state, fx.task_id, confirmed)
-        .await
-        .expect("recorded and completed");
+    let done = complete_and_integrate(&fx.state, fx.task_id, confirmed).await.expect("recorded and completed");
     assert_done_and_integrated(&fx, &done, IntegrationStrategy::FastForward);
     assert_eq!(tip_of(&fx.repo, "main"), plan.result);
 }
@@ -933,47 +702,20 @@ async fn a_crash_after_the_destination_moved_records_it_and_completes_without_mo
 async fn resuming_an_integration_whose_checkout_cannot_be_removed_keeps_the_task_in_review() {
     let fx = fixture().await;
     let plan = pending_unmoved(&fx).await;
-    run(
-        &fx.repo,
-        &["worktree", "lock", fx.worktree.to_str().unwrap()],
-    );
+    run(&fx.repo, &["worktree", "lock", fx.worktree.to_str().unwrap()]);
 
-    let kept = resume(&fx.state, fx.task_id)
-        .await
-        .expect("integrated, not completed");
-    assert_eq!(
-        tip_of(&fx.repo, "main"),
-        plan.result,
-        "the destination holds the approved work"
-    );
-    assert_eq!(
-        kept.status,
-        TaskStatus::HumanReview,
-        "the task is not reported complete"
-    );
+    let kept = resume(&fx.state, fx.task_id).await.expect("integrated, not completed");
+    assert_eq!(tip_of(&fx.repo, "main"), plan.result, "the destination holds the approved work");
+    assert_eq!(kept.status, TaskStatus::HumanReview, "the task is not reported complete");
     assert!(!kept.completed_locally());
-    assert!(
-        kept.error_message
-            .as_deref()
-            .is_some_and(|m| m.contains("was kept")),
-        "{:?}",
-        kept.error_message
-    );
-    let record = kept
-        .local_integration
-        .clone()
-        .expect("the integration is recorded");
+    assert!(kept.error_message.as_deref().is_some_and(|m| m.contains("was kept")), "{:?}", kept.error_message);
+    let record = kept.local_integration.clone().expect("the integration is recorded");
     assert_eq!(record.state, IntegrationState::Integrated);
     assert_eq!((integrations(&kept), completions(&kept)), (1, 0));
     assert!(fx.worktree.exists(), "the Task Checkout is kept");
 
-    run(
-        &fx.repo,
-        &["worktree", "unlock", fx.worktree.to_str().unwrap()],
-    );
-    let done = human_review::complete_locally(&fx.state, fx.task_id, true)
-        .await
-        .expect("completed");
+    run(&fx.repo, &["worktree", "unlock", fx.worktree.to_str().unwrap()]);
+    let done = human_review::complete_locally(&fx.state, fx.task_id, true).await.expect("completed");
     assert_done_and_integrated(&fx, &done, IntegrationStrategy::FastForward);
 }
 
@@ -983,10 +725,7 @@ async fn a_pending_integration_dropped_before_it_moved_leaves_the_task_in_review
     let plan = pending_unmoved(&fx).await;
     let waiting = current(&fx).await;
     assert_eq!(waiting.status, TaskStatus::HumanReview);
-    assert_eq!(
-        waiting.needs_you(false),
-        Some(crate::domain::task::AttentionReason::IntegrationUnfinished)
-    );
+    assert_eq!(waiting.needs_you(false), Some(crate::domain::task::AttentionReason::IntegrationUnfinished));
     let task = discard(&fx.state, fx.task_id).await.unwrap();
     assert!(task.local_integration.is_none());
     assert_eq!(task.needs_you(false), None);
@@ -1000,17 +739,10 @@ async fn a_pending_integration_dropped_before_it_moved_leaves_the_task_in_review
 async fn a_pending_integration_blocks_a_plain_completion_and_a_pull_request() {
     let fx = fixture().await;
     pending_unmoved(&fx).await;
-    let refused = human_review::complete_locally(&fx.state, fx.task_id, true)
-        .await
-        .expect_err("pending");
+    let refused = human_review::complete_locally(&fx.state, fx.task_id, true).await.expect_err("pending");
     assert!(refused.contains("started and not finished"), "{refused}");
-    let refused = crate::commands::pr::create_pr_for_approved_task(&fx.state, fx.task_id)
-        .await
-        .expect_err("pending");
-    assert!(
-        refused.contains("integrated into a local branch"),
-        "{refused}"
-    );
+    let refused = crate::commands::pr::create_pr_for_approved_task(&fx.state, fx.task_id).await.expect_err("pending");
+    assert!(refused.contains("integrated into a local branch"), "{refused}");
     assert_eq!(current(&fx).await.status, TaskStatus::HumanReview);
     assert!(fx.worktree.exists());
 }
@@ -1022,9 +754,7 @@ async fn a_pending_integration_blocks_a_plain_completion_and_a_pull_request() {
 async fn a_crash_between_the_integration_and_the_completion_is_finished_without_repeating_it() {
     let fx = fixture().await;
     let plan = pending_unmoved(&fx).await;
-    git::advance(fx.repo.to_str().unwrap(), &plan, None)
-        .await
-        .unwrap();
+    git::advance(fx.repo.to_str().unwrap(), &plan, None).await.unwrap();
     {
         let id = fx.task_id;
         let amend = |s: &mut HashMap<Uuid, Task>| {
@@ -1038,9 +768,7 @@ async fn a_crash_between_the_integration_and_the_completion_is_finished_without_
                 commit: plan.result.clone(),
             });
         };
-        crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, id, &amend)
-            .await
-            .unwrap();
+        crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, id, &amend).await.unwrap();
     }
     git::unpin(&fx.repo, fx.task_id).await.unwrap();
 
@@ -1057,9 +785,7 @@ async fn a_crash_between_the_integration_and_the_completion_is_finished_without_
         approved_tip: fx.tip.clone(),
         checkout_path: None,
     };
-    let done = complete_and_integrate(&fx.state, fx.task_id, confirmed)
-        .await
-        .expect("completed");
+    let done = complete_and_integrate(&fx.state, fx.task_id, confirmed).await.expect("completed");
     assert_eq!(tip_of(&fx.repo, "main"), main_before);
     assert_done_and_integrated(&fx, &done, IntegrationStrategy::FastForward);
 }
@@ -1073,17 +799,9 @@ async fn a_completion_interrupted_during_the_removal_is_finished_by_asking_again
     let confirmed = confirmation(&shown(&fx).await);
     // The completion refuses to remove a locked checkout, which stands in for
     // any removal that cannot finish; then the process "dies" mid-removal.
-    run(
-        &fx.repo,
-        &["worktree", "lock", fx.worktree.to_str().unwrap()],
-    );
-    complete_and_integrate(&fx.state, fx.task_id, confirmed)
-        .await
-        .expect("integrated, not completed");
-    run(
-        &fx.repo,
-        &["worktree", "unlock", fx.worktree.to_str().unwrap()],
-    );
+    run(&fx.repo, &["worktree", "lock", fx.worktree.to_str().unwrap()]);
+    complete_and_integrate(&fx.state, fx.task_id, confirmed).await.expect("integrated, not completed");
+    run(&fx.repo, &["worktree", "unlock", fx.worktree.to_str().unwrap()]);
     {
         let mut tasks = fx.state.task.tasks.write().await;
         tasks.get_mut(&fx.task_id).unwrap().cleanup_in_flight = true;
@@ -1091,9 +809,7 @@ async fn a_completion_interrupted_during_the_removal_is_finished_by_asking_again
     let p = shown(&fx).await;
     assert_eq!(p.state, PreviewState::CompletionPending, "still answerable");
 
-    let done = human_review::complete_locally(&fx.state, fx.task_id, true)
-        .await
-        .expect("finished");
+    let done = human_review::complete_locally(&fx.state, fx.task_id, true).await.expect("finished");
     assert_done_and_integrated(&fx, &done, IntegrationStrategy::FastForward);
 }
 
@@ -1103,77 +819,37 @@ async fn a_completion_interrupted_during_the_removal_is_finished_by_asking_again
 async fn a_checkout_git_will_not_remove_keeps_the_integration_and_the_task_in_review() {
     let fx = fixture().await;
     let confirmed = confirmation(&shown(&fx).await);
-    run(
-        &fx.repo,
-        &["worktree", "lock", fx.worktree.to_str().unwrap()],
-    );
+    run(&fx.repo, &["worktree", "lock", fx.worktree.to_str().unwrap()]);
 
-    let kept = complete_and_integrate(&fx.state, fx.task_id, confirmed.clone())
-        .await
-        .expect("integrated");
-    assert_eq!(
-        tip_of(&fx.repo, "main"),
-        fx.tip,
-        "the destination holds the approved work"
-    );
-    assert_eq!(
-        kept.status,
-        TaskStatus::HumanReview,
-        "the task is not reported complete"
-    );
+    let kept = complete_and_integrate(&fx.state, fx.task_id, confirmed.clone()).await.expect("integrated");
+    assert_eq!(tip_of(&fx.repo, "main"), fx.tip, "the destination holds the approved work");
+    assert_eq!(kept.status, TaskStatus::HumanReview, "the task is not reported complete");
     assert!(!kept.completed_locally());
-    assert!(
-        kept.error_message
-            .as_deref()
-            .is_some_and(|m| m.contains("was kept")),
-        "{:?}",
-        kept.error_message
-    );
+    assert!(kept.error_message.as_deref().is_some_and(|m| m.contains("was kept")), "{:?}", kept.error_message);
     assert!(!kept.cleanup_in_flight);
-    let record = kept
-        .local_integration
-        .clone()
-        .expect("the integration is recorded");
+    let record = kept.local_integration.clone().expect("the integration is recorded");
     assert_eq!(record.state, IntegrationState::Integrated);
     assert_eq!((integrations(&kept), completions(&kept)), (1, 0));
     assert!(fx.worktree.exists(), "the Task Checkout is kept");
-    assert_eq!(
-        tip_of(&fx.repo, &fx.branch),
-        fx.tip,
-        "and so is the Task branch"
-    );
+    assert_eq!(tip_of(&fx.repo, &fx.branch), fx.tip, "and so is the Task branch");
     assert_eq!(on_disk(&fx).local_integration, Some(record));
 
     // What the drawer shows meanwhile, and that no second delivery is offered.
     let p = shown(&fx).await;
     assert_eq!(p.state, PreviewState::CompletionPending);
     assert!(p.reason.unwrap().contains("was kept"));
-    assert!(
-        crate::commands::pr::create_pr_for_approved_task(&fx.state, fx.task_id)
-            .await
-            .is_err()
-    );
+    assert!(crate::commands::pr::create_pr_for_approved_task(&fx.state, fx.task_id).await.is_err());
 
     // Asking again while it is still locked repeats nothing and reports the same.
-    let again = complete_and_integrate(&fx.state, fx.task_id, confirmed)
-        .await
-        .expect("same answer");
+    let again = complete_and_integrate(&fx.state, fx.task_id, confirmed).await.expect("same answer");
     assert_eq!((integrations(&again), completions(&again)), (1, 0));
     assert_eq!(tip_of(&fx.repo, "main"), fx.tip);
 
     // Resolved, the finishing step completes it once.
-    run(
-        &fx.repo,
-        &["worktree", "unlock", fx.worktree.to_str().unwrap()],
-    );
-    let done = human_review::complete_locally(&fx.state, fx.task_id, true)
-        .await
-        .expect("completed");
+    run(&fx.repo, &["worktree", "unlock", fx.worktree.to_str().unwrap()]);
+    let done = human_review::complete_locally(&fx.state, fx.task_id, true).await.expect("completed");
     assert_done_and_integrated(&fx, &done, IntegrationStrategy::FastForward);
-    assert!(
-        done.error_message.is_none(),
-        "the earlier reason is cleared"
-    );
+    assert!(done.error_message.is_none(), "the earlier reason is cleared");
 }
 
 #[cfg(unix)]
@@ -1187,15 +863,9 @@ async fn a_board_that_cannot_be_written_refuses_before_the_destination_moves() {
         return; // Root ignores permission bits; nothing could be proven.
     };
 
-    let refused = complete_and_integrate(&fx.state, fx.task_id, confirmed)
-        .await
-        .expect_err("cannot record");
+    let refused = complete_and_integrate(&fx.state, fx.task_id, confirmed).await.expect_err("cannot record");
     assert!(refused.contains("because recording it failed"), "{refused}");
-    assert_eq!(
-        tip_of(&fx.repo, "main"),
-        before,
-        "an integration that cannot be recorded does not happen"
-    );
+    assert_eq!(tip_of(&fx.repo, "main"), before, "an integration that cannot be recorded does not happen");
     assert_eq!(current(&fx).await.status, TaskStatus::HumanReview);
     assert!(current(&fx).await.local_integration.is_none());
     assert!(!ref_exists(&fx.repo, &git::pin_ref(fx.task_id)));
@@ -1211,9 +881,7 @@ fn tasks_dir(fx: &Fx) -> PathBuf {
                 if let Some(found) = find(&path, name_ends, id) {
                     return Some(found);
                 }
-            } else if path
-                .file_name()
-                .is_some_and(|n| n.to_string_lossy().ends_with(name_ends))
+            } else if path.file_name().is_some_and(|n| n.to_string_lossy().ends_with(name_ends))
                 && std::fs::read_to_string(&path).is_ok_and(|c| c.contains(id))
             {
                 return path.parent().map(Path::to_path_buf);
@@ -1232,21 +900,10 @@ fn tasks_dir(fx: &Fx) -> PathBuf {
 async fn the_whole_outcome_survives_a_restart() {
     let fx = fixture().await;
     let confirmed = confirmation(&shown(&fx).await);
-    let done = complete_and_integrate(&fx.state, fx.task_id, confirmed)
-        .await
-        .unwrap();
+    let done = complete_and_integrate(&fx.state, fx.task_id, confirmed).await.unwrap();
 
-    let (restarted, _) = crate::app_core::build_state_with_paths(fx.paths.clone())
-        .await
-        .expect("restart");
-    let reloaded = restarted
-        .task
-        .tasks
-        .read()
-        .await
-        .get(&fx.task_id)
-        .cloned()
-        .expect("the task is back");
+    let (restarted, _) = crate::app_core::build_state_with_paths(fx.paths.clone()).await.expect("restart");
+    let reloaded = restarted.task.tasks.read().await.get(&fx.task_id).cloned().expect("the task is back");
     assert_eq!(reloaded.status, TaskStatus::Done);
     assert_eq!(reloaded.local_integration, done.local_integration);
     assert_eq!(reloaded.activity, done.activity);
@@ -1259,25 +916,11 @@ async fn the_whole_outcome_survives_a_restart() {
 async fn an_integration_waiting_for_its_completion_survives_a_restart_unchanged() {
     let fx = fixture().await;
     let confirmed = confirmation(&shown(&fx).await);
-    run(
-        &fx.repo,
-        &["worktree", "lock", fx.worktree.to_str().unwrap()],
-    );
-    let kept = complete_and_integrate(&fx.state, fx.task_id, confirmed)
-        .await
-        .unwrap();
+    run(&fx.repo, &["worktree", "lock", fx.worktree.to_str().unwrap()]);
+    let kept = complete_and_integrate(&fx.state, fx.task_id, confirmed).await.unwrap();
 
-    let (restarted, _) = crate::app_core::build_state_with_paths(fx.paths.clone())
-        .await
-        .expect("restart");
-    let reloaded = restarted
-        .task
-        .tasks
-        .read()
-        .await
-        .get(&fx.task_id)
-        .cloned()
-        .expect("the task is back");
+    let (restarted, _) = crate::app_core::build_state_with_paths(fx.paths.clone()).await.expect("restart");
+    let reloaded = restarted.task.tasks.read().await.get(&fx.task_id).cloned().expect("the task is back");
     assert_eq!(reloaded.status, TaskStatus::HumanReview);
     assert_eq!(reloaded.local_integration, kept.local_integration);
     assert_eq!((integrations(&reloaded), completions(&reloaded)), (1, 0));
@@ -1289,8 +932,7 @@ async fn an_integration_waiting_for_its_completion_survives_a_restart_unchanged(
 // ---- Remotes ----
 
 #[tokio::test]
-async fn a_project_with_a_github_remote_integrates_locally_when_that_is_chosen_and_pushes_nothing()
-{
+async fn a_project_with_a_github_remote_integrates_locally_when_that_is_chosen_and_pushes_nothing() {
     let fx = fixture_with(true, Some("https://github.com/example/never-contacted.git")).await;
     let p = shown(&fx).await;
     assert_eq!(p.state, PreviewState::Ready);
@@ -1298,48 +940,25 @@ async fn a_project_with_a_github_remote_integrates_locally_when_that_is_chosen_a
 
     // A PR remains the default delivery; this is the explicit local choice,
     // and completing locally without it is still refused.
-    let default_refusal = human_review::complete_locally(&fx.state, fx.task_id, false)
-        .await
-        .expect_err("PR is the default");
+    let default_refusal = human_review::complete_locally(&fx.state, fx.task_id, false).await.expect_err("PR is the default");
     assert!(default_refusal.contains("Create PR"), "{default_refusal}");
 
-    let done = complete_and_integrate(&fx.state, fx.task_id, confirmation(&p))
-        .await
-        .expect("completed");
+    let done = complete_and_integrate(&fx.state, fx.task_id, confirmation(&p)).await.expect("completed");
     assert_done_and_integrated(&fx, &done, IntegrationStrategy::FastForward);
-    assert!(
-        !ref_exists(&fx.repo, "refs/remotes/origin/task-one"),
-        "no branch was pushed"
-    );
-    assert!(
-        !ref_exists(&fx.repo, "refs/remotes/origin/main"),
-        "nothing was fetched or pushed"
-    );
-    assert_eq!(
-        run(&fx.repo, &["remote", "get-url", "origin"]),
-        "https://github.com/example/never-contacted.git"
-    );
+    assert!(!ref_exists(&fx.repo, "refs/remotes/origin/task-one"), "no branch was pushed");
+    assert!(!ref_exists(&fx.repo, "refs/remotes/origin/main"), "nothing was fetched or pushed");
+    assert_eq!(run(&fx.repo, &["remote", "get-url", "origin"]), "https://github.com/example/never-contacted.git");
 }
 
 #[tokio::test]
 async fn work_that_reached_a_local_branch_is_not_also_offered_as_a_pull_request() {
     let fx = fixture_with(true, Some("https://github.com/example/never-contacted.git")).await;
     let confirmed = confirmation(&shown(&fx).await);
-    run(
-        &fx.repo,
-        &["worktree", "lock", fx.worktree.to_str().unwrap()],
-    );
-    complete_and_integrate(&fx.state, fx.task_id, confirmed)
-        .await
-        .expect("integrated");
+    run(&fx.repo, &["worktree", "lock", fx.worktree.to_str().unwrap()]);
+    complete_and_integrate(&fx.state, fx.task_id, confirmed).await.expect("integrated");
 
-    let refused = crate::commands::pr::create_pr_for_approved_task(&fx.state, fx.task_id)
-        .await
-        .expect_err("one delivery");
-    assert!(
-        refused.contains("integrated into a local branch"),
-        "{refused}"
-    );
+    let refused = crate::commands::pr::create_pr_for_approved_task(&fx.state, fx.task_id).await.expect_err("one delivery");
+    assert!(refused.contains("integrated into a local branch"), "{refused}");
     assert!(current(&fx).await.pr_url.is_none());
 }
 
@@ -1351,29 +970,19 @@ async fn work_that_reached_a_local_branch_is_not_also_offered_as_a_pull_request(
 async fn the_integrated_work_is_in_the_base_a_dependent_task_starts_from() {
     let fx = fixture().await;
     let confirmed = confirmation(&shown(&fx).await);
-    let done = complete_and_integrate(&fx.state, fx.task_id, confirmed)
-        .await
-        .unwrap();
+    let done = complete_and_integrate(&fx.state, fx.task_id, confirmed).await.unwrap();
 
     let record = done.local_integration.clone().unwrap();
     let integrated = record.state == IntegrationState::Integrated;
     assert!(
-        done.completed_locally()
-            && integrated
-            && done.human_review.approved_tip() == Some(record.approved_tip.as_str()),
+        done.completed_locally() && integrated && done.human_review.approved_tip() == Some(record.approved_tip.as_str()),
         "the facts a dependent Task's start reads"
     );
     let base = crate::worktree::resolve_default_base(
         fx.repo.to_str().unwrap(),
-        Some(&crate::domain::project::ProjectBase::LocalBranch {
-            branch: "main".into(),
-        }),
+        Some(&crate::domain::project::ProjectBase::LocalBranch { branch: "main".into() }),
     )
     .await
     .expect("the base resolves");
-    assert!(
-        crate::worktree::restack::is_ancestor(&fx.repo, &record.approved_tip, &base.commit)
-            .await
-            .unwrap()
-    );
+    assert!(crate::worktree::restack::is_ancestor(&fx.repo, &record.approved_tip, &base.commit).await.unwrap());
 }

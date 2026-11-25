@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: MPL-2.0
-use crate::agents::runner::{ClaudeRunConfig, ClaudeRunner, ToolAccess};
 use crate::commands::gui_admission::GuiMutation;
+use crate::agents::runner::{ClaudeRunConfig, ClaudeRunner, ToolAccess};
+use crate::domain::conversation::{
+    ActionStatus, Conversation, CoordinatorOutput, EntryKind, Role,
+};
 use crate::conversation_actions::{self, Decision};
 use crate::conversation_context::{
-    build_coordinator_context, ContextBudget, ContextError, ContextRequest, ContextSite,
-    ReturnedAction, TurnInput,
+    build_coordinator_context, ContextBudget, ContextError, ContextRequest, ContextSite, ReturnedAction, TurnInput,
 };
 use crate::conversation_executions::{self, ExecutionView};
-use crate::domain::conversation::{ActionStatus, Conversation, CoordinatorOutput, EntryKind, Role};
 use crate::domain::AgentStatus;
 use crate::AppState;
 use serde::{Deserialize, Serialize};
@@ -52,25 +53,15 @@ fn fixed_invocation_chars(site: ContextSite) -> usize {
 /// The per-invocation limits `drive` enforces, and the fixed size the Builder
 /// budgets around. The prompt envelope is part of the measured prompt, so only
 /// the system prompt and the output schema are counted outside it.
-fn invocation_limits(
-    site: ContextSite,
-    budget: ContextBudget,
-) -> (crate::coordinator_reads::PromptLimits, usize) {
+fn invocation_limits(site: ContextSite, budget: ContextBudget) -> (crate::coordinator_reads::PromptLimits, usize) {
     let fixed = fixed_invocation_chars(site);
     let system = match site {
         ContextSite::Ordinary => COORDINATOR_SYSTEM_PROMPT,
         ContextSite::Continuation => FOLLOW_UP_SYSTEM_PROMPT,
     };
-    let other = system.chars().count()
-        + crate::domain::conversation::coordinator_output_schema()
-            .to_string()
-            .chars()
-            .count();
+    let other = system.chars().count() + crate::domain::conversation::coordinator_output_schema().to_string().chars().count();
     (
-        crate::coordinator_reads::PromptLimits {
-            max_chars: budget.total_chars,
-            other_fixed_chars: other,
-        },
+        crate::coordinator_reads::PromptLimits { max_chars: budget.total_chars, other_fixed_chars: other },
         fixed,
     )
 }
@@ -172,9 +163,7 @@ fn preserve_saved_conversation(
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanAction {
-    Approve {
-        request: Option<String>,
-    },
+    Approve { request: Option<String> },
     Reject,
     /// Withdraws the Human's approval of a retired direct delegation that has
     /// not started. Nothing is executed and the Task is not changed.
@@ -219,14 +208,7 @@ async fn task_executions(state: &AppState, conversation: &Conversation) -> Vec<E
     // `None` when the executor is not installed yet: liveness is then unknown,
     // and no run is reported as running.
     let live: Option<HashSet<Uuid>> = match state.executor.get() {
-        Some(executor) => Some(
-            executor
-                .live_runs()
-                .await
-                .into_iter()
-                .map(|run| run.task_id)
-                .collect(),
-        ),
+        Some(executor) => Some(executor.live_runs().await.into_iter().map(|run| run.task_id).collect()),
         None => None,
     };
     let tasks = state.task.tasks.read().await;
@@ -434,7 +416,8 @@ pub async fn retry_project_conversation_continuation(
         return Err("This Worker result is no longer awaiting Coordinator mediation".into());
     }
     let saved = conversation.clone();
-    let result = continue_from_worker_result(&state, project_id, action_id, conversation).await;
+    let result =
+        continue_from_worker_result(&state, project_id, action_id, conversation).await;
     let (conversation, continuation_error) = preserve_saved_conversation(saved, result)?;
     Ok(snapshot(&state, conversation, continuation_error).await)
 }
@@ -514,10 +497,7 @@ async fn answer_human_message(
         conversation: prior_history,
         project_name: &project.name,
         project_root: root.as_deref(),
-        turn: TurnInput::Ordinary {
-            message,
-            tasks: &task_index,
-        },
+        turn: TurnInput::Ordinary { message, tasks: &task_index },
         budget,
         fixed_chars,
         read_reserve_chars: crate::coordinator_reads::read_reserve_chars(budget.per_read_cap_chars),
@@ -536,37 +516,13 @@ async fn answer_human_message(
         Some(executor) => executor.clone(),
         None => return record_failed_turn(state, project_id, "Task executor is not ready").await,
     };
-    let answer = coordinator_turn(
-        state,
-        &executor,
-        prior_history.id,
-        project_id,
-        &prompt,
-        limits,
-        |prompt| ClaudeRunConfig {
-            prompt,
-            working_dir: working_directory.path.clone(),
-            tools: ToolAccess::ReadOnly,
-            max_turns: Some(4),
-            max_budget_usd: None,
-            session_id: None,
-            resume_session: None,
-            model: Some(
-                project
-                    .agent_config
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| "sonnet".into()),
-            ),
-            system_prompt: Some(COORDINATOR_SYSTEM_PROMPT.into()),
-            append_system_prompt: None,
-            disable_mcp: true,
-            additional_dirs: vec![],
-            isolate_customizations: false,
-            json_schema: Some(crate::domain::conversation::coordinator_output_schema()),
-        },
-    )
-    .await;
+    let answer = coordinator_turn(state, &executor, prior_history.id, project_id, &prompt, limits, |prompt| ClaudeRunConfig {
+        prompt, working_dir: working_directory.path.clone(), tools: ToolAccess::ReadOnly, max_turns: Some(4), max_budget_usd: None,
+        session_id: None, resume_session: None, model: Some(project.agent_config.model.clone().unwrap_or_else(|| "sonnet".into())),
+        system_prompt: Some(COORDINATOR_SYSTEM_PROMPT.into()),
+        append_system_prompt: None, disable_mcp: true, additional_dirs: vec![], isolate_customizations: false,
+        json_schema: Some(crate::domain::conversation::coordinator_output_schema()),
+    }).await;
     let (output, run_lease) = match answer {
         Ok(answer) => answer,
         Err(reason) => return record_failed_turn(state, project_id, &reason).await,
@@ -609,11 +565,13 @@ async fn record_coordinator_output(
             record_retired_delegation(conversation);
             Ok(())
         }
-        output @ (CoordinatorOutput::CreateTask { .. }
-        | CoordinatorOutput::EditTask { .. }
-        | CoordinatorOutput::MoveTask { .. }
-        | CoordinatorOutput::EnqueueTask { .. }
-        | CoordinatorOutput::ExecuteRequest { .. }) => {
+        output @ (
+            CoordinatorOutput::CreateTask { .. }
+            | CoordinatorOutput::EditTask { .. }
+            | CoordinatorOutput::MoveTask { .. }
+            | CoordinatorOutput::EnqueueTask { .. }
+            | CoordinatorOutput::ExecuteRequest { .. }
+        ) => {
             // A checkout that cannot be inspected is a transient failure, so it ends the
             // turn as a retryable failure. Only a refused proposal is a refusal.
             let checkout = proposal_checkout(state, project_id, &output).await?;
@@ -635,11 +593,7 @@ async fn record_coordinator_output(
 /// is durable at failure time and retryable. It names the reason and does not
 /// repeat the message. A failure to save it is reported with the run failure, so
 /// the caller can tell that the run failed and that the failure was not kept.
-async fn record_failed_turn(
-    state: &AppState,
-    project_id: Uuid,
-    reason: &str,
-) -> Result<Snapshot, String> {
+async fn record_failed_turn(state: &AppState, project_id: Uuid, reason: &str) -> Result<Snapshot, String> {
     record_turn_failure(state, project_id, coordinator_failure_message(reason), true).await
 }
 
@@ -647,22 +601,12 @@ async fn record_failed_turn(
 /// context budget. No provider ran, the message stays saved unchanged, and the
 /// failure is not retryable: asking again with the same message cannot succeed.
 /// A later, smaller message is answered on its own.
-async fn record_budget_failure(
-    state: &AppState,
-    project_id: Uuid,
-    error: &ContextError,
-) -> Result<Snapshot, String> {
-    let message =
-        format!("The Coordinator was not asked: {error} Your message is saved and unchanged.");
+async fn record_budget_failure(state: &AppState, project_id: Uuid, error: &ContextError) -> Result<Snapshot, String> {
+    let message = format!("The Coordinator was not asked: {error} Your message is saved and unchanged.");
     record_turn_failure(state, project_id, message, false).await
 }
 
-async fn record_turn_failure(
-    state: &AppState,
-    project_id: Uuid,
-    message: String,
-    retryable: bool,
-) -> Result<Snapshot, String> {
+async fn record_turn_failure(state: &AppState, project_id: Uuid, message: String, retryable: bool) -> Result<Snapshot, String> {
     let mut conversation = state
         .storage
         .load_primary_conversation(project_id)
@@ -823,8 +767,7 @@ async fn coordinator_turn(
         |output| async move {
             let facts = project_facts(state, project_id).await;
             let tasks = state.task.tasks.read().await;
-            crate::coordinator_reads::read(&output, project_id, &tasks, &state.pr_statuses, &facts)
-                .ok_or(output)
+            crate::coordinator_reads::read(&output, project_id, &tasks, &state.pr_statuses, &facts).ok_or(output)
         },
     )
     .await
@@ -833,21 +776,9 @@ async fn coordinator_turn(
 /// The Project facts `inspect_project` may report, copied out so no lock is
 /// held while the Coordinator runs. A Workspace the registry no longer knows
 /// is reported as absent.
-async fn project_facts(
-    state: &AppState,
-    project_id: Uuid,
-) -> crate::coordinator_reads::ProjectFacts {
-    let project = state
-        .project
-        .projects
-        .read()
-        .await
-        .get(&project_id)
-        .cloned();
-    let workspace = match project
-        .as_ref()
-        .and_then(|project| project.scope.workspace_id())
-    {
+async fn project_facts(state: &AppState, project_id: Uuid) -> crate::coordinator_reads::ProjectFacts {
+    let project = state.project.projects.read().await.get(&project_id).cloned();
+    let workspace = match project.as_ref().and_then(|project| project.scope.workspace_id()) {
         Some(id) => state
             .workspace
             .registry
@@ -858,10 +789,7 @@ async fn project_facts(
         None => None,
     };
     crate::coordinator_reads::ProjectFacts {
-        name: project
-            .as_ref()
-            .map(|project| project.name.clone())
-            .unwrap_or_default(),
+        name: project.as_ref().map(|project| project.name.clone()).unwrap_or_default(),
         workspace,
         base_branch: project.and_then(|project| project.base.map(|base| base.branch().to_owned())),
     }
@@ -889,9 +817,7 @@ async fn run_with_lease(
 ) -> (Result<String, String>, crate::queue::ProjectRunLease) {
     let mut cancel_rx = lease.cancel_receiver();
     let result = async {
-        if *cancel_rx.borrow() {
-            return Err("Run stopped".into());
-        }
+        if *cancel_rx.borrow() { return Err("Run stopped".into()); }
         let runner = ClaudeRunner::start_leased(config, None).await?;
         tokio::select! {
             result = runner.wait() => {
@@ -905,8 +831,7 @@ async fn run_with_lease(
                 Err("Run stopped".into())
             }
         }
-    }
-    .await;
+    }.await;
     (result, lease)
 }
 
@@ -1017,10 +942,7 @@ pub async fn act_on_project_conversation(
     // with a stale revision: the withdrawal already happened, and this one
     // records nothing. A lost response therefore cannot turn into an error.
     if matches!(action, HumanAction::Withdraw)
-        && conversation
-            .actions
-            .iter()
-            .any(|item| item.id == action_id && item.status == ActionStatus::Withdrawn)
+        && conversation.actions.iter().any(|item| item.id == action_id && item.status == ActionStatus::Withdrawn)
     {
         return Ok(snapshot(&state, conversation, None).await);
     }
@@ -1035,9 +957,7 @@ pub async fn act_on_project_conversation(
             }
             HumanAction::Reject => Decision::Reject,
             HumanAction::Withdraw => {
-                return Err(
-                    "Only an approval of a retired direct delegation can be withdrawn".into(),
-                );
+                return Err("Only an approval of a retired direct delegation can be withdrawn".into());
             }
         };
         let scope = conversation_actions::Scope {
@@ -1053,10 +973,7 @@ pub async fn act_on_project_conversation(
     }
     if matches!(action, HumanAction::Withdraw) {
         withdraw_legacy_approval(&mut conversation, action_id, |candidate| {
-            state
-                .storage
-                .save_conversation(candidate)
-                .map_err(|error| error.to_string())
+            state.storage.save_conversation(candidate).map_err(|error| error.to_string())
         })?;
         return Ok(snapshot(&state, conversation, None).await);
     }
@@ -1065,10 +982,7 @@ pub async fn act_on_project_conversation(
         .iter_mut()
         .find(|item| item.id == action_id)
         .ok_or("Action not found")?;
-    if !matches!(
-        action_record.status,
-        ActionStatus::Proposed | ActionStatus::Approved
-    ) {
+    if !matches!(action_record.status, ActionStatus::Proposed | ActionStatus::Approved) {
         return Err("Action is no longer awaiting approval or safe to start".into());
     }
     match action {
@@ -1118,9 +1032,7 @@ async fn proposal_checkout(
         return Ok(None);
     };
     if task.project_id != project_id
-        || (task.worktree_path.is_none()
-            && task.branch_name.is_none()
-            && task.worker_handoff.is_none())
+        || (task.worktree_path.is_none() && task.branch_name.is_none() && task.worker_handoff.is_none())
     {
         return Ok(None);
     }
@@ -1128,9 +1040,7 @@ async fn proposal_checkout(
         .await
         .remove(&project_id)
         .ok_or("This Project has no repository to inspect its Task Checkout in")?;
-    conversation_actions::inspect_existing_checkout(&repo_path, &task)
-        .await
-        .map(Some)
+    conversation_actions::inspect_existing_checkout(&repo_path, &task).await.map(Some)
 }
 
 /// What the Human sees when a historical approval would start a retired direct
@@ -1167,35 +1077,19 @@ where
             return Err("A proposal that was never approved is rejected, not withdrawn".into());
         }
         ActionStatus::Running => {
-            return Err(
-                "This Worker is running, so its approval cannot be withdrawn. Nothing was changed."
-                    .into(),
-            );
+            return Err("This Worker is running, so its approval cannot be withdrawn. Nothing was changed.".into());
         }
-        ActionStatus::Returned
-        | ActionStatus::Rejected
-        | ActionStatus::Interrupted
-        | ActionStatus::Failed => {
+        ActionStatus::Returned | ActionStatus::Rejected | ActionStatus::Interrupted | ActionStatus::Failed => {
             return Err("This action has no approval to withdraw in its current state".into());
         }
     }
     let mut candidate = conversation.clone();
     let revision = candidate.revision;
-    let Some(action) = candidate
-        .actions
-        .iter_mut()
-        .find(|action| action.id == action_id)
-    else {
+    let Some(action) = candidate.actions.iter_mut().find(|action| action.id == action_id) else {
         return Err("Action not found".into());
     };
     action.status = ActionStatus::Withdrawn;
-    candidate.push(
-        Role::Human,
-        EntryKind::ActionWithdrawn {
-            action_id,
-            revision,
-        },
-    );
+    candidate.push(Role::Human, EntryKind::ActionWithdrawn { action_id, revision });
     save(&candidate)?;
     *conversation = candidate;
     Ok(true)
@@ -1245,9 +1139,7 @@ fn record_proposal_or_refusal(
             Role::Coordinator,
             EntryKind::RunFailed {
                 role: Role::Coordinator,
-                message: format!(
-                    "The Coordinator's proposal was refused and nothing was recorded: {reason}"
-                ),
+                message: format!("The Coordinator's proposal was refused and nothing was recorded: {reason}"),
                 retryable: false,
             },
         );
@@ -1320,47 +1212,25 @@ async fn continue_from_worker_result(
         .get()
         .ok_or("Task executor is not ready")?
         .clone();
-    let (output, run_lease) = coordinator_turn(
-        state,
-        &executor,
-        conversation.id,
-        project_id,
-        &prompt,
-        limits,
-        |prompt| ClaudeRunConfig {
-            prompt,
-            working_dir: working_directory.path.clone(),
-            tools: ToolAccess::ReadOnly,
-            max_turns: Some(4),
-            max_budget_usd: None,
-            session_id: None,
-            resume_session: None,
-            model: Some(
-                project
-                    .agent_config
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| "sonnet".into()),
-            ),
-            system_prompt: Some(FOLLOW_UP_SYSTEM_PROMPT.into()),
-            append_system_prompt: None,
-            disable_mcp: true,
-            additional_dirs: vec![],
-            isolate_customizations: false,
-            json_schema: Some(crate::domain::conversation::coordinator_output_schema()),
-        },
-    )
-    .await?;
+    let (output, run_lease) = coordinator_turn(state, &executor, conversation.id, project_id, &prompt, limits, |prompt| ClaudeRunConfig {
+        prompt, working_dir: working_directory.path.clone(), tools: ToolAccess::ReadOnly, max_turns: Some(4), max_budget_usd: None,
+        session_id: None, resume_session: None, model: Some(project.agent_config.model.clone().unwrap_or_else(|| "sonnet".into())),
+        system_prompt: Some(FOLLOW_UP_SYSTEM_PROMPT.into()),
+        append_system_prompt: None, disable_mcp: true, additional_dirs: vec![], isolate_customizations: false,
+        json_schema: Some(crate::domain::conversation::coordinator_output_schema()),
+    }).await?;
     match output {
         CoordinatorOutput::Reply { text } => {
             conversation.push(Role::Coordinator, EntryKind::CoordinatorReply { text })
         }
         CoordinatorOutput::DelegateToTask { .. } => record_retired_delegation(&mut conversation),
-        output @ (CoordinatorOutput::CreateTask { .. }
-        | CoordinatorOutput::EditTask { .. }
-        | CoordinatorOutput::MoveTask { .. }
-        | CoordinatorOutput::EnqueueTask { .. }
-        | CoordinatorOutput::ExecuteRequest { .. }) => {
+        output @ (
+            CoordinatorOutput::CreateTask { .. }
+            | CoordinatorOutput::EditTask { .. }
+            | CoordinatorOutput::MoveTask { .. }
+            | CoordinatorOutput::EnqueueTask { .. }
+            | CoordinatorOutput::ExecuteRequest { .. }
+        ) => {
             let checkout = proposal_checkout(state, project_id, &output).await;
             let tasks = state.task.tasks.read().await;
             record_proposal_or_refusal(&mut conversation, project_id, output, &tasks, checkout);
@@ -1391,8 +1261,8 @@ async fn continue_from_worker_result(
 #[cfg(test)]
 mod tests {
     use super::{
-        can_reject, preserve_saved_conversation, project_after_lock, record_proposal_or_refusal,
-        record_retired_delegation, ContinuationError,
+        can_reject, preserve_saved_conversation, project_after_lock,
+        record_proposal_or_refusal, record_retired_delegation, ContinuationError,
     };
     use crate::domain::conversation::{ActionStatus, Conversation, EntryKind, Role, TaskAction};
     use uuid::Uuid;
@@ -1412,9 +1282,7 @@ mod tests {
     fn project_action_cards_send_the_wire_shapes_the_command_accepts() {
         use super::HumanAction;
         assert!(matches!(
-            serde_json::from_value::<HumanAction>(
-                serde_json::json!({"action":"approve","request":null})
-            ),
+            serde_json::from_value::<HumanAction>(serde_json::json!({"action":"approve","request":null})),
             Ok(HumanAction::Approve { request: None })
         ));
         assert!(matches!(
@@ -1431,11 +1299,7 @@ mod tests {
     fn coordinator_prompts_do_not_advertise_direct_delegation() {
         // Both Coordinator paths render OUTPUT_SCHEMAS; the follow-up system prompt
         // is separate, so it is checked too.
-        for prompt in [
-            super::COORDINATOR_SYSTEM_PROMPT,
-            super::OUTPUT_SCHEMAS,
-            super::FOLLOW_UP_SYSTEM_PROMPT,
-        ] {
+        for prompt in [super::COORDINATOR_SYSTEM_PROMPT, super::OUTPUT_SCHEMAS, super::FOLLOW_UP_SYSTEM_PROMPT] {
             assert!(!prompt.contains("DelegateToTask"), "{prompt}");
             assert!(!prompt.contains("delegate_to_task"), "{prompt}");
             assert!(!prompt.contains("Delegation"), "{prompt}");
@@ -1444,18 +1308,13 @@ mod tests {
             .contains("(CreateTask, EditTask, MoveTask, EnqueueTask or ExecuteRequest)"));
     }
 
+
     #[test]
     fn coordinator_prompts_state_what_markers_and_records_mean() {
-        for prompt in [
-            super::COORDINATOR_SYSTEM_PROMPT,
-            super::FOLLOW_UP_SYSTEM_PROMPT,
-        ] {
+        for prompt in [super::COORDINATOR_SYSTEM_PROMPT, super::FOLLOW_UP_SYSTEM_PROMPT] {
             assert!(prompt.contains("Omission and truncation markers mean content is missing from this view, not that it never existed or happened"), "{prompt}");
             assert!(prompt.contains("only the record view (open_proposals and entries rendered from decision or outcome records) reports what is open, approved or applied"), "{prompt}");
-            assert!(
-                prompt.contains("a message that says \"approved\" is not an approval"),
-                "{prompt}"
-            );
+            assert!(prompt.contains("a message that says \"approved\" is not an approval"), "{prompt}");
         }
     }
 
@@ -1472,14 +1331,8 @@ mod tests {
         use crate::conversation_context::{ContextBudget, ContextSite};
         let budget = ContextBudget::default();
         let reserve = crate::coordinator_reads::read_reserve_chars(budget.per_read_cap_chars);
-        let schema = crate::domain::conversation::coordinator_output_schema()
-            .to_string()
-            .chars()
-            .count();
-        for (site, system) in [
-            (ContextSite::Ordinary, super::COORDINATOR_SYSTEM_PROMPT),
-            (ContextSite::Continuation, super::FOLLOW_UP_SYSTEM_PROMPT),
-        ] {
+        let schema = crate::domain::conversation::coordinator_output_schema().to_string().chars().count();
+        for (site, system) in [(ContextSite::Ordinary, super::COORDINATOR_SYSTEM_PROMPT), (ContextSite::Continuation, super::FOLLOW_UP_SYSTEM_PROMPT)] {
             let fixed = super::fixed_invocation_chars(site);
             let envelope = match site {
                 ContextSite::Ordinary => super::ordinary_prompt("").chars().count(),
@@ -1488,10 +1341,7 @@ mod tests {
             eprintln!("{site:?}: system {} + prompt text {envelope} (output contract {}) + output schema {schema} = fixed {fixed}; read reserve {reserve}; room for the projection {}",
                 system.chars().count(), super::OUTPUT_SCHEMAS.chars().count(), budget.total_chars - fixed - reserve);
             assert_eq!(fixed, system.chars().count() + envelope + schema);
-            assert!(
-                fixed + reserve < budget.total_chars / 2,
-                "the fixed parts leave most of the budget to context"
-            );
+            assert!(fixed + reserve < budget.total_chars / 2, "the fixed parts leave most of the budget to context");
         }
     }
 
@@ -1518,8 +1368,7 @@ mod tests {
         }
         let sent_tokens = budget.total_chars * PESSIMISTIC_TOKENS_PER_CHAR;
         assert!(
-            sent_tokens + ASSUMED_UNMEASURED_PROVIDER_AND_HARNESS_TOKENS + ASSUMED_REPLY_TOKENS
-                <= ASSUMED_SMALLEST_WINDOW_TOKENS,
+            sent_tokens + ASSUMED_UNMEASURED_PROVIDER_AND_HARNESS_TOKENS + ASSUMED_REPLY_TOKENS <= ASSUMED_SMALLEST_WINDOW_TOKENS,
             "estimate only: {sent_tokens} budget tokens plus assumed overhead"
         );
     }
@@ -1544,17 +1393,10 @@ mod tests {
         record_retired_delegation(&mut conversation);
 
         assert!(conversation.actions.is_empty(), "no TaskAction is created");
-        assert!(
-            conversation.project_actions.is_empty(),
-            "no proposal is recorded"
-        );
+        assert!(conversation.project_actions.is_empty(), "no proposal is recorded");
         assert_eq!(conversation.revision, revision + 1);
         match &conversation.entries.last().unwrap().kind {
-            EntryKind::RunFailed {
-                role: Role::Coordinator,
-                message,
-                ..
-            } => {
+            EntryKind::RunFailed { role: Role::Coordinator, message, .. } => {
                 assert!(message.contains("retired"), "{message}");
                 assert!(message.len() <= 600, "bounded: {}", message.len());
                 assert!(!message.contains("do it") && !message.contains("change a.txt"));
@@ -1566,10 +1408,8 @@ mod tests {
 
     #[test]
     fn coordinator_instructions_scope_a_rejection_to_its_proposal() {
-        assert!(super::COORDINATOR_SYSTEM_PROMPT
-            .contains("applies only to the one proposal it answers"));
-        assert!(super::COORDINATOR_SYSTEM_PROMPT
-            .contains("treat it as a new request and propose it again"));
+        assert!(super::COORDINATOR_SYSTEM_PROMPT.contains("applies only to the one proposal it answers"));
+        assert!(super::COORDINATOR_SYSTEM_PROMPT.contains("treat it as a new request and propose it again"));
         assert!(super::COORDINATOR_SYSTEM_PROMPT.contains("Never start work"));
     }
 
@@ -1577,15 +1417,10 @@ mod tests {
     fn execute_request_instructions_describe_both_eligible_checkout_states() {
         // Both the ordinary and the Worker-result follow-up prompts format this
         // constant, so one check covers each.
-        assert!(
-            super::OUTPUT_SCHEMAS.contains("a Backlog Task qualifies when it has no Task Checkout")
-        );
-        assert!(super::OUTPUT_SCHEMAS
-            .contains("its own existing Task Checkout that SlashIt inspects and finds eligible"));
-        assert!(super::OUTPUT_SCHEMAS
-            .contains("do not assume a checkout is safe merely because it exists"));
-        assert!(super::OUTPUT_SCHEMAS
-            .contains("approval queues the Task and does not start the Worker"));
+        assert!(super::OUTPUT_SCHEMAS.contains("a Backlog Task qualifies when it has no Task Checkout"));
+        assert!(super::OUTPUT_SCHEMAS.contains("its own existing Task Checkout that SlashIt inspects and finds eligible"));
+        assert!(super::OUTPUT_SCHEMAS.contains("do not assume a checkout is safe merely because it exists"));
+        assert!(super::OUTPUT_SCHEMAS.contains("approval queues the Task and does not start the Worker"));
     }
 
     #[test]
@@ -1649,11 +1484,7 @@ mod tests {
     }
 
     fn refusals(conversation: &Conversation) -> usize {
-        conversation
-            .entries
-            .iter()
-            .filter(|e| matches!(e.kind, EntryKind::RunFailed { .. }))
-            .count()
+        conversation.entries.iter().filter(|e| matches!(e.kind, EntryKind::RunFailed { .. })).count()
     }
 
     #[test]
@@ -1663,35 +1494,15 @@ mod tests {
         let backlog = board_task(project_id, TaskStatus::Backlog);
         let running = board_task(project_id, TaskStatus::InProgress);
         let foreign = board_task(Uuid::new_v4(), TaskStatus::Queue);
-        let tasks: std::collections::HashMap<_, _> = [&backlog, &running, &foreign]
-            .iter()
-            .map(|t| (t.id, (*t).clone()))
-            .collect();
+        let tasks: std::collections::HashMap<_, _> =
+            [&backlog, &running, &foreign].iter().map(|t| (t.id, (*t).clone())).collect();
         let proposals = [
-            format!(
-                r#"{{"type":"move_task","text":"x","target_task_id":"{}","to":"backlog"}}"#,
-                backlog.id
-            ),
-            format!(
-                r#"{{"type":"move_task","text":"x","target_task_id":"{}","to":"backlog"}}"#,
-                running.id
-            ),
-            format!(
-                r#"{{"type":"move_task","text":"x","target_task_id":"{}","to":"backlog"}}"#,
-                foreign.id
-            ),
-            format!(
-                r#"{{"type":"move_task","text":"x","target_task_id":"{}","to":"backlog"}}"#,
-                Uuid::new_v4()
-            ),
-            format!(
-                r#"{{"type":"edit_task","text":"x","target_task_id":"{}","title":"Task"}}"#,
-                backlog.id
-            ),
-            format!(
-                r#"{{"type":"edit_task","text":"x","target_task_id":"{}","title":"t"}}"#,
-                foreign.id
-            ),
+            format!(r#"{{"type":"move_task","text":"x","target_task_id":"{}","to":"backlog"}}"#, backlog.id),
+            format!(r#"{{"type":"move_task","text":"x","target_task_id":"{}","to":"backlog"}}"#, running.id),
+            format!(r#"{{"type":"move_task","text":"x","target_task_id":"{}","to":"backlog"}}"#, foreign.id),
+            format!(r#"{{"type":"move_task","text":"x","target_task_id":"{}","to":"backlog"}}"#, Uuid::new_v4()),
+            format!(r#"{{"type":"edit_task","text":"x","target_task_id":"{}","title":"Task"}}"#, backlog.id),
+            format!(r#"{{"type":"edit_task","text":"x","target_task_id":"{}","title":"t"}}"#, foreign.id),
         ];
         for json in proposals {
             let mut conversation = Conversation::new(project_id);
@@ -1701,11 +1512,7 @@ mod tests {
             assert!(conversation.actions.is_empty(), "{json}");
             assert_eq!(refusals(&conversation), 1, "{json}");
         }
-        assert_eq!(
-            tasks[&running.id].status,
-            TaskStatus::InProgress,
-            "no Task is touched"
-        );
+        assert_eq!(tasks[&running.id].status, TaskStatus::InProgress, "no Task is touched");
     }
 
     #[test]
@@ -1714,25 +1521,13 @@ mod tests {
         let project_id = Uuid::new_v4();
         let queued = board_task(project_id, TaskStatus::Queue);
         let tasks = std::collections::HashMap::from([(queued.id, queued.clone())]);
-        let json = format!(
-            r#"{{"type":"move_task","text":"x","target_task_id":"{}","to":"backlog"}}"#,
-            queued.id
-        );
+        let json = format!(r#"{{"type":"move_task","text":"x","target_task_id":"{}","to":"backlog"}}"#, queued.id);
         let mut conversation = Conversation::new(project_id);
 
-        record_proposal_or_refusal(
-            &mut conversation,
-            project_id,
-            Conversation::parse_output(&json).unwrap(),
-            &tasks,
-            Ok(None),
-        );
+        record_proposal_or_refusal(&mut conversation, project_id, Conversation::parse_output(&json).unwrap(), &tasks, Ok(None));
 
         assert_eq!(conversation.project_actions.len(), 1);
-        assert_eq!(
-            conversation.project_actions[0].status,
-            crate::domain::conversation::ProjectActionStatus::Proposed
-        );
+        assert_eq!(conversation.project_actions[0].status, crate::domain::conversation::ProjectActionStatus::Proposed);
         assert_eq!(refusals(&conversation), 0);
     }
 
@@ -1742,47 +1537,25 @@ mod tests {
         let project_id = Uuid::new_v4();
         let queued = board_task(project_id, TaskStatus::Queue);
         let tasks = std::collections::HashMap::from([(queued.id, queued.clone())]);
-        let json = format!(
-            r#"{{"type":"move_task","text":"x","target_task_id":"{}","to":"backlog"}}"#,
-            queued.id
-        );
+        let json = format!(r#"{{"type":"move_task","text":"x","target_task_id":"{}","to":"backlog"}}"#, queued.id);
         let saved = Conversation::new(project_id);
 
         // First attempt records in memory, then the save fails: the caller
         // keeps the saved Conversation, which carries neither the proposal nor
         // the reply mark, so the follow-up stays retryable.
         let mut attempt = saved.clone();
-        record_proposal_or_refusal(
-            &mut attempt,
-            project_id,
-            Conversation::parse_output(&json).unwrap(),
-            &tasks,
-            Ok(None),
-        );
+        record_proposal_or_refusal(&mut attempt, project_id, Conversation::parse_output(&json).unwrap(), &tasks, Ok(None));
         assert_eq!(attempt.project_actions.len(), 1);
         assert!(preserve_saved_conversation(
             saved.clone(),
             Err(ContinuationError::Persistence("disk write failed".into())),
         )
         .is_err());
-        assert!(
-            saved.project_actions.is_empty(),
-            "a failed save publishes nothing"
-        );
+        assert!(saved.project_actions.is_empty(), "a failed save publishes nothing");
 
         let mut retry = saved;
-        record_proposal_or_refusal(
-            &mut retry,
-            project_id,
-            Conversation::parse_output(&json).unwrap(),
-            &tasks,
-            Ok(None),
-        );
-        assert_eq!(
-            retry.project_actions.len(),
-            1,
-            "exactly one proposal after the retry"
-        );
+        record_proposal_or_refusal(&mut retry, project_id, Conversation::parse_output(&json).unwrap(), &tasks, Ok(None));
+        assert_eq!(retry.project_actions.len(), 1, "exactly one proposal after the retry");
     }
 
     fn legacy_action(status: ActionStatus) -> TaskAction {
@@ -1826,29 +1599,15 @@ mod tests {
 
         let (result, conversation) = withdraw(ActionStatus::Withdrawn);
         assert_eq!(result, Ok(false), "a withdrawn action is already final");
-        assert!(
-            conversation.entries.is_empty(),
-            "a repeated withdrawal records nothing"
-        );
+        assert!(conversation.entries.is_empty(), "a repeated withdrawal records nothing");
         let (result, _) = withdraw(ActionStatus::Proposed);
         assert!(result.unwrap_err().contains("rejected, not withdrawn"));
         let (result, _) = withdraw(ActionStatus::Running);
         assert!(result.unwrap_err().contains("running"));
-        for status in [
-            ActionStatus::Returned,
-            ActionStatus::Rejected,
-            ActionStatus::Interrupted,
-            ActionStatus::Failed,
-        ] {
+        for status in [ActionStatus::Returned, ActionStatus::Rejected, ActionStatus::Interrupted, ActionStatus::Failed] {
             let (result, conversation) = withdraw(status);
-            assert!(
-                result.unwrap_err().contains("no approval to withdraw"),
-                "{status:?}"
-            );
-            assert!(
-                conversation.entries.is_empty(),
-                "{status:?} changes nothing"
-            );
+            assert!(result.unwrap_err().contains("no approval to withdraw"), "{status:?}");
+            assert!(conversation.entries.is_empty(), "{status:?} changes nothing");
         }
         assert_eq!(saved, 1, "only the one real withdrawal was saved");
     }
@@ -1866,16 +1625,9 @@ mod tests {
         });
 
         assert_eq!(result, Err("disk write failed".into()));
-        assert_eq!(
-            conversation.actions[0].status,
-            ActionStatus::Approved,
-            "still the approval"
-        );
+        assert_eq!(conversation.actions[0].status, ActionStatus::Approved, "still the approval");
         assert_eq!(conversation.revision, revision);
-        assert!(
-            conversation.entries.is_empty(),
-            "no withdrawal entry was committed"
-        );
+        assert!(conversation.entries.is_empty(), "no withdrawal entry was committed");
     }
 
     #[test]
@@ -1894,7 +1646,7 @@ mod tests {
         use super::*;
         use crate::commands::gui_admission::GuiMutation;
         use crate::domain::task::{WorkerHandoff, WorkerHandoffStage};
-        use crate::domain::{Repository, TaskStatus};
+        use crate::domain::{TaskStatus, Repository};
         use tauri::Manager;
 
         fn git(dir: &std::path::Path, args: &[&str]) -> String {
@@ -1907,11 +1659,7 @@ mod tests {
                 .env("GIT_COMMITTER_EMAIL", "t@example.com")
                 .output()
                 .expect("git");
-            assert!(
-                out.status.success(),
-                "{args:?}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
+            assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         }
 
@@ -1925,9 +1673,7 @@ mod tests {
                 tmp.path().join("cache"),
                 tmp.path().join("runtime"),
             ));
-            let (state, _) = crate::app_core::build_state_with_paths(paths)
-                .await
-                .unwrap();
+            let (state, _) = crate::app_core::build_state_with_paths(paths).await.unwrap();
             let executor = crate::test_helpers::attach_test_executor(&state);
 
             let repo = tmp.path().join("repo");
@@ -1937,17 +1683,7 @@ mod tests {
             git(&repo, &["add", "."]);
             git(&repo, &["commit", "-q", "-m", "init"]);
             let checkout = tmp.path().join("checkout");
-            git(
-                &repo,
-                &[
-                    "worktree",
-                    "add",
-                    "-q",
-                    "-b",
-                    "task-branch",
-                    checkout.to_str().unwrap(),
-                ],
-            );
+            git(&repo, &["worktree", "add", "-q", "-b", "task-branch", checkout.to_str().unwrap()]);
             let head = git(&checkout, &["rev-parse", "HEAD"]);
 
             let repository_id = Uuid::new_v4();
@@ -2006,16 +1742,10 @@ mod tests {
             });
             let task_id = task.id;
             state.task.tasks.write().await.insert(task_id, task.clone());
-            state
-                .storage
-                .save_project_tasks(project_id, &[task.clone()])
-                .unwrap();
+            state.storage.save_project_tasks(project_id, &[task.clone()]).unwrap();
 
             // One action not yet decided, one the Human had already approved.
-            let mut conversation = state
-                .storage
-                .create_primary_conversation(project_id)
-                .unwrap();
+            let mut conversation = state.storage.create_primary_conversation(project_id).unwrap();
             let make = |status, approved: Option<&str>| TaskAction {
                 id: Uuid::new_v4(),
                 target_task_id: task_id,
@@ -2034,11 +1764,7 @@ mod tests {
             conversation.actions.push(proposed);
             conversation.actions.push(approved);
             state.storage.save_conversation(&conversation).unwrap();
-            let before = state
-                .storage
-                .load_primary_conversation(project_id)
-                .unwrap()
-                .unwrap();
+            let before = state.storage.load_primary_conversation(project_id).unwrap().unwrap();
 
             let app = tauri::test::mock_app();
             app.manage(state);
@@ -2063,42 +1789,17 @@ mod tests {
                 assert!(refusal.contains("retired"), "{refusal}");
             }
 
-            assert!(
-                fake.invocations().is_empty(),
-                "no provider was launched: {}",
-                fake.invocations()
-            );
-            assert_eq!(
-                git(&checkout, &["rev-parse", "HEAD"]),
-                head,
-                "HEAD did not move"
-            );
-            assert_eq!(
-                git(&checkout, &["status", "--porcelain"]),
-                "",
-                "checkout untouched"
-            );
-            assert_eq!(
-                git(&repo, &["rev-parse", "task-branch"]),
-                head,
-                "branch did not move"
-            );
+            assert!(fake.invocations().is_empty(), "no provider was launched: {}", fake.invocations());
+            assert_eq!(git(&checkout, &["rev-parse", "HEAD"]), head, "HEAD did not move");
+            assert_eq!(git(&checkout, &["status", "--porcelain"]), "", "checkout untouched");
+            assert_eq!(git(&repo, &["rev-parse", "task-branch"]), head, "branch did not move");
             assert!(!executor.is_task_running(task_id).await);
             let live: &crate::AppState = app.state::<crate::AppState>().inner();
-            let after = live
-                .storage
-                .load_primary_conversation(project_id)
-                .unwrap()
-                .unwrap();
+            let after = live.storage.load_primary_conversation(project_id).unwrap().unwrap();
             assert_eq!(after.revision, before.revision, "nothing was written");
-            let status_of =
-                |c: &Conversation, id| c.actions.iter().find(|a| a.id == id).unwrap().status;
+            let status_of = |c: &Conversation, id| c.actions.iter().find(|a| a.id == id).unwrap().status;
             assert_eq!(status_of(&after, proposed_id), ActionStatus::Proposed);
-            assert_eq!(
-                status_of(&after, approved_id),
-                ActionStatus::Approved,
-                "history preserved, not Running"
-            );
+            assert_eq!(status_of(&after, approved_id), ActionStatus::Approved, "history preserved, not Running");
             let kept = live.task.tasks.read().await[&task_id].clone();
             assert!(matches!(
                 kept.worker_handoff.as_ref().unwrap().stage,
@@ -2144,27 +1845,16 @@ mod tests {
             fixture_with_budget(tmp, result, mediated, Default::default()).await
         }
 
-        async fn fixture_with_budget(
-            tmp: tempfile::TempDir,
-            result: &str,
-            mediated: bool,
-            budget: crate::conversation_context::ContextBudget,
-        ) -> Fx {
+        async fn fixture_with_budget(tmp: tempfile::TempDir, result: &str, mediated: bool, budget: crate::conversation_context::ContextBudget) -> Fx {
             let log = tmp.path().join("provider-runs.log");
-            let fake = crate::test_helpers::FakeProgram::install(
-                "claude",
-                &coordinator_body(&log, result),
-            )
-            .await;
+            let fake = crate::test_helpers::FakeProgram::install("claude", &coordinator_body(&log, result)).await;
             let paths = std::sync::Arc::new(crate::config::paths::AppPaths::with_roots(
                 tmp.path().join("config"),
                 tmp.path().join("data"),
                 tmp.path().join("cache"),
                 tmp.path().join("runtime"),
             ));
-            let (mut state, _) = crate::app_core::build_state_with_paths(paths)
-                .await
-                .unwrap();
+            let (mut state, _) = crate::app_core::build_state_with_paths(paths).await.unwrap();
             state.conversation.context_budget = budget;
             crate::test_helpers::attach_test_executor(&state);
             let project_id = Uuid::new_v4();
@@ -2195,10 +1885,7 @@ mod tests {
             let target_task_id = task.id;
             state.task.tasks.write().await.insert(task.id, task);
             let returned = Uuid::new_v4();
-            let mut conversation = state
-                .storage
-                .create_primary_conversation(project_id)
-                .unwrap();
+            let mut conversation = state.storage.create_primary_conversation(project_id).unwrap();
             conversation.actions.push(TaskAction {
                 id: returned,
                 target_task_id,
@@ -2214,14 +1901,7 @@ mod tests {
             state.storage.save_conversation(&conversation).unwrap();
             let app = tauri::test::mock_app();
             app.manage(state);
-            Fx {
-                _tmp: tmp,
-                _fake: fake,
-                app,
-                log,
-                project_id,
-                returned,
-            }
+            Fx { _tmp: tmp, _fake: fake, app, log, project_id, returned }
         }
 
         impl Fx {
@@ -2230,17 +1910,12 @@ mod tests {
             }
 
             fn conversation(&self) -> Conversation {
-                self.state()
-                    .storage
-                    .load_primary_conversation(self.project_id)
-                    .unwrap()
-                    .unwrap()
+                self.state().storage.load_primary_conversation(self.project_id).unwrap().unwrap()
             }
 
             /// The prompt sent to provider run `run` (1-based).
             fn prompt(&self, run: usize) -> String {
-                std::fs::read_to_string(format!("{}.prompt.{run}", self.log.display()))
-                    .unwrap_or_default()
+                std::fs::read_to_string(format!("{}.prompt.{run}", self.log.display())).unwrap_or_default()
             }
 
             /// Provider runs so far. Each line is one run's working directory.
@@ -2284,15 +1959,8 @@ mod tests {
             .await
             .expect("the refusal is recorded, not returned as a failed send");
 
-            assert_eq!(
-                snapshot.conversation.actions.len(),
-                actions_before,
-                "no TaskAction was created"
-            );
-            assert!(
-                snapshot.conversation.project_actions.is_empty(),
-                "no proposal was recorded"
-            );
+            assert_eq!(snapshot.conversation.actions.len(), actions_before, "no TaskAction was created");
+            assert!(snapshot.conversation.project_actions.is_empty(), "no proposal was recorded");
             assert_eq!(Fx::refusals(&snapshot.conversation), 1);
             assert_eq!(fx.runs().len(), 1, "only the Coordinator ran");
             assert!(!snapshot.worker_live && !snapshot.coordinator_live);
@@ -2318,31 +1986,14 @@ mod tests {
             .await
             .expect("the mediation completes");
 
-            let returned = snapshot
-                .conversation
-                .actions
-                .iter()
-                .find(|a| a.id == fx.returned)
-                .unwrap();
+            let returned = snapshot.conversation.actions.iter().find(|a| a.id == fx.returned).unwrap();
             assert!(returned.coordinator_replied, "the saved result is mediated");
             assert_eq!(returned.status, ActionStatus::Returned);
-            assert_eq!(
-                returned.worker_result.as_deref(),
-                Some("fake Worker completed approved work"),
-                "the result is kept"
-            );
-            assert_eq!(
-                snapshot.conversation.actions.len(),
-                actions_before,
-                "no new TaskAction was created"
-            );
+            assert_eq!(returned.worker_result.as_deref(), Some("fake Worker completed approved work"), "the result is kept");
+            assert_eq!(snapshot.conversation.actions.len(), actions_before, "no new TaskAction was created");
             assert!(snapshot.conversation.project_actions.is_empty());
             assert_eq!(Fx::refusals(&snapshot.conversation), 1);
-            assert_eq!(
-                fx.runs().len(),
-                1,
-                "one Coordinator follow-up, and no Worker"
-            );
+            assert_eq!(fx.runs().len(), 1, "one Coordinator follow-up, and no Worker");
             assert!(!fx.conversation().has_unmediated_worker_result());
         }
 
@@ -2364,20 +2015,12 @@ mod tests {
             .await
             .expect("the mediation completes");
 
-            assert!(snapshot
-                .conversation
-                .actions
-                .iter()
-                .any(|a| a.id == fx.returned && a.coordinator_replied));
+            assert!(snapshot.conversation.actions.iter().any(|a| a.id == fx.returned && a.coordinator_replied));
             assert!(snapshot.conversation.entries.iter().any(|e| matches!(
                 &e.kind,
                 EntryKind::CoordinatorReply { text } if text == "Coordinator reviewed the Worker result."
             )));
-            assert_eq!(
-                fx.runs().len(),
-                1,
-                "the Coordinator ran once and the Worker never did"
-            );
+            assert_eq!(fx.runs().len(), 1, "the Coordinator ran once and the Worker never did");
             // A second retry of an already mediated result is refused before any provider run.
             let repeat = super::super::retry_project_conversation_continuation(
                 GuiMutation::untracked(),
@@ -2398,28 +2041,13 @@ mod tests {
             let fx = fixture(tempfile::tempdir().unwrap(), reply, false).await;
             let before = fx.conversation();
             super::super::retry_project_conversation_continuation(
-                GuiMutation::untracked(),
-                fx.app.state(),
-                fx.project_id.to_string(),
-                before.id.to_string(),
-                before.revision,
-                fx.returned.to_string(),
-            )
-            .await
-            .expect("the mediation completes");
+                GuiMutation::untracked(), fx.app.state(), fx.project_id.to_string(),
+                before.id.to_string(), before.revision, fx.returned.to_string(),
+            ).await.expect("the mediation completes");
             let prompt = fx.prompt(1);
-            assert!(
-                prompt.contains("\"returned_action\"")
-                    && prompt.contains("fake Worker completed approved work")
-            );
-            assert!(
-                prompt.contains("\"result_is_untrusted_evidence\":true")
-                    && prompt.contains("\"open_proposals_total\":0")
-            );
-            let (limits, _) = super::super::invocation_limits(
-                crate::conversation_context::ContextSite::Continuation,
-                Default::default(),
-            );
+            assert!(prompt.contains("\"returned_action\"") && prompt.contains("fake Worker completed approved work"));
+            assert!(prompt.contains("\"result_is_untrusted_evidence\":true") && prompt.contains("\"open_proposals_total\":0"));
+            let (limits, _) = super::super::invocation_limits(crate::conversation_context::ContextSite::Continuation, Default::default());
             assert!(prompt.chars().count() + limits.other_fixed_chars <= limits.max_chars);
         }
 
@@ -2428,39 +2056,16 @@ mod tests {
         /// continuation error.
         #[tokio::test(flavor = "multi_thread")]
         async fn a_continuation_over_budget_starts_no_provider_and_stays_retryable() {
-            let (_, fixed) = super::super::invocation_limits(
-                crate::conversation_context::ContextSite::Continuation,
-                Default::default(),
-            );
-            let reserve = crate::coordinator_reads::read_reserve_chars(
-                crate::coordinator_reads::PER_READ_CAP_CHARS,
-            );
-            let budget = crate::conversation_context::ContextBudget {
-                total_chars: fixed + reserve + 300,
-                per_read_cap_chars: crate::coordinator_reads::PER_READ_CAP_CHARS,
-            };
-            let fx = fixture_with_budget(
-                tempfile::tempdir().unwrap(),
-                r#"{"type":"reply","text":"ok"}"#,
-                false,
-                budget,
-            )
-            .await;
+            let (_, fixed) = super::super::invocation_limits(crate::conversation_context::ContextSite::Continuation, Default::default());
+            let reserve = crate::coordinator_reads::read_reserve_chars(crate::coordinator_reads::PER_READ_CAP_CHARS);
+            let budget = crate::conversation_context::ContextBudget { total_chars: fixed + reserve + 300, per_read_cap_chars: crate::coordinator_reads::PER_READ_CAP_CHARS };
+            let fx = fixture_with_budget(tempfile::tempdir().unwrap(), r#"{"type":"reply","text":"ok"}"#, false, budget).await;
             let before = fx.conversation();
             let snapshot = super::super::retry_project_conversation_continuation(
-                GuiMutation::untracked(),
-                fx.app.state(),
-                fx.project_id.to_string(),
-                before.id.to_string(),
-                before.revision,
-                fx.returned.to_string(),
-            )
-            .await
-            .expect("the continuation error is reported in the snapshot");
-            assert!(snapshot
-                .continuation_error
-                .as_deref()
-                .is_some_and(|error| error.contains("context budget")));
+                GuiMutation::untracked(), fx.app.state(), fx.project_id.to_string(),
+                before.id.to_string(), before.revision, fx.returned.to_string(),
+            ).await.expect("the continuation error is reported in the snapshot");
+            assert!(snapshot.continuation_error.as_deref().is_some_and(|error| error.contains("context budget")));
             assert!(fx.runs().is_empty());
             assert!(fx.conversation().has_unmediated_worker_result());
         }
@@ -2476,7 +2081,8 @@ mod tests {
         use crate::domain::{Repository, TaskStatus};
         use tauri::Manager;
 
-        const RESULT_EVENT: &str = r#"printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"done"}'"#;
+        const RESULT_EVENT: &str =
+            r#"printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"done"}'"#;
 
         fn git(dir: &std::path::Path, args: &[&str]) -> String {
             let out = std::process::Command::new("git")
@@ -2488,11 +2094,7 @@ mod tests {
                 .env("GIT_COMMITTER_EMAIL", "t@example.com")
                 .output()
                 .expect("git");
-            assert!(
-                out.status.success(),
-                "{args:?}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
+            assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         }
 
@@ -2526,9 +2128,7 @@ mod tests {
                 tmp.path().join("cache"),
                 tmp.path().join("runtime"),
             ));
-            let (state, _) = crate::app_core::build_state_with_paths(paths)
-                .await
-                .unwrap();
+            let (state, _) = crate::app_core::build_state_with_paths(paths).await.unwrap();
             crate::test_helpers::attach_test_executor(&state);
             let repo = tmp.path().join("repo");
             std::fs::create_dir_all(&repo).unwrap();
@@ -2543,17 +2143,7 @@ mod tests {
             git(&repo, &["add", "."]);
             git(&repo, &["commit", "-q", "-m", "init"]);
             let checkout = checkout_path_of(&tmp);
-            git(
-                &repo,
-                &[
-                    "worktree",
-                    "add",
-                    "-q",
-                    "-b",
-                    "task-branch",
-                    checkout.to_str().unwrap(),
-                ],
-            );
+            git(&repo, &["worktree", "add", "-q", "-b", "task-branch", checkout.to_str().unwrap()]);
 
             let repository_id = Uuid::new_v4();
             state.repository.repositories.write().await.insert(
@@ -2595,24 +2185,11 @@ mod tests {
             task.branch_name = Some("task-branch".into());
             let task_id = task.id;
             state.task.tasks.write().await.insert(task_id, task.clone());
-            state
-                .storage
-                .save_project_tasks(project_id, &[task])
-                .unwrap();
-            state
-                .storage
-                .create_primary_conversation(project_id)
-                .unwrap();
+            state.storage.save_project_tasks(project_id, &[task]).unwrap();
+            state.storage.create_primary_conversation(project_id).unwrap();
             let app = tauri::test::mock_app();
             app.manage(state);
-            Fx {
-                _tmp: tmp,
-                app,
-                repo,
-                checkout,
-                project_id,
-                task_id,
-            }
+            Fx { _tmp: tmp, app, repo, checkout, project_id, task_id }
         }
 
         impl Fx {
@@ -2622,12 +2199,8 @@ mod tests {
 
             /// Persist one new, undecided action for the Task and return its id.
             fn propose(&self, request: &str) -> Uuid {
-                let mut conversation = self
-                    .state()
-                    .storage
-                    .load_primary_conversation(self.project_id)
-                    .unwrap()
-                    .unwrap();
+                let mut conversation =
+                    self.state().storage.load_primary_conversation(self.project_id).unwrap().unwrap();
                 let id = Uuid::new_v4();
                 conversation.actions.push(TaskAction {
                     id,
@@ -2641,28 +2214,16 @@ mod tests {
                     coordinator_replied: false,
                     created_at: chrono::Utc::now(),
                 });
-                self.state()
-                    .storage
-                    .save_conversation(&conversation)
-                    .unwrap();
+                self.state().storage.save_conversation(&conversation).unwrap();
                 id
             }
 
             fn conversation(&self) -> Conversation {
-                self.state()
-                    .storage
-                    .load_primary_conversation(self.project_id)
-                    .unwrap()
-                    .unwrap()
+                self.state().storage.load_primary_conversation(self.project_id).unwrap().unwrap()
             }
 
             fn status_of(&self, id: Uuid) -> ActionStatus {
-                self.conversation()
-                    .actions
-                    .iter()
-                    .find(|a| a.id == id)
-                    .unwrap()
-                    .status
+                self.conversation().actions.iter().find(|a| a.id == id).unwrap().status
             }
 
             async fn approve(&self, id: Uuid) -> Result<(), String> {
@@ -2682,12 +2243,7 @@ mod tests {
             }
 
             /// Sends any Human action at an explicit revision, as a direct command would.
-            async fn act(
-                &self,
-                id: Uuid,
-                revision: u64,
-                action: super::super::HumanAction,
-            ) -> Result<(), String> {
+            async fn act(&self, id: Uuid, revision: u64, action: super::super::HumanAction) -> Result<(), String> {
                 let current = self.conversation();
                 super::super::act_on_project_conversation(
                     GuiMutation::untracked(),
@@ -2705,29 +2261,18 @@ mod tests {
 
             async fn withdraw(&self, id: Uuid) -> Result<(), String> {
                 let revision = self.conversation().revision;
-                self.act(id, revision, super::super::HumanAction::Withdraw)
-                    .await
+                self.act(id, revision, super::super::HumanAction::Withdraw).await
             }
 
             fn assert_retired_refusal(&self, refusal: &str) {
                 assert!(refusal.contains("retired"), "{refusal}");
-                assert!(
-                    refusal.contains("Nothing was started or changed"),
-                    "{refusal}"
-                );
+                assert!(refusal.contains("Nothing was started or changed"), "{refusal}");
                 assert!(refusal.len() < 800, "bounded: {refusal}");
-                assert!(
-                    !refusal.contains("uncommitted changes"),
-                    "the gate precedes the checkout read: {refusal}"
-                );
+                assert!(!refusal.contains("uncommitted changes"), "the gate precedes the checkout read: {refusal}");
             }
 
             fn worker_started(&self) -> usize {
-                self.conversation()
-                    .entries
-                    .iter()
-                    .filter(|e| matches!(e.kind, EntryKind::WorkerStarted { .. }))
-                    .count()
+                self.conversation().entries.iter().filter(|e| matches!(e.kind, EntryKind::WorkerStarted { .. })).count()
             }
 
             fn human_approvals(&self) -> usize {
@@ -2737,6 +2282,7 @@ mod tests {
                     .filter(|e| matches!(e.kind, EntryKind::ActionDecision { approved: true, .. }))
                     .count()
             }
+
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -2749,16 +2295,9 @@ mod tests {
             .await;
             let fx = fixture(tmp).await;
             let git_dir = git(&fx.checkout, &["rev-parse", "--absolute-git-dir"]);
-            std::fs::write(
-                std::path::Path::new(&git_dir).join("index"),
-                b"not an index",
-            )
-            .unwrap();
+            std::fs::write(std::path::Path::new(&git_dir).join("index"), b"not an index").unwrap();
             let action = fx.propose("change a.txt");
-            let refusal = fx
-                .approve(action)
-                .await
-                .expect_err("retired before the checkout is read");
+            let refusal = fx.approve(action).await.expect_err("retired before the checkout is read");
             fx.assert_retired_refusal(&refusal);
             assert!(fake.invocations().is_empty());
             assert_eq!(fx.worker_started(), 0);
@@ -2782,21 +2321,16 @@ mod tests {
             let record = seeded.actions.iter_mut().find(|a| a.id == action).unwrap();
             record.status = ActionStatus::Approved;
             record.approved_request = Some("change a.txt".into());
-            seeded.push(
-                Role::Human,
-                EntryKind::ActionDecision {
-                    action_id: action,
-                    approved: true,
-                    request: Some("change a.txt".into()),
-                },
-            );
+            seeded.push(Role::Human, EntryKind::ActionDecision {
+                action_id: action,
+                approved: true,
+                request: Some("change a.txt".into()),
+            });
             fx.state().storage.save_conversation(&seeded).unwrap();
             let before = fx.conversation();
             let task_before = fx.state().task.tasks.read().await[&fx.task_id].clone();
 
-            fx.withdraw(action)
-                .await
-                .expect("the approval is withdrawn");
+            fx.withdraw(action).await.expect("the approval is withdrawn");
             let after = fx.conversation();
             assert_eq!(fx.status_of(action), ActionStatus::Withdrawn);
             assert_eq!(after.revision, before.revision + 1, "one durable decision");
@@ -2804,16 +2338,10 @@ mod tests {
                 after.entries.last().unwrap().kind,
                 EntryKind::ActionWithdrawn { action_id, revision } if action_id == action && revision == before.revision
             ));
-            assert_eq!(
-                fx.human_approvals(),
-                1,
-                "the historical approval event is kept"
-            );
+            assert_eq!(fx.human_approvals(), 1, "the historical approval event is kept");
 
             // Repeating the withdrawal at the current revision has no effect and no new entry.
-            fx.withdraw(action)
-                .await
-                .expect("a repeated withdrawal is accepted");
+            fx.withdraw(action).await.expect("a repeated withdrawal is accepted");
             let repeated = fx.conversation();
             assert_eq!(repeated.revision, after.revision);
             assert_eq!(repeated.entries.len(), after.entries.len());
@@ -2826,15 +2354,9 @@ mod tests {
             assert_eq!(fx.conversation().entries.len(), after.entries.len());
 
             // The withdrawn approval can never be approved again.
-            let refusal = fx
-                .approve(action)
-                .await
-                .expect_err("a withdrawn approval is not retried");
+            let refusal = fx.approve(action).await.expect_err("a withdrawn approval is not retried");
             assert!(refusal.contains("no longer awaiting"), "{refusal}");
-            assert!(
-                !refusal.contains("retired"),
-                "a withdrawn action is not a retirement case: {refusal}"
-            );
+            assert!(!refusal.contains("retired"), "a withdrawn action is not a retirement case: {refusal}");
             assert_eq!(fx.status_of(action), ActionStatus::Withdrawn);
 
             // The Task, its checkout and the provider are untouched.
@@ -2854,29 +2376,11 @@ mod tests {
                 root.join("cache"),
                 root.join("runtime"),
             ));
-            let (reopened, _) = crate::app_core::build_state_with_paths(paths)
-                .await
-                .unwrap();
-            let persisted = reopened
-                .storage
-                .load_primary_conversation(fx.project_id)
-                .unwrap()
-                .unwrap();
+            let (reopened, _) = crate::app_core::build_state_with_paths(paths).await.unwrap();
+            let persisted = reopened.storage.load_primary_conversation(fx.project_id).unwrap().unwrap();
+            assert_eq!(persisted.actions.iter().find(|a| a.id == action).unwrap().status, ActionStatus::Withdrawn);
             assert_eq!(
-                persisted
-                    .actions
-                    .iter()
-                    .find(|a| a.id == action)
-                    .unwrap()
-                    .status,
-                ActionStatus::Withdrawn
-            );
-            assert_eq!(
-                persisted
-                    .entries
-                    .iter()
-                    .filter(|e| matches!(e.kind, EntryKind::ActionWithdrawn { .. }))
-                    .count(),
+                persisted.entries.iter().filter(|e| matches!(e.kind, EntryKind::ActionWithdrawn { .. })).count(),
                 1,
                 "one durable withdrawal after restart"
             );
@@ -3001,24 +2505,16 @@ mod tests {
             fixture_with_budget(tmp, steps, Default::default()).await
         }
 
-        async fn fixture_with_budget(
-            tmp: tempfile::TempDir,
-            steps: &[Step],
-            budget: crate::conversation_context::ContextBudget,
-        ) -> Fx {
+        async fn fixture_with_budget(tmp: tempfile::TempDir, steps: &[Step], budget: crate::conversation_context::ContextBudget) -> Fx {
             let log = tmp.path().join("provider-runs.log");
-            let fake =
-                crate::test_helpers::FakeProgram::install("claude", &provider_body(&log, steps))
-                    .await;
+            let fake = crate::test_helpers::FakeProgram::install("claude", &provider_body(&log, steps)).await;
             let paths = std::sync::Arc::new(crate::config::paths::AppPaths::with_roots(
                 tmp.path().join("config"),
                 tmp.path().join("data"),
                 tmp.path().join("cache"),
                 tmp.path().join("runtime"),
             ));
-            let (mut state, _) = crate::app_core::build_state_with_paths(paths)
-                .await
-                .unwrap();
+            let (mut state, _) = crate::app_core::build_state_with_paths(paths).await.unwrap();
             state.conversation.context_budget = budget;
             crate::test_helpers::attach_test_executor(&state);
             let project_id = Uuid::new_v4();
@@ -3047,13 +2543,7 @@ mod tests {
             );
             let app = tauri::test::mock_app();
             app.manage(state);
-            Fx {
-                _tmp: tmp,
-                _fake: fake,
-                app,
-                log,
-                project_id,
-            }
+            Fx { _tmp: tmp, _fake: fake, app, log, project_id }
         }
 
         impl Fx {
@@ -3062,24 +2552,17 @@ mod tests {
             }
 
             fn conversation(&self) -> Conversation {
-                self.state()
-                    .storage
-                    .load_primary_conversation(self.project_id)
-                    .unwrap()
-                    .unwrap()
+                self.state().storage.load_primary_conversation(self.project_id).unwrap().unwrap()
             }
 
             /// Provider runs so far.
             fn runs(&self) -> usize {
-                std::fs::read_to_string(&self.log)
-                    .map(|log| log.lines().count())
-                    .unwrap_or(0)
+                std::fs::read_to_string(&self.log).map(|log| log.lines().count()).unwrap_or(0)
             }
 
             /// The prompt sent to provider run `run` (1-based).
             fn prompt(&self, run: usize) -> String {
-                std::fs::read_to_string(format!("{}.prompt.{run}", self.log.display()))
-                    .unwrap_or_default()
+                std::fs::read_to_string(format!("{}.prompt.{run}", self.log.display())).unwrap_or_default()
             }
         }
 
@@ -3124,22 +2607,11 @@ mod tests {
         }
 
         fn count(conversation: &Conversation, matches: impl Fn(&EntryKind) -> bool) -> usize {
-            conversation
-                .entries
-                .iter()
-                .filter(|entry| matches(&entry.kind))
-                .count()
+            conversation.entries.iter().filter(|entry| matches(&entry.kind)).count()
         }
 
         fn is_retryable_failure(kind: &EntryKind) -> bool {
-            matches!(
-                kind,
-                EntryKind::RunFailed {
-                    role: Role::Coordinator,
-                    retryable: true,
-                    ..
-                }
-            )
+            matches!(kind, EntryKind::RunFailed { role: Role::Coordinator, retryable: true, .. })
         }
 
         fn failure_message(conversation: &Conversation) -> String {
@@ -3152,10 +2624,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         async fn a_successful_turn_saves_the_message_once_and_its_reply() {
             let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Reply("Hello")]).await;
-            let conversation = send(&fx, "Hi there")
-                .await
-                .expect("the send succeeds")
-                .conversation;
+            let conversation = send(&fx, "Hi there").await.expect("the send succeeds").conversation;
             assert_eq!(human_count(&conversation, "Hi there"), 1);
             assert!(matches!(
                 &conversation.entries.last().unwrap().kind,
@@ -3168,23 +2637,12 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         async fn a_provider_failure_is_recorded_at_failure_time_and_is_retryable() {
             let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Fail]).await;
-            let snapshot = send(&fx, "Check the build")
-                .await
-                .expect("the failure is recorded, not returned as an error");
+            let snapshot = send(&fx, "Check the build").await.expect("the failure is recorded, not returned as an error");
             assert_eq!(human_count(&snapshot.conversation, "Check the build"), 1);
             let message = failure_message(&snapshot.conversation);
-            assert!(
-                message.contains("did not return a reply")
-                    && message.contains("Your message is saved"),
-                "{message}"
-            );
-            assert!(is_retryable_failure(
-                &snapshot.conversation.entries.last().unwrap().kind
-            ));
-            assert_eq!(
-                snapshot.conversation.retryable_human_turn(),
-                Some((0, "Check the build"))
-            );
+            assert!(message.contains("did not return a reply") && message.contains("Your message is saved"), "{message}");
+            assert!(is_retryable_failure(&snapshot.conversation.entries.last().unwrap().kind));
+            assert_eq!(snapshot.conversation.retryable_human_turn(), Some((0, "Check the build")));
             // Durable: the failure is in the saved Conversation, not only the response.
             assert_eq!(fx.conversation().entries.len(), 2);
             assert_eq!(fx.runs(), 1);
@@ -3193,10 +2651,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         async fn an_exhausted_turn_limit_is_recorded_with_its_own_explanation() {
             let fx = fixture(tempfile::tempdir().unwrap(), &[Step::MaxTurns]).await;
-            let conversation = send(&fx, "Summarize the Tasks")
-                .await
-                .expect("recorded")
-                .conversation;
+            let conversation = send(&fx, "Summarize the Tasks").await.expect("recorded").conversation;
             let message = failure_message(&conversation);
             assert!(message.contains("used up its provider turns"), "{message}");
             assert!(conversation.retryable_human_turn().is_some());
@@ -3217,18 +2672,9 @@ mod tests {
                 let fx = fixture(tempfile::tempdir().unwrap(), &[step]).await;
                 let conversation = send(&fx, "Status?").await.expect("recorded").conversation;
                 let message = failure_message(&conversation);
-                assert!(
-                    message.contains("did not contain structured output"),
-                    "{message}"
-                );
+                assert!(message.contains("did not contain structured output"), "{message}");
                 assert!(conversation.retryable_human_turn().is_some());
-                assert_eq!(
-                    count(&conversation, |kind| matches!(
-                        kind,
-                        EntryKind::CoordinatorReply { .. }
-                    )),
-                    0
-                );
+                assert_eq!(count(&conversation, |kind| matches!(kind, EntryKind::CoordinatorReply { .. })), 0);
                 assert!(conversation.actions.is_empty() && conversation.project_actions.is_empty());
             }
         }
@@ -3237,10 +2683,7 @@ mod tests {
         async fn a_field_outside_the_contract_is_refused_and_proposes_nothing() {
             let raw = r#"{"type":"create_task","text":"why","title":"New","extra":true}"#;
             let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Proposal(raw)]).await;
-            let conversation = send(&fx, "Add a task")
-                .await
-                .expect("recorded")
-                .conversation;
+            let conversation = send(&fx, "Add a task").await.expect("recorded").conversation;
             assert!(failure_message(&conversation).contains("Invalid Coordinator JSON"));
             assert!(conversation.retryable_human_turn().is_some());
             assert!(conversation.actions.is_empty() && conversation.project_actions.is_empty());
@@ -3250,10 +2693,7 @@ mod tests {
         async fn a_structurally_valid_proposal_the_domain_refuses_proposes_nothing() {
             let raw = r#"{"type":"create_task","text":"why","title":""}"#;
             let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Proposal(raw)]).await;
-            let conversation = send(&fx, "Add a task")
-                .await
-                .expect("recorded")
-                .conversation;
+            let conversation = send(&fx, "Add a task").await.expect("recorded").conversation;
             let message = failure_message(&conversation);
             assert!(message.contains("did not return a reply"), "{message}");
             assert!(conversation.retryable_human_turn().is_some());
@@ -3263,201 +2703,94 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         async fn a_lookup_then_a_reply_is_one_message_and_one_reply() {
             let lookup = r#"{"type":"inspect_project"}"#;
-            let fx = fixture(
-                tempfile::tempdir().unwrap(),
-                &[Step::Proposal(lookup), Step::Reply("Here it is.")],
-            )
-            .await;
-            let conversation = send(&fx, "What is this Project?")
-                .await
-                .expect("the send succeeds")
-                .conversation;
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Proposal(lookup), Step::Reply("Here it is.")]).await;
+            let conversation = send(&fx, "What is this Project?").await.expect("the send succeeds").conversation;
             assert_eq!(human_count(&conversation, "What is this Project?"), 1);
-            assert_eq!(
-                count(&conversation, |kind| matches!(
-                    kind,
-                    EntryKind::CoordinatorReply { .. }
-                )),
-                1
-            );
+            assert_eq!(count(&conversation, |kind| matches!(kind, EntryKind::CoordinatorReply { .. })), 1);
             assert!(conversation.retryable_human_turn().is_none());
             assert_eq!(fx.runs(), 2);
-            assert!(
-                fx.prompt(2).contains("untrusted evidence"),
-                "the lookup result reaches the second run"
-            );
+            assert!(fx.prompt(2).contains("untrusted evidence"), "the lookup result reaches the second run");
         }
 
         #[tokio::test(flavor = "multi_thread")]
         async fn every_invocation_of_a_turn_with_three_reads_stays_within_the_budget() {
             let read = r#"{"type":"inspect_project"}"#;
-            let fx = fixture(
-                tempfile::tempdir().unwrap(),
-                &[
-                    Step::Proposal(read),
-                    Step::Proposal(read),
-                    Step::Proposal(read),
-                    Step::Reply("Done."),
-                ],
-            )
-            .await;
-            send(&fx, "Look at everything")
-                .await
-                .expect("the send succeeds");
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Proposal(read), Step::Proposal(read), Step::Proposal(read), Step::Reply("Done.")]).await;
+            send(&fx, "Look at everything").await.expect("the send succeeds");
             assert_eq!(fx.runs(), 4);
-            let (limits, _) = super::super::invocation_limits(
-                crate::conversation_context::ContextSite::Ordinary,
-                Default::default(),
-            );
+            let (limits, _) = super::super::invocation_limits(crate::conversation_context::ContextSite::Ordinary, Default::default());
             for run in 1..=4 {
                 let prompt = fx.prompt(run);
                 let sent = prompt.chars().count() + limits.other_fixed_chars;
-                eprintln!(
-                    "invocation {run}: {sent} characters of {}",
-                    limits.max_chars
-                );
+                eprintln!("invocation {run}: {sent} characters of {}", limits.max_chars);
                 assert!(sent <= limits.max_chars);
             }
-            assert!(fx
-                .prompt(1)
-                .contains("\"current_message\":\"Look at everything\""));
+            assert!(fx.prompt(1).contains("\"current_message\":\"Look at everything\""));
             assert!(fx.prompt(1).contains("\"open_proposals_total\":0"));
-            assert!(fx
-                .prompt(4)
-                .contains("No further reads are available this turn"));
+            assert!(fx.prompt(4).contains("No further reads are available this turn"));
         }
 
         #[tokio::test(flavor = "multi_thread")]
         async fn an_oversized_message_fails_without_a_provider_and_a_smaller_one_is_answered() {
             use crate::conversation_context::ContextSite;
-            let (_, fixed) =
-                super::super::invocation_limits(ContextSite::Ordinary, Default::default());
-            let reserve = crate::coordinator_reads::read_reserve_chars(
-                crate::coordinator_reads::PER_READ_CAP_CHARS,
-            );
-            let budget = crate::conversation_context::ContextBudget {
-                total_chars: fixed + reserve + 2_500,
-                per_read_cap_chars: crate::coordinator_reads::PER_READ_CAP_CHARS,
-            };
-            let fx = fixture_with_budget(
-                tempfile::tempdir().unwrap(),
-                &[Step::Reply("Answered.")],
-                budget,
-            )
-            .await;
+            let (_, fixed) = super::super::invocation_limits(ContextSite::Ordinary, Default::default());
+            let reserve = crate::coordinator_reads::read_reserve_chars(crate::coordinator_reads::PER_READ_CAP_CHARS);
+            let budget = crate::conversation_context::ContextBudget { total_chars: fixed + reserve + 2_500, per_read_cap_chars: crate::coordinator_reads::PER_READ_CAP_CHARS };
+            let fx = fixture_with_budget(tempfile::tempdir().unwrap(), &[Step::Reply("Answered.")], budget).await;
             let big = format!("{}é", "x".repeat(6_000));
-            let snapshot = send(&fx, &big)
-                .await
-                .expect("the failure is recorded, not returned");
+            let snapshot = send(&fx, &big).await.expect("the failure is recorded, not returned");
             assert_eq!(fx.runs(), 0, "no provider started");
-            assert_eq!(
-                human_count(&snapshot.conversation, &big),
-                1,
-                "the message is saved byte for byte"
-            );
+            assert_eq!(human_count(&snapshot.conversation, &big), 1, "the message is saved byte for byte");
             let message = failure_message(&snapshot.conversation);
-            assert!(
-                message.contains("context budget") && message.contains("Send a shorter request"),
-                "{message}"
-            );
-            assert!(!is_retryable_failure(
-                &snapshot.conversation.entries.last().unwrap().kind
-            ));
+            assert!(message.contains("context budget") && message.contains("Send a shorter request"), "{message}");
+            assert!(!is_retryable_failure(&snapshot.conversation.entries.last().unwrap().kind));
             assert!(!snapshot.turn_retry_available);
             assert!(retry(&fx, &snapshot.conversation).await.is_err());
 
-            let answered = send(&fx, "A short question")
-                .await
-                .expect("a smaller message is answered")
-                .conversation;
+            let answered = send(&fx, "A short question").await.expect("a smaller message is answered").conversation;
             assert_eq!(fx.runs(), 1);
-            assert!(
-                matches!(&answered.entries.last().unwrap().kind, EntryKind::CoordinatorReply { text } if text == "Answered.")
-            );
-            assert!(fx
-                .prompt(1)
-                .contains("\"current_message\":\"A short question\""));
+            assert!(matches!(&answered.entries.last().unwrap().kind, EntryKind::CoordinatorReply { text } if text == "Answered."));
+            assert!(fx.prompt(1).contains("\"current_message\":\"A short question\""));
             assert_eq!(human_count(&answered, &big), 1);
         }
 
         #[tokio::test(flavor = "multi_thread")]
         async fn retry_reuses_the_exact_saved_message_and_is_not_projected_twice() {
-            let fx = fixture(
-                tempfile::tempdir().unwrap(),
-                &[Step::Fail, Step::Reply("Done")],
-            )
-            .await;
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Fail, Step::Reply("Done")]).await;
             send(&fx, "Check the build").await.expect("recorded");
             let before = fx.conversation();
-            let conversation = retry(&fx, &before)
-                .await
-                .expect("the retry succeeds")
-                .conversation;
+            let conversation = retry(&fx, &before).await.expect("the retry succeeds").conversation;
 
-            assert_eq!(
-                human_count(&conversation, "Check the build"),
-                1,
-                "the Human message is not saved again"
-            );
-            assert!(matches!(
-                conversation.entries.last().unwrap().kind,
-                EntryKind::CoordinatorReply { .. }
-            ));
+            assert_eq!(human_count(&conversation, "Check the build"), 1, "the Human message is not saved again");
+            assert!(matches!(conversation.entries.last().unwrap().kind, EntryKind::CoordinatorReply { .. }));
             assert_eq!(fx.runs(), 2);
             let prompt = fx.prompt(2);
-            assert!(
-                prompt.contains(r#""current_message":"Check the build""#),
-                "the retry asks the saved message"
-            );
-            assert_eq!(
-                prompt.matches("Check the build").count(),
-                1,
-                "the message is projected once"
-            );
+            assert!(prompt.contains(r#""current_message":"Check the build""#), "the retry asks the saved message");
+            assert_eq!(prompt.matches("Check the build").count(), 1, "the message is projected once");
         }
 
         #[tokio::test(flavor = "multi_thread")]
         async fn a_repeated_or_stale_retry_runs_nothing_and_saves_nothing() {
-            let fx = fixture(
-                tempfile::tempdir().unwrap(),
-                &[Step::Fail, Step::Reply("Done")],
-            )
-            .await;
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Fail, Step::Reply("Done")]).await;
             send(&fx, "Check the build").await.expect("recorded");
             let before = fx.conversation();
             retry(&fx, &before).await.expect("the first retry succeeds");
 
             let stale = retry(&fx, &before).await;
-            assert!(
-                stale.unwrap_err().contains("Conversation changed"),
-                "the old revision is refused"
-            );
+            assert!(stale.unwrap_err().contains("Conversation changed"), "the old revision is refused");
             let after = fx.conversation();
             let again = retry(&fx, &after).await;
-            assert_eq!(
-                again.unwrap_err(),
-                "No failed Coordinator turn is waiting for a retry"
-            );
+            assert_eq!(again.unwrap_err(), "No failed Coordinator turn is waiting for a retry");
 
             let conversation = fx.conversation();
             assert_eq!(human_count(&conversation, "Check the build"), 1);
-            assert_eq!(
-                count(&conversation, |kind| matches!(
-                    kind,
-                    EntryKind::CoordinatorReply { .. }
-                )),
-                1
-            );
+            assert_eq!(count(&conversation, |kind| matches!(kind, EntryKind::CoordinatorReply { .. })), 1);
             assert_eq!(fx.runs(), 2, "neither refused retry started a provider run");
         }
 
         #[tokio::test(flavor = "multi_thread")]
         async fn a_retry_with_a_stale_revision_is_refused_before_any_run() {
-            let fx = fixture(
-                tempfile::tempdir().unwrap(),
-                &[Step::Fail, Step::Reply("Done")],
-            )
-            .await;
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Fail, Step::Reply("Done")]).await;
             send(&fx, "Check the build").await.expect("recorded");
             let mut stale = fx.conversation();
             stale.revision += 5;
@@ -3468,11 +2801,7 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn a_retry_while_a_mutation_holds_the_project_lock_is_refused() {
-            let fx = fixture(
-                tempfile::tempdir().unwrap(),
-                &[Step::Fail, Step::Reply("Done")],
-            )
-            .await;
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Fail, Step::Reply("Done")]).await;
             send(&fx, "Check the build").await.expect("recorded");
             let before = fx.conversation();
             let lock = fx.state().conversation.project_lock(fx.project_id);
@@ -3485,25 +2814,12 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         async fn a_retried_proposal_is_recorded_once() {
             let proposal = r#"{"type":"create_task","text":"Track it","title":"Track the build"}"#;
-            let fx = fixture(
-                tempfile::tempdir().unwrap(),
-                &[Step::Fail, Step::Proposal(proposal)],
-            )
-            .await;
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Fail, Step::Proposal(proposal)]).await;
             send(&fx, "Track the build").await.expect("recorded");
             let before = fx.conversation();
-            let conversation = retry(&fx, &before)
-                .await
-                .expect("the retry succeeds")
-                .conversation;
+            let conversation = retry(&fx, &before).await.expect("the retry succeeds").conversation;
             assert_eq!(conversation.project_actions.len(), 1);
-            assert_eq!(
-                count(&conversation, |kind| matches!(
-                    kind,
-                    EntryKind::ProjectActionProposed { .. }
-                )),
-                1
-            );
+            assert_eq!(count(&conversation, |kind| matches!(kind, EntryKind::ProjectActionProposed { .. })), 1);
             assert!(conversation.retryable_human_turn().is_none());
         }
 
@@ -3511,96 +2827,50 @@ mod tests {
         async fn a_failure_that_cannot_be_saved_is_reported_and_recovered_on_reopen() {
             let tmp = tempfile::tempdir().unwrap();
             let frozen = tmp.path().to_path_buf();
-            let fx = fixture(
-                tmp,
-                &[Step::FailAndFreeze(frozen.clone()), Step::Reply("Done")],
-            )
-            .await;
+            let fx = fixture(tmp, &[Step::FailAndFreeze(frozen.clone()), Step::Reply("Done")]).await;
 
-            let error = send(&fx, "Check the build")
-                .await
-                .expect_err("the failure could not be recorded");
+            let error = send(&fx, "Check the build").await.expect_err("the failure could not be recorded");
             assert!(error.contains("could not record this failure"), "{error}");
             assert_eq!(fx.runs(), 1);
 
             // Storage recovers. The unanswered message is saved, and no failure was written.
-            std::process::Command::new("chmod")
-                .arg("-R")
-                .arg("u+w")
-                .arg(&frozen)
-                .status()
-                .unwrap();
+            std::process::Command::new("chmod").arg("-R").arg("u+w").arg(&frozen).status().unwrap();
             let on_disk = fx.conversation();
             assert_eq!(human_count(&on_disk, "Check the build"), 1);
-            assert_eq!(
-                on_disk.entries.len(),
-                1,
-                "the failed save left no failure entry"
-            );
+            assert_eq!(on_disk.entries.len(), 1, "the failed save left no failure entry");
 
             // Reopening the Conversation records the failure that could not be saved before.
             let reopened = reopen(&fx).await;
             assert!(is_retryable_failure(&reopened.entries.last().unwrap().kind));
 
-            let recovered = retry(&fx, &reopened)
-                .await
-                .expect("the retry succeeds")
-                .conversation;
-            assert!(matches!(
-                recovered.entries.last().unwrap().kind,
-                EntryKind::CoordinatorReply { .. }
-            ));
+            let recovered = retry(&fx, &reopened).await.expect("the retry succeeds").conversation;
+            assert!(matches!(recovered.entries.last().unwrap().kind, EntryKind::CoordinatorReply { .. }));
             assert_eq!(human_count(&recovered, "Check the build"), 1);
         }
 
         #[tokio::test(flavor = "multi_thread")]
         async fn a_message_left_unanswered_by_an_interrupted_run_is_retryable_after_reopen() {
             let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Reply("Back")]).await;
-            let mut conversation = fx
-                .state()
-                .storage
-                .create_primary_conversation(fx.project_id)
-                .unwrap();
-            conversation.push(
-                Role::Human,
-                EntryKind::HumanMessage {
-                    text: "Where was I?".into(),
-                },
-            );
+            let mut conversation = fx.state().storage.create_primary_conversation(fx.project_id).unwrap();
+            conversation.push(Role::Human, EntryKind::HumanMessage { text: "Where was I?".into() });
             fx.state().storage.save_conversation(&conversation).unwrap();
 
             let reopened = reopen(&fx).await;
             assert_eq!(reopened.retryable_human_turn(), Some((0, "Where was I?")));
 
-            let answered = retry(&fx, &reopened)
-                .await
-                .expect("the retry succeeds")
-                .conversation;
+            let answered = retry(&fx, &reopened).await.expect("the retry succeeds").conversation;
             assert_eq!(human_count(&answered, "Where was I?"), 1);
-            assert!(matches!(
-                answered.entries.last().unwrap().kind,
-                EntryKind::CoordinatorReply { .. }
-            ));
+            assert!(matches!(answered.entries.last().unwrap().kind, EntryKind::CoordinatorReply { .. }));
         }
 
         #[tokio::test(flavor = "multi_thread")]
         async fn a_new_message_after_a_failure_is_sent_without_retrying_the_old_one() {
-            let fx = fixture(
-                tempfile::tempdir().unwrap(),
-                &[Step::Fail, Step::Reply("Second answer")],
-            )
-            .await;
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Fail, Step::Reply("Second answer")]).await;
             send(&fx, "First").await.expect("recorded");
-            let conversation = send(&fx, "Second")
-                .await
-                .expect("the new send succeeds")
-                .conversation;
+            let conversation = send(&fx, "Second").await.expect("the new send succeeds").conversation;
             assert_eq!(human_count(&conversation, "First"), 1);
             assert_eq!(human_count(&conversation, "Second"), 1);
-            assert!(matches!(
-                conversation.entries.last().unwrap().kind,
-                EntryKind::CoordinatorReply { .. }
-            ));
+            assert!(matches!(conversation.entries.last().unwrap().kind, EntryKind::CoordinatorReply { .. }));
             assert_eq!(fx.runs(), 2);
         }
 
@@ -3608,46 +2878,18 @@ mod tests {
         async fn a_failure_that_was_not_saved_is_recorded_before_the_next_message() {
             let tmp = tempfile::tempdir().unwrap();
             let frozen = tmp.path().to_path_buf();
-            let fx = fixture(
-                tmp,
-                &[
-                    Step::FailAndFreeze(frozen.clone()),
-                    Step::Reply("Second answer"),
-                ],
-            )
-            .await;
-            send(&fx, "First")
-                .await
-                .expect_err("the failure could not be recorded");
-            std::process::Command::new("chmod")
-                .arg("-R")
-                .arg("u+w")
-                .arg(&frozen)
-                .status()
-                .unwrap();
+            let fx = fixture(tmp, &[Step::FailAndFreeze(frozen.clone()), Step::Reply("Second answer")]).await;
+            send(&fx, "First").await.expect_err("the failure could not be recorded");
+            std::process::Command::new("chmod").arg("-R").arg("u+w").arg(&frozen).status().unwrap();
 
             // Without a reopen, the next send must not bury the unanswered first message.
-            let conversation = send(&fx, "Second")
-                .await
-                .expect("the next send succeeds")
-                .conversation;
+            let conversation = send(&fx, "Second").await.expect("the next send succeeds").conversation;
             let entries = &conversation.entries;
-            assert_eq!(
-                entries.len(),
-                4,
-                "first message, its recorded failure, second message, reply"
-            );
+            assert_eq!(entries.len(), 4, "first message, its recorded failure, second message, reply");
             assert!(matches!(entries[0].kind, EntryKind::HumanMessage { .. }));
-            assert!(
-                is_retryable_failure(&entries[1].kind),
-                "the first message gets its failure before the next message"
-            );
-            assert!(
-                matches!(&entries[2].kind, EntryKind::HumanMessage { text } if text == "Second")
-            );
-            assert!(
-                matches!(&entries[3].kind, EntryKind::CoordinatorReply { text } if text == "Second answer")
-            );
+            assert!(is_retryable_failure(&entries[1].kind), "the first message gets its failure before the next message");
+            assert!(matches!(&entries[2].kind, EntryKind::HumanMessage { text } if text == "Second"));
+            assert!(matches!(&entries[3].kind, EntryKind::CoordinatorReply { text } if text == "Second answer"));
             assert_eq!(human_count(&conversation, "First"), 1);
             assert_eq!(fx.runs(), 2);
         }
@@ -3655,21 +2897,11 @@ mod tests {
         /// Creates the Conversation before a fault is armed, so the fault hits
         /// the Human message's write and not the creation of the file.
         fn created_conversation(fx: &Fx) -> Conversation {
-            fx.state()
-                .storage
-                .create_primary_conversation(fx.project_id)
-                .unwrap()
+            fx.state().storage.create_primary_conversation(fx.project_id).unwrap()
         }
 
-        fn fault_on(
-            conversation: &Conversation,
-            stage: slashit_durable_fs::Stage,
-        ) -> slashit_durable_fs::fault::FaultGuard {
-            slashit_durable_fs::fault::fail_at_file(
-                stage,
-                std::io::ErrorKind::Other,
-                &format!("{}.json", conversation.id),
-            )
+        fn fault_on(conversation: &Conversation, stage: slashit_durable_fs::Stage) -> slashit_durable_fs::fault::FaultGuard {
+            slashit_durable_fs::fault::fail_at_file(stage, std::io::ErrorKind::Other, &format!("{}.json", conversation.id))
         }
 
         async fn reopen_fails(fx: &Fx) -> bool {
@@ -3687,76 +2919,38 @@ mod tests {
             let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Reply("Hello")]).await;
             let created = created_conversation(&fx);
             let fault = fault_on(&created, slashit_durable_fs::Stage::Replace);
-            let error = send(&fx, "Hi there")
-                .await
-                .expect_err("the save was refused");
+            let error = send(&fx, "Hi there").await.expect_err("the save was refused");
             drop(fault);
             assert!(error.contains("was not saved"), "{error}");
-            assert_eq!(
-                fx.runs(),
-                0,
-                "the Coordinator is not asked about a message that was not saved"
-            );
-            assert!(
-                fx.conversation().entries.is_empty(),
-                "the file holds what it held before"
-            );
+            assert_eq!(fx.runs(), 0, "the Coordinator is not asked about a message that was not saved");
+            assert!(fx.conversation().entries.is_empty(), "the file holds what it held before");
 
-            let conversation = send(&fx, "Hi there")
-                .await
-                .expect("the send succeeds once storage works")
-                .conversation;
+            let conversation = send(&fx, "Hi there").await.expect("the send succeeds once storage works").conversation;
             assert_eq!(human_count(&conversation, "Hi there"), 1);
             assert_eq!(fx.runs(), 1);
         }
 
         #[tokio::test(flavor = "multi_thread")]
         async fn a_message_published_but_not_confirmed_is_kept_once_and_answered_by_retry() {
-            let fx = fixture(
-                tempfile::tempdir().unwrap(),
-                &[Step::Reply("Answered"), Step::Reply("Next")],
-            )
-            .await;
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Reply("Answered"), Step::Reply("Next")]).await;
             let created = created_conversation(&fx);
             let fault = fault_on(&created, slashit_durable_fs::Stage::SyncDirectory);
-            let error = send(&fx, "Check the build")
-                .await
-                .expect_err("the save is not confirmed");
+            let error = send(&fx, "Check the build").await.expect_err("the save is not confirmed");
             drop(fault);
-            assert!(
-                error.contains("was saved") && error.contains("could not confirm"),
-                "{error}"
-            );
-            assert_eq!(
-                fx.runs(),
-                0,
-                "no provider run starts for a message whose save is not confirmed"
-            );
-            assert_eq!(
-                human_count(&fx.conversation(), "Check the build"),
-                1,
-                "the new content is visible"
-            );
+            assert!(error.contains("was saved") && error.contains("could not confirm"), "{error}");
+            assert_eq!(fx.runs(), 0, "no provider run starts for a message whose save is not confirmed");
+            assert_eq!(human_count(&fx.conversation(), "Check the build"), 1, "the new content is visible");
 
             // Restart: the reopen records the unanswered message as retryable.
             let reopened = reopen(&fx).await;
-            assert_eq!(
-                reopened.retryable_human_turn(),
-                Some((0, "Check the build"))
-            );
+            assert_eq!(reopened.retryable_human_turn(), Some((0, "Check the build")));
 
-            let answered = retry(&fx, &reopened)
-                .await
-                .expect("the retry succeeds")
-                .conversation;
+            let answered = retry(&fx, &reopened).await.expect("the retry succeeds").conversation;
             assert_eq!(human_count(&answered, "Check the build"), 1);
             assert_eq!(fx.runs(), 1);
 
             // A later save rewrites the whole Conversation, so the earlier message is saved with it.
-            let next = send(&fx, "Next question")
-                .await
-                .expect("the next send succeeds")
-                .conversation;
+            let next = send(&fx, "Next question").await.expect("the next send succeeds").conversation;
             assert_eq!(human_count(&next, "Check the build"), 1);
             assert_eq!(human_count(&next, "Next question"), 1);
             assert_eq!(fx.runs(), 2);
@@ -3766,52 +2960,28 @@ mod tests {
         async fn an_unconfirmed_message_is_not_sent_again_when_the_reopen_cannot_save_either() {
             let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Reply("Answered")]).await;
             created_conversation(&fx);
-            let fault = slashit_durable_fs::fault::fail_every(
-                slashit_durable_fs::Stage::SyncDirectory,
-                std::io::ErrorKind::Other,
-            );
-            let error = send(&fx, "Check the build")
-                .await
-                .expect_err("the save is not confirmed");
+            let fault = slashit_durable_fs::fault::fail_every(slashit_durable_fs::Stage::SyncDirectory, std::io::ErrorKind::Other);
+            let error = send(&fx, "Check the build").await.expect_err("the save is not confirmed");
             assert!(error.contains("could not confirm"), "{error}");
-            assert!(
-                reopen_fails(&fx).await,
-                "the reopen cannot record the unanswered message"
-            );
+            assert!(reopen_fails(&fx).await, "the reopen cannot record the unanswered message");
             assert_eq!(fx.runs(), 0, "nothing is sent again automatically");
             drop(fault);
 
             assert_eq!(human_count(&fx.conversation(), "Check the build"), 1);
             let reopened = reopen(&fx).await;
-            assert_eq!(
-                reopened.retryable_human_turn(),
-                Some((0, "Check the build"))
-            );
+            assert_eq!(reopened.retryable_human_turn(), Some((0, "Check the build")));
             assert_eq!(fx.runs(), 0);
         }
 
         #[tokio::test(flavor = "multi_thread")]
         async fn a_reply_published_but_not_confirmed_is_shown_after_reload_and_not_asked_again() {
-            let fx = fixture(
-                tempfile::tempdir().unwrap(),
-                &[Step::Reply("Hello"), Step::Reply("Again")],
-            )
-            .await;
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Reply("Hello"), Step::Reply("Again")]).await;
             created_conversation(&fx);
             // The first directory sync is the Human message; the second is the reply.
-            let fault = slashit_durable_fs::fault::fail_in_order(&[(
-                slashit_durable_fs::Stage::SyncDirectory,
-                std::io::ErrorKind::Other,
-                1,
-            )]);
-            let error = send(&fx, "Hi")
-                .await
-                .expect_err("the reply is not confirmed");
+            let fault = slashit_durable_fs::fault::fail_in_order(&[(slashit_durable_fs::Stage::SyncDirectory, std::io::ErrorKind::Other, 1)]);
+            let error = send(&fx, "Hi").await.expect_err("the reply is not confirmed");
             drop(fault);
-            assert!(
-                error.contains("reply") && error.contains("could not confirm"),
-                "{error}"
-            );
+            assert!(error.contains("reply") && error.contains("could not confirm"), "{error}");
             assert_eq!(fx.runs(), 1);
 
             let reopened = reopen(&fx).await;
@@ -3822,118 +2992,63 @@ mod tests {
             assert!(reopened.retryable_human_turn().is_none());
             assert_eq!(human_count(&reopened, "Hi"), 1);
 
-            let next = send(&fx, "Again")
-                .await
-                .expect("the next send succeeds")
-                .conversation;
-            assert_eq!(
-                count(
-                    &next,
-                    |kind| matches!(kind, EntryKind::CoordinatorReply { text } if text == "Hello")
-                ),
-                1
-            );
+            let next = send(&fx, "Again").await.expect("the next send succeeds").conversation;
+            assert_eq!(count(&next, |kind| matches!(kind, EntryKind::CoordinatorReply { text } if text == "Hello")), 1);
             assert_eq!(fx.runs(), 2);
         }
 
         #[tokio::test(flavor = "multi_thread")]
         async fn a_reply_that_was_not_published_leaves_the_message_unanswered_until_reopen() {
-            let fx = fixture(
-                tempfile::tempdir().unwrap(),
-                &[Step::Reply("Lost"), Step::Reply("Recovered")],
-            )
-            .await;
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Reply("Lost"), Step::Reply("Recovered")]).await;
             created_conversation(&fx);
             // The first replacement is the Human message; the second is the reply.
-            let fault = slashit_durable_fs::fault::fail_in_order(&[(
-                slashit_durable_fs::Stage::Replace,
-                std::io::ErrorKind::Other,
-                1,
-            )]);
-            let error = send(&fx, "Status?")
-                .await
-                .expect_err("the reply could not be saved");
+            let fault = slashit_durable_fs::fault::fail_in_order(&[(slashit_durable_fs::Stage::Replace, std::io::ErrorKind::Other, 1)]);
+            let error = send(&fx, "Status?").await.expect_err("the reply could not be saved");
             drop(fault);
             assert!(error.contains("could not be saved"), "{error}");
             assert_eq!(fx.runs(), 1);
-            assert_eq!(
-                fx.conversation().entries.len(),
-                1,
-                "only the Human message is on disk"
-            );
+            assert_eq!(fx.conversation().entries.len(), 1, "only the Human message is on disk");
 
             let reopened = reopen(&fx).await;
-            let retried = retry(&fx, &reopened)
-                .await
-                .expect("the retry succeeds")
-                .conversation;
+            let retried = retry(&fx, &reopened).await.expect("the retry succeeds").conversation;
             assert_eq!(human_count(&retried, "Status?"), 1);
             assert_eq!(fx.runs(), 2);
         }
 
         #[tokio::test(flavor = "multi_thread")]
         async fn a_failure_published_but_not_confirmed_is_reported_as_saved_and_retryable() {
-            let fx = fixture(
-                tempfile::tempdir().unwrap(),
-                &[Step::Fail, Step::Reply("Done")],
-            )
-            .await;
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Fail, Step::Reply("Done")]).await;
             created_conversation(&fx);
             // The first directory sync is the Human message; the second records the failure.
-            let fault = slashit_durable_fs::fault::fail_in_order(&[(
-                slashit_durable_fs::Stage::SyncDirectory,
-                std::io::ErrorKind::Other,
-                1,
-            )]);
-            let error = send(&fx, "Check the build")
-                .await
-                .expect_err("the failure is not confirmed");
+            let fault = slashit_durable_fs::fault::fail_in_order(&[(slashit_durable_fs::Stage::SyncDirectory, std::io::ErrorKind::Other, 1)]);
+            let error = send(&fx, "Check the build").await.expect_err("the failure is not confirmed");
             drop(fault);
-            assert!(
-                error.contains("failure") && error.contains("could not confirm"),
-                "{error}"
-            );
-            assert!(
-                !error.contains("could not record"),
-                "the failure is in place: {error}"
-            );
+            assert!(error.contains("failure") && error.contains("could not confirm"), "{error}");
+            assert!(!error.contains("could not record"), "the failure is in place: {error}");
             assert_eq!(fx.runs(), 1);
 
             let reopened = reopen(&fx).await;
             assert!(is_retryable_failure(&reopened.entries.last().unwrap().kind));
-            let retried = retry(&fx, &reopened)
-                .await
-                .expect("the retry succeeds")
-                .conversation;
+            let retried = retry(&fx, &reopened).await.expect("the retry succeeds").conversation;
             assert_eq!(human_count(&retried, "Check the build"), 1);
             assert_eq!(fx.runs(), 2);
         }
 
         #[tokio::test(flavor = "multi_thread")]
         async fn a_newer_message_ends_an_earlier_retry_and_a_stale_retry_runs_nothing() {
-            let fx = fixture(
-                tempfile::tempdir().unwrap(),
-                &[Step::Fail, Step::Reply("Second answer")],
-            )
-            .await;
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Fail, Step::Reply("Second answer")]).await;
             send(&fx, "First").await.expect("recorded");
             let stale = fx.conversation();
             assert_eq!(stale.retryable_human_turn(), Some((0, "First")));
 
             let snapshot = send(&fx, "Second").await.expect("the new send succeeds");
-            assert!(
-                !snapshot.turn_retry_available,
-                "the earlier message has no Retry any more"
-            );
+            assert!(!snapshot.turn_retry_available, "the earlier message has no Retry any more");
             assert!(snapshot.conversation.retryable_human_turn().is_none());
             let failure = match &snapshot.conversation.entries[1].kind {
                 EntryKind::RunFailed { message, .. } => message.clone(),
                 other => panic!("the first failure is kept: {other:?}"),
             };
-            assert!(
-                failure.contains("until you send a newer message"),
-                "{failure}"
-            );
+            assert!(failure.contains("until you send a newer message"), "{failure}");
 
             let refused = retry(&fx, &stale).await.unwrap_err();
             assert!(refused.contains("Conversation changed"), "{refused}");
@@ -3942,11 +3057,7 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn a_send_that_races_a_retry_is_refused_and_the_newer_message_is_answered_once() {
-            let fx = fixture(
-                tempfile::tempdir().unwrap(),
-                &[Step::Fail, Step::Reply("Answer")],
-            )
-            .await;
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Fail, Step::Reply("Answer")]).await;
             send(&fx, "First").await.expect("recorded");
             let before = fx.conversation();
             let (sent, retried) = tokio::join!(send(&fx, "Second"), retry(&fx, &before));
@@ -3964,11 +3075,7 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn a_retry_that_races_a_send_is_answered_before_the_newer_message() {
-            let fx = fixture(
-                tempfile::tempdir().unwrap(),
-                &[Step::Fail, Step::Reply("Retried"), Step::Reply("Newer")],
-            )
-            .await;
+            let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Fail, Step::Reply("Retried"), Step::Reply("Newer")]).await;
             send(&fx, "First").await.expect("recorded");
             let before = fx.conversation();
             let (retried, sent) = tokio::join!(retry(&fx, &before), send(&fx, "Second"));
@@ -3998,12 +3105,7 @@ mod tests {
             let inspect_second = r#"{"type":"inspect_task","target_task_id":"22222222-2222-4222-8222-222222222222"}"#;
             let fx = fixture(
                 tempfile::tempdir().unwrap(),
-                &[
-                    Step::Proposal(inspect_first),
-                    Step::Proposal(list),
-                    Step::Proposal(inspect_second),
-                    Step::Reply("Done."),
-                ],
+                &[Step::Proposal(inspect_first), Step::Proposal(list), Step::Proposal(inspect_second), Step::Reply("Done.")],
             )
             .await;
             {
@@ -4015,11 +3117,7 @@ mod tests {
                     task.description = Some("d".repeat(5_000));
                     task.error_message = Some("e".repeat(2_000));
                     task.subtasks = (0..30)
-                        .map(|n| crate::domain::Subtask {
-                            id: Uuid::new_v4(),
-                            title: "s".repeat(300),
-                            completed: n % 2 == 0,
-                        })
+                        .map(|n| crate::domain::Subtask { id: Uuid::new_v4(), title: "s".repeat(300), completed: n % 2 == 0 })
                         .collect();
                     tasks.insert(task.id, task);
                 }
@@ -4030,39 +3128,23 @@ mod tests {
                     tasks.insert(task.id, task);
                 }
             }
-            send(&fx, "Look at everything")
-                .await
-                .expect("the send succeeds");
+            send(&fx, "Look at everything").await.expect("the send succeeds");
             assert_eq!(fx.runs(), 4);
-            let (limits, _) = super::super::invocation_limits(
-                crate::conversation_context::ContextSite::Ordinary,
-                Default::default(),
-            );
+            let (limits, _) = super::super::invocation_limits(crate::conversation_context::ContextSite::Ordinary, Default::default());
             for run in 1..=4 {
                 let sent = fx.prompt(run).chars().count() + limits.other_fixed_chars;
-                eprintln!(
-                    "maximum reads, invocation {run}: {sent} characters of {}",
-                    limits.max_chars
-                );
+                eprintln!("maximum reads, invocation {run}: {sent} characters of {}", limits.max_chars);
                 assert!(sent <= limits.max_chars, "invocation {run} sent {sent}");
             }
             let last = fx.prompt(4);
-            assert_eq!(
-                last.matches("\"result_truncated\"").count(),
-                3,
-                "all three reads were capped and marked"
-            );
+            assert_eq!(last.matches("\"result_truncated\"").count(), 3, "all three reads were capped and marked");
         }
 
         #[tokio::test(flavor = "multi_thread")]
         async fn a_proposal_left_out_of_the_context_can_still_be_decided() {
             use crate::domain::conversation::ProjectActionStatus;
             let fx = fixture(tempfile::tempdir().unwrap(), &[Step::Reply("Seen.")]).await;
-            let mut conversation = fx
-                .state()
-                .storage
-                .create_primary_conversation(fx.project_id)
-                .unwrap();
+            let mut conversation = fx.state().storage.create_primary_conversation(fx.project_id).unwrap();
             for index in 0..25 {
                 crate::conversation_actions::record_proposal(
                     &mut conversation,
@@ -4080,41 +3162,20 @@ mod tests {
                 .unwrap();
             }
             fx.state().storage.save_conversation(&conversation).unwrap();
-            let omitted = [
-                conversation.project_actions[0].id,
-                conversation.project_actions[1].id,
-            ];
+            let omitted = [conversation.project_actions[0].id, conversation.project_actions[1].id];
 
             send(&fx, "What is open?").await.expect("the send succeeds");
             let prompt = fx.prompt(1);
-            assert!(
-                prompt.contains("\"open_proposals_total\":25")
-                    && prompt.contains("\"open_proposals_omitted\":5")
-            );
-            let block = prompt
-                .split("\"open_proposals\":[")
-                .nth(1)
-                .unwrap()
-                .split("\"recent_history\"")
-                .next()
-                .unwrap();
+            assert!(prompt.contains("\"open_proposals_total\":25") && prompt.contains("\"open_proposals_omitted\":5"));
+            let block = prompt.split("\"open_proposals\":[").nth(1).unwrap().split("\"recent_history\"").next().unwrap();
             assert_eq!(block.matches("\"action_id\"").count(), 20);
             for id in omitted {
-                assert!(
-                    !block.contains(&id.to_string()),
-                    "the oldest proposals are not in the open proposals block"
-                );
+                assert!(!block.contains(&id.to_string()), "the oldest proposals are not in the open proposals block");
             }
 
             for (id, action) in [
-                (
-                    omitted[0],
-                    crate::commands::conversation::HumanAction::Reject,
-                ),
-                (
-                    omitted[1],
-                    crate::commands::conversation::HumanAction::Approve { request: None },
-                ),
+                (omitted[0], crate::commands::conversation::HumanAction::Reject),
+                (omitted[1], crate::commands::conversation::HumanAction::Approve { request: None }),
             ] {
                 let current = fx.conversation();
                 super::super::act_on_project_conversation(
@@ -4130,14 +3191,8 @@ mod tests {
                 .expect("an omitted proposal is still decidable");
             }
             let after = fx.conversation();
-            assert_eq!(
-                after.project_action(omitted[0]).unwrap().status,
-                ProjectActionStatus::Rejected
-            );
-            assert_ne!(
-                after.project_action(omitted[1]).unwrap().status,
-                ProjectActionStatus::Proposed
-            );
+            assert_eq!(after.project_action(omitted[0]).unwrap().status, ProjectActionStatus::Rejected);
+            assert_ne!(after.project_action(omitted[1]).unwrap().status, ProjectActionStatus::Proposed);
         }
     }
 }

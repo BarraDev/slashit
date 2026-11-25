@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 use crate::commands::gui_admission::GuiMutation;
-use crate::domain::{QaSignoff, QaStatus, Task};
+use crate::domain::{Task, QaSignoff, QaStatus};
 use uuid::Uuid;
 
 #[tauri::command]
@@ -57,9 +57,7 @@ pub async fn check_recurring_issues(
 
     if let Some(task) = tasks.get(&task_id) {
         if let Some(signoff) = &task.qa_signoff {
-            let count = signoff
-                .issues_found
-                .iter()
+            let count = signoff.issues_found.iter()
                 .filter(|i| i.to_lowercase() == issue.to_lowercase())
                 .count();
             return Ok(count >= 3);

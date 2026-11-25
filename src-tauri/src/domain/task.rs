@@ -79,12 +79,7 @@ pub struct DependencyAdmission {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(
-    tag = "kind",
-    content = "commits",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
+#[serde(tag = "kind", content = "commits", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DependencyRequirement {
     /// The dependency had no recorded branch and therefore required no work.
     Branchless,
@@ -817,9 +812,7 @@ impl Task {
     /// branch and HEAD are checked against Git by the caller, not here.
     pub fn existing_checkout_refusal(&self) -> Option<String> {
         if self.status != TaskStatus::Backlog {
-            return Some(
-                "An additional request can only reuse the checkout of a Backlog Task".into(),
-            );
+            return Some("An additional request can only reuse the checkout of a Backlog Task".into());
         }
         self.settled_checkout_refusal()
     }
@@ -833,18 +826,10 @@ impl Task {
             return Some("A new attempt for this Task's recovered run is pending, so its checkout cannot be reused".into());
         }
         if self.cleanup_in_flight {
-            return Some(
-                "An earlier cleanup of this Task's checkout is unfinished, so it cannot be reused"
-                    .into(),
-            );
+            return Some("An earlier cleanup of this Task's checkout is unfinished, so it cannot be reused".into());
         }
-        if self.republish_pending_refusal().is_some()
-            || self.integration_unfinished_refusal().is_some()
-        {
-            return Some(
-                "A checkout operation on this Task is unfinished, so its checkout cannot be reused"
-                    .into(),
-            );
+        if self.republish_pending_refusal().is_some() || self.integration_unfinished_refusal().is_some() {
+            return Some("A checkout operation on this Task is unfinished, so its checkout cannot be reused".into());
         }
         match self.worker_handoff.as_ref().map(|handoff| &handoff.stage) {
             None => None,
@@ -968,10 +953,7 @@ impl Task {
     /// reaches it through `lifecycle::queue_move_refusal`.
     pub fn queue_entry_refusal(&self) -> Option<String> {
         self.cleanup_in_flight
-            .then(|| {
-                "An earlier cleanup of this Task's checkout is unfinished, so it cannot run yet"
-                    .to_string()
-            })
+            .then(|| "An earlier cleanup of this Task's checkout is unfinished, so it cannot run yet".to_string())
             .or_else(|| self.republish_pending_refusal())
             .or_else(|| self.worker_recovery_refusal())
             .or_else(|| self.review_fix_residue_refusal())
@@ -1199,10 +1181,7 @@ impl Task {
         self.phase = TaskPhase::Failed;
         self.worker_handoff_confirmed = false;
         self.error_message = Some(reason.to_string());
-        self.record_activity(ActivityKind::RunFailed {
-            run: None,
-            reason: reason.to_string(),
-        });
+        self.record_activity(ActivityKind::RunFailed { run: None, reason: reason.to_string() });
         self.record_move(&from);
         // `record_move` ends the binding only when the column changed.
         self.approved_execution = None;
@@ -1218,10 +1197,7 @@ impl Task {
         self.phase = TaskPhase::Failed;
         self.worker_handoff_confirmed = false;
         self.error_message = Some(reason.to_string());
-        self.record_activity(ActivityKind::RunFailed {
-            run: None,
-            reason: reason.to_string(),
-        });
+        self.record_activity(ActivityKind::RunFailed { run: None, reason: reason.to_string() });
         self.record_move(&from);
         self.approved_execution = None;
     }
@@ -1237,10 +1213,7 @@ impl Task {
             return false;
         }
         self.error_message = Some(format!("{STALE_APPROVAL_REASON} {outcome}"));
-        self.record_activity(ActivityKind::RunFailed {
-            run: None,
-            reason: outcome.to_string(),
-        });
+        self.record_activity(ActivityKind::RunFailed { run: None, reason: outcome.to_string() });
         true
     }
 
@@ -1253,10 +1226,7 @@ impl Task {
             return false;
         }
         self.error_message = Some(format!("{refusal} {outcome}"));
-        self.record_activity(ActivityKind::RunFailed {
-            run: None,
-            reason: outcome.to_string(),
-        });
+        self.record_activity(ActivityKind::RunFailed { run: None, reason: outcome.to_string() });
         true
     }
 
@@ -1273,10 +1243,7 @@ impl Task {
             // reused for changes that were never decided. Done and PrCreated keep
             // it: integration and the delivered pull request still read it.
             if *from == TaskStatus::HumanReview
-                && !matches!(
-                    self.status,
-                    TaskStatus::HumanReview | TaskStatus::Done | TaskStatus::PrCreated
-                )
+                && !matches!(self.status, TaskStatus::HumanReview | TaskStatus::Done | TaskStatus::PrCreated)
             {
                 self.human_review.withdraw_approval();
             }
@@ -1607,11 +1574,8 @@ impl PrReviewPlan {
     /// there is exactly one. Lets a caller tell a missing identity from an
     /// ambiguous one.
     pub fn comment_count_for(&self, comment_id: u64) -> (usize, Option<&PrReviewComment>) {
-        let mut matches: Vec<&PrReviewComment> = self
-            .comments
-            .iter()
-            .filter(|c| c.id == Some(comment_id))
-            .collect();
+        let mut matches: Vec<&PrReviewComment> =
+            self.comments.iter().filter(|c| c.id == Some(comment_id)).collect();
         let count = matches.len();
         let unique = if count == 1 { matches.pop() } else { None };
         (count, unique)
@@ -2117,9 +2081,9 @@ const MAX_WORKER_MODEL_LEN: usize = 200;
 fn is_claude_model_id(model: &str) -> bool {
     model.len() <= MAX_WORKER_MODEL_LEN
         && model.starts_with(|c: char| c.is_ascii_alphanumeric())
-        && model.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | ':' | '@' | '[' | ']')
-        })
+        && model
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | ':' | '@' | '[' | ']'))
         && brackets_are_paired(model)
 }
 
@@ -2612,10 +2576,7 @@ mod tests {
         assert_eq!(restarted.checkout_admission, task.checkout_admission);
 
         let mut missing: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
-        missing
-            .as_object_mut()
-            .unwrap()
-            .remove("checkout_admission");
+        missing.as_object_mut().unwrap().remove("checkout_admission");
         let missing: Task = serde_json::from_value(missing).unwrap();
         assert!(missing.checkout_admission.is_none());
 
@@ -2963,8 +2924,7 @@ mod tests {
     /// is inferred about what it was configured to before.
     #[test]
     fn old_task_records_load_without_an_observed_model_and_keep_their_configured_model() {
-        let task: Task =
-            toml::from_str(LEGACY_TASK_TOML).expect("old Task TOML remains compatible");
+        let task: Task = toml::from_str(LEGACY_TASK_TOML).expect("old Task TOML remains compatible");
         assert_eq!(task.model, "test-model");
         assert_eq!(task.last_observed_model, None);
 
@@ -3034,17 +2994,11 @@ mod tests {
     #[test]
     fn a_new_attempt_decision_admits_only_when_confirmed_for_the_recovered_run() {
         let (mut task, _) = recovered_task_with_decision(2);
-        assert!(
-            !task.new_attempt_admits(),
-            "an unconfirmed decision never admits"
-        );
+        assert!(!task.new_attempt_admits(), "an unconfirmed decision never admits");
         task.new_attempt_confirmed = true;
         assert!(task.new_attempt_admits());
         task.new_attempt.as_mut().unwrap().for_run = 1;
-        assert!(
-            !task.new_attempt_admits(),
-            "a decision for an earlier run is stale"
-        );
+        assert!(!task.new_attempt_admits(), "a decision for an earlier run is stale");
     }
 
     #[test]
@@ -3301,10 +3255,7 @@ mod tests {
             0,
         );
         let stored = serde_json::to_value(&task).unwrap();
-        assert!(
-            stored.get("review_mode").is_none(),
-            "the default is not written"
-        );
+        assert!(stored.get("review_mode").is_none(), "the default is not written");
         let loaded: Task = serde_json::from_value(stored).unwrap();
         assert_eq!(loaded.review_mode, ReviewMode::Automatic);
 
@@ -3329,10 +3280,7 @@ mod tests {
             reviewer_model: None,
         };
         let stored = serde_json::to_value(&handoff).unwrap();
-        assert!(
-            stored.get("review_mode").is_none(),
-            "a run's default is not written"
-        );
+        assert!(stored.get("review_mode").is_none(), "a run's default is not written");
         let loaded: WorkerHandoff = serde_json::from_value(stored).unwrap();
         assert_eq!(loaded.review_mode, ReviewMode::Automatic);
     }
@@ -3398,22 +3346,11 @@ mod tests {
             "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
             "claude-sonnet-4-5@20250929",
         ] {
-            assert_eq!(
-                parse_worker_model(CodingProvider::Claude, id).as_deref(),
-                Ok(id),
-                "{id}"
-            );
+            assert_eq!(parse_worker_model(CodingProvider::Claude, id).as_deref(), Ok(id), "{id}");
         }
+        assert_eq!(parse_worker_model(CodingProvider::Claude, " opus \n").as_deref(), Ok("opus"));
         assert_eq!(
-            parse_worker_model(CodingProvider::Claude, " opus \n").as_deref(),
-            Ok("opus")
-        );
-        assert_eq!(
-            parse_worker_model(
-                CodingProvider::OpenCode,
-                " ollama/dcostenco/prism-coder:4b "
-            )
-            .as_deref(),
+            parse_worker_model(CodingProvider::OpenCode, " ollama/dcostenco/prism-coder:4b ").as_deref(),
             Ok("ollama/dcostenco/prism-coder:4b")
         );
         for provider in [CodingProvider::Claude, CodingProvider::OpenCode] {
@@ -3440,13 +3377,7 @@ mod tests {
             assert!(refusal.contains("was not saved"), "{refusal}");
         }
         // An OpenCode Worker takes only provider/model, and nothing with whitespace.
-        for id in [
-            "default",
-            "sonnet",
-            "ollama/",
-            "/llama3.2:3b",
-            "ollama/llama 3",
-        ] {
+        for id in ["default", "sonnet", "ollama/", "/llama3.2:3b", "ollama/llama 3"] {
             let refusal = parse_worker_model(CodingProvider::OpenCode, id).unwrap_err();
             assert!(refusal.contains("provider/model"), "{refusal}");
             assert!(refusal.contains("was not saved"), "{refusal}");
@@ -3521,12 +3452,8 @@ mod tests {
             serde_json::from_str::<WorkerHandoffStage>(r#"{"state":"started"}"#).unwrap(),
             WorkerHandoffStage::Started {}
         );
-        assert!(
-            serde_json::from_str::<WorkerHandoffStage>(r#"{"state":"started","x":1}"#).is_err()
-        );
-        assert!(
-            serde_json::from_str::<ActivityKind>(r#"{"type":"completed_locally","x":1}"#).is_err()
-        );
+        assert!(serde_json::from_str::<WorkerHandoffStage>(r#"{"state":"started","x":1}"#).is_err());
+        assert!(serde_json::from_str::<ActivityKind>(r#"{"type":"completed_locally","x":1}"#).is_err());
     }
 
     #[test]
@@ -4125,8 +4052,9 @@ mod tests {
 
         // A discard clears the record and records that no pull request exists.
         task.pr_create_unconfirmed = None;
-        task.human_review.pr_error =
-            Some("You confirmed that no pull request exists. Retry to open one.".to_string());
+        task.human_review.pr_error = Some(
+            "You confirmed that no pull request exists. Retry to open one.".to_string(),
+        );
         assert_eq!(task.needs_you(false), Some(AttentionReason::PrNotCreated));
     }
 

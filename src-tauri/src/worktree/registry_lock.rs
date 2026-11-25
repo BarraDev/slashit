@@ -114,24 +114,16 @@ fn run_git_blocking_with(
     use std::process::Stdio;
     let lock = {
         let mut held = locks().lock().unwrap_or_else(PoisonError::into_inner);
-        held.entry(registry_key(Path::new(repo_path)))
-            .or_default()
-            .clone()
+        held.entry(registry_key(Path::new(repo_path))).or_default().clone()
     };
     // The lock guards no data, so a holder that panicked leaves nothing
     // half-written behind it.
     let _one_at_a_time = lock.lock().unwrap_or_else(PoisonError::into_inner);
     let mut command = crate::host_process::std_command(program);
-    command
-        .args(args)
-        .envs(envs.iter().map(|(k, v)| (k, v)))
-        .current_dir(repo_path);
+    command.args(args).envs(envs.iter().map(|(k, v)| (k, v))).current_dir(repo_path);
     // Standard input is closed unless given: `output()` does that for us.
     match input {
-        Input::None => Ok(Ran {
-            output: command.output()?,
-            input_written: Ok(()),
-        }),
+        Input::None => Ok(Ran { output: command.output()?, input_written: Ok(()) }),
         Input::Bytes(bytes) => {
             use std::io::Write;
             let mut child = command
@@ -144,13 +136,10 @@ fn run_git_blocking_with(
             // answer cannot wait on each other.
             let writer = std::thread::spawn(move || stdin.write_all(&bytes));
             let output = child.wait_with_output()?;
-            let input_written = writer.join().unwrap_or_else(|_| {
-                Err(std::io::Error::other("the thread writing to git panicked"))
-            });
-            Ok(Ran {
-                output,
-                input_written,
-            })
+            let input_written = writer
+                .join()
+                .unwrap_or_else(|_| Err(std::io::Error::other("the thread writing to git panicked")));
+            Ok(Ran { output, input_written })
         }
     }
 }
@@ -176,10 +165,7 @@ pub(super) async fn run_git_with(
 ) -> std::io::Result<Ran> {
     let repo_path = repo_path.to_string();
     let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-    let envs: Vec<(String, String)> = envs
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.clone()))
-        .collect();
+    let envs: Vec<(String, String)> = envs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
     tokio::task::spawn_blocking(move || {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         run_git_blocking_with(&program, &repo_path, &args, &envs, input)
@@ -190,14 +176,8 @@ pub(super) async fn run_git_with(
 
 /// [`run_git`] for the many callers that give no input and want only the
 /// output.
-pub(super) async fn output(
-    program: OsString,
-    repo_path: &str,
-    args: &[&str],
-) -> std::io::Result<Output> {
-    run_git(program, repo_path, args, Input::None)
-        .await
-        .map(|ran| ran.output)
+pub(super) async fn output(program: OsString, repo_path: &str, args: &[&str]) -> std::io::Result<Output> {
+    run_git(program, repo_path, args, Input::None).await.map(|ran| ran.output)
 }
 
 #[cfg(test)]
@@ -210,39 +190,13 @@ mod tests {
         let repo = dir.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .args(args)
-                .current_dir(&repo)
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "{args:?}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
+            let out = std::process::Command::new("git").args(args).current_dir(&repo).output().unwrap();
+            assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
         };
         git(&["init", "-q", "-b", "main"]);
-        git(&[
-            "-c",
-            "user.email=a@b",
-            "-c",
-            "user.name=n",
-            "commit",
-            "-q",
-            "--allow-empty",
-            "-m",
-            "i",
-        ]);
+        git(&["-c", "user.email=a@b", "-c", "user.name=n", "commit", "-q", "--allow-empty", "-m", "i"]);
         let linked = dir.path().join("linked");
-        git(&[
-            "worktree",
-            "add",
-            "-q",
-            "-b",
-            "other",
-            "--",
-            linked.to_str().unwrap(),
-        ]);
+        git(&["worktree", "add", "-q", "-b", "other", "--", linked.to_str().unwrap()]);
         std::fs::create_dir_all(repo.join("sub")).unwrap();
 
         let primary = registry_key(&repo);

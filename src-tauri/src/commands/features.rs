@@ -108,10 +108,7 @@ mod tests {
 
         let result = set_feature_flag_on(&features, &paths, "daemon_mode", true).await;
 
-        assert!(
-            result.is_err(),
-            "save should fail against an unwritable config dir"
-        );
+        assert!(result.is_err(), "save should fail against an unwritable config dir");
         assert!(
             !features.read().await.daemon_mode,
             "a failed save must not leave the in-memory flag diverged from disk"
@@ -139,10 +136,7 @@ mod tests {
 
         assert!(error.contains("could not confirm"), "{error}");
         assert!(features.read().await.daemon_mode, "memory follows the file");
-        assert!(
-            FeatureFlags::load(&paths).daemon_mode,
-            "the file holds the toggle"
-        );
+        assert!(FeatureFlags::load(&paths).daemon_mode, "the file holds the toggle");
     }
 
     #[tokio::test]
@@ -216,10 +210,7 @@ mod tests {
             "the re-resolved set must still reflect the (still-set, at read time) \
              environment override"
         );
-        assert!(
-            result.auto_update,
-            "the actually-requested toggle must still apply"
-        );
+        assert!(result.auto_update, "the actually-requested toggle must still apply");
     }
 
     #[tokio::test]

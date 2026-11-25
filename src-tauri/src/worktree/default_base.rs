@@ -90,12 +90,8 @@ impl ResolvedBase {
     /// What a task branch created at this base records as its origin.
     pub fn branch_origin(&self) -> BranchOrigin {
         match self.source {
-            BaseSource::Remote => BranchOrigin::DefaultBase {
-                branch: Some(self.branch.clone()),
-            },
-            BaseSource::Local => BranchOrigin::LocalBase {
-                branch: self.branch.clone(),
-            },
+            BaseSource::Remote => BranchOrigin::DefaultBase { branch: Some(self.branch.clone()) },
+            BaseSource::Local => BranchOrigin::LocalBase { branch: self.branch.clone() },
         }
     }
 
@@ -247,11 +243,9 @@ async fn resolve_local_base(
 ) -> Result<ResolvedBase, String> {
     let branch = super::checked_base_branch(branch)?;
     match at_branch(repo, LOCAL_BRANCHES, branch).await? {
-        Found::Commit(commit) => Ok(ResolvedBase {
-            branch: branch.to_string(),
-            commit,
-            source: BaseSource::Local,
-        }),
+        Found::Commit(commit) => {
+            Ok(ResolvedBase { branch: branch.to_string(), commit, source: BaseSource::Local })
+        }
         Found::Missing => Err(format!(
             "This project's base branch {branch} does not exist in {repo_path} any more, so \
              SlashIt cannot tell where a new task should start. Choose the base branch again in \
@@ -266,10 +260,7 @@ async fn resolve_local_base(
 
 /// Whether a local branch `branch` is one a task branch can start at, and
 /// its commit. For choosing and capturing a project's base.
-pub(super) async fn local_branch_commit(
-    repo: &Path,
-    branch: &str,
-) -> Result<Option<String>, String> {
+pub(super) async fn local_branch_commit(repo: &Path, branch: &str) -> Result<Option<String>, String> {
     Ok(match at_branch(repo, LOCAL_BRANCHES, branch).await? {
         Found::Commit(commit) => Some(commit),
         Found::Missing | Found::Unusable(_) => None,
@@ -376,9 +367,7 @@ async fn at_branch(repo: &Path, prefix: &str, branch: &str) -> Result<Found, Str
         return Ok(Found::Missing);
     };
     if !has_commit(repo, &commit).await? {
-        return Ok(Found::Unusable(
-            "names a commit this repository does not have",
-        ));
+        return Ok(Found::Unusable("names a commit this repository does not have"));
     }
     if !is_commit_object(repo, &commit).await? {
         return Ok(Found::Unusable("names a tag object, not a commit"));
@@ -496,11 +485,7 @@ mod tests {
             .current_dir(dir)
             .output()
             .expect("spawn git");
-        assert!(
-            output.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
@@ -516,10 +501,7 @@ mod tests {
         git(&repo, &["init", "-q", "-b", "trunk"]);
         git(&repo, &["commit", "-q", "--allow-empty", "-m", "first"]);
         git(&repo, &["init", "-q", "--bare", origin.to_str().unwrap()]);
-        git(
-            &repo,
-            &["remote", "add", "origin", origin.to_str().unwrap()],
-        );
+        git(&repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
         git(&repo, &["push", "-q", "origin", "trunk"]);
         git(&repo, &["remote", "set-head", "origin", "trunk"]);
         let tip = git(&repo, &["rev-parse", "refs/remotes/origin/trunk"]);
@@ -539,11 +521,7 @@ mod tests {
 
         assert_eq!(
             resolve(&repo).await,
-            Ok(ResolvedBase {
-                branch: "trunk".to_string(),
-                commit: tip,
-                source: BaseSource::Remote
-            })
+            Ok(ResolvedBase { branch: "trunk".to_string(), commit: tip, source: BaseSource::Remote })
         );
     }
 
@@ -552,20 +530,13 @@ mod tests {
     #[tokio::test]
     async fn a_default_branch_with_a_slash_is_read_whole() {
         let (_temp, repo, tip) = cloned_repo();
-        git(
-            &repo,
-            &["push", "-q", "origin", "trunk:refs/heads/release/v2"],
-        );
+        git(&repo, &["push", "-q", "origin", "trunk:refs/heads/release/v2"]);
         git(&repo, &["fetch", "-q", "origin"]);
         git(&repo, &["remote", "set-head", "origin", "release/v2"]);
 
         assert_eq!(
             resolve(&repo).await,
-            Ok(ResolvedBase {
-                branch: "release/v2".to_string(),
-                commit: tip,
-                source: BaseSource::Remote
-            })
+            Ok(ResolvedBase { branch: "release/v2".to_string(), commit: tip, source: BaseSource::Remote })
         );
     }
 
@@ -575,80 +546,29 @@ mod tests {
     async fn an_unusable_origin_head_is_refused_with_what_to_run() {
         type Arrange = fn(&Path, &str);
         let cases: [(&str, Arrange, &str); 6] = [
-            (
-                "missing",
-                |repo, _| {
-                    git(
-                        repo,
-                        &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
-                    );
-                },
-                "git remote set-head origin --auto",
-            ),
-            (
-                "dangling",
-                |repo, _| {
-                    git(
-                        repo,
-                        &[
-                            "symbolic-ref",
-                            "refs/remotes/origin/HEAD",
-                            "refs/remotes/origin/gone",
-                        ],
-                    );
-                },
-                "git remote set-head origin --auto",
-            ),
-            (
-                "not symbolic",
-                |repo, tip| {
-                    git(
-                        repo,
-                        &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
-                    );
-                    git(repo, &["update-ref", "refs/remotes/origin/HEAD", tip]);
-                },
-                "git remote set-head origin --auto",
-            ),
-            (
-                "another remote",
-                |repo, tip| {
-                    git(repo, &["update-ref", "refs/remotes/upstream/trunk", tip]);
-                    git(
-                        repo,
-                        &[
-                            "symbolic-ref",
-                            "refs/remotes/origin/HEAD",
-                            "refs/remotes/upstream/trunk",
-                        ],
-                    );
-                },
-                "not at a branch of origin",
-            ),
-            (
-                "a name SlashIt will not pass on",
-                |repo, tip| {
-                    git(repo, &["update-ref", "refs/remotes/origin/we@ird", tip]);
-                    git(
-                        repo,
-                        &[
-                            "symbolic-ref",
-                            "refs/remotes/origin/HEAD",
-                            "refs/remotes/origin/we@ird",
-                        ],
-                    );
-                },
-                "cannot use",
-            ),
-            (
-                "a tag object, not a commit",
-                |repo, _| {
-                    git(repo, &["tag", "-a", "-m", "annotated", "v1"]);
-                    let tag = git(repo, &["rev-parse", "refs/tags/v1"]);
-                    git(repo, &["update-ref", "refs/remotes/origin/trunk", &tag]);
-                },
-                "names a tag object, not a commit",
-            ),
+            ("missing", |repo, _| {
+                git(repo, &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"]);
+            }, "git remote set-head origin --auto"),
+            ("dangling", |repo, _| {
+                git(repo, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/gone"]);
+            }, "git remote set-head origin --auto"),
+            ("not symbolic", |repo, tip| {
+                git(repo, &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"]);
+                git(repo, &["update-ref", "refs/remotes/origin/HEAD", tip]);
+            }, "git remote set-head origin --auto"),
+            ("another remote", |repo, tip| {
+                git(repo, &["update-ref", "refs/remotes/upstream/trunk", tip]);
+                git(repo, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/upstream/trunk"]);
+            }, "not at a branch of origin"),
+            ("a name SlashIt will not pass on", |repo, tip| {
+                git(repo, &["update-ref", "refs/remotes/origin/we@ird", tip]);
+                git(repo, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/we@ird"]);
+            }, "cannot use"),
+            ("a tag object, not a commit", |repo, _| {
+                git(repo, &["tag", "-a", "-m", "annotated", "v1"]);
+                let tag = git(repo, &["rev-parse", "refs/tags/v1"]);
+                git(repo, &["update-ref", "refs/remotes/origin/trunk", &tag]);
+            }, "names a tag object, not a commit"),
         ];
         for (name, arrange, expected) in cases {
             let (_temp, repo, tip) = cloned_repo();
@@ -665,44 +585,17 @@ mod tests {
     #[tokio::test]
     async fn an_origin_head_through_another_symbolic_ref_resolves_to_where_the_chain_ends() {
         let (_temp, repo, tip) = cloned_repo();
-        git(
-            &repo,
-            &[
-                "symbolic-ref",
-                "refs/remotes/origin/alias",
-                "refs/remotes/origin/trunk",
-            ],
-        );
-        git(
-            &repo,
-            &[
-                "symbolic-ref",
-                "refs/remotes/origin/HEAD",
-                "refs/remotes/origin/alias",
-            ],
-        );
+        git(&repo, &["symbolic-ref", "refs/remotes/origin/alias", "refs/remotes/origin/trunk"]);
+        git(&repo, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/alias"]);
 
         assert_eq!(
             resolve(&repo).await,
-            Ok(ResolvedBase {
-                branch: "trunk".to_string(),
-                commit: tip.clone(),
-                source: BaseSource::Remote
-            })
+            Ok(ResolvedBase { branch: "trunk".to_string(), commit: tip.clone(), source: BaseSource::Remote })
         );
 
         git(&repo, &["update-ref", "refs/remotes/upstream/trunk", &tip]);
-        git(
-            &repo,
-            &[
-                "symbolic-ref",
-                "refs/remotes/origin/alias",
-                "refs/remotes/upstream/trunk",
-            ],
-        );
-        let refused = resolve(&repo)
-            .await
-            .expect_err("a chain ending outside origin");
+        git(&repo, &["symbolic-ref", "refs/remotes/origin/alias", "refs/remotes/upstream/trunk"]);
+        let refused = resolve(&repo).await.expect_err("a chain ending outside origin");
         assert!(refused.contains("not at a branch of origin"), "{refused}");
     }
 
@@ -725,14 +618,8 @@ mod tests {
         }
         assert_eq!(resolve(&repo).await.map(|b| b.commit), Ok(tip.clone()));
 
-        git(
-            &repo,
-            &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
-        );
-        assert!(
-            resolve(&repo).await.is_err(),
-            "the look-alikes do not stand in for it"
-        );
+        git(&repo, &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"]);
+        assert!(resolve(&repo).await.is_err(), "the look-alikes do not stand in for it");
     }
 
     /// No remote named `origin`, whether a local-only repository or one
@@ -750,10 +637,7 @@ mod tests {
 
         let upstream = temp.path().join("upstream.git");
         git(&repo, &["init", "-q", "--bare", upstream.to_str().unwrap()]);
-        git(
-            &repo,
-            &["remote", "add", "upstream", upstream.to_str().unwrap()],
-        );
+        git(&repo, &["remote", "add", "upstream", upstream.to_str().unwrap()]);
         git(&repo, &["push", "-q", "upstream", "main"]);
         git(&repo, &["remote", "set-head", "upstream", "main"]);
         let refused = resolve(&repo).await.expect_err("another remote");
@@ -761,9 +645,7 @@ mod tests {
     }
 
     fn local(branch: &str) -> ProjectBase {
-        ProjectBase::LocalBranch {
-            branch: branch.to_string(),
-        }
+        ProjectBase::LocalBranch { branch: branch.to_string() }
     }
 
     async fn resolve_with(repo: &Path, base: &ProjectBase) -> Result<ResolvedBase, String> {
@@ -781,36 +663,18 @@ mod tests {
         git(&repo, &["commit", "-q", "--allow-empty", "-m", "first"]);
         let tip = git(&repo, &["rev-parse", "HEAD"]);
         git(&repo, &["checkout", "-q", "-b", "feature"]);
-        git(
-            &repo,
-            &["commit", "-q", "--allow-empty", "-m", "feature work"],
-        );
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "feature work"]);
 
-        let base = resolve_with(&repo, &local("trunk-xyz"))
-            .await
-            .expect("local base");
+        let base = resolve_with(&repo, &local("trunk-xyz")).await.expect("local base");
         assert_eq!(
             base,
-            ResolvedBase {
-                branch: "trunk-xyz".to_string(),
-                commit: tip,
-                source: BaseSource::Local
-            }
+            ResolvedBase { branch: "trunk-xyz".to_string(), commit: tip, source: BaseSource::Local }
         );
-        assert_eq!(
-            base.branch_origin(),
-            BranchOrigin::LocalBase {
-                branch: "trunk-xyz".to_string()
-            }
-        );
+        assert_eq!(base.branch_origin(), BranchOrigin::LocalBase { branch: "trunk-xyz".to_string() });
 
-        let refused = resolve_with(&repo, &local("gone"))
-            .await
-            .expect_err("missing base");
+        let refused = resolve_with(&repo, &local("gone")).await.expect_err("missing base");
         assert!(refused.contains("does not exist"), "{refused}");
-        let refused = resolve_with(&repo, &local("-evil"))
-            .await
-            .expect_err("unsafe name");
+        let refused = resolve_with(&repo, &local("-evil")).await.expect_err("unsafe name");
         assert!(refused.contains("will not use it"), "{refused}");
     }
 
@@ -822,46 +686,18 @@ mod tests {
     async fn origin_head_takes_precedence_over_the_project_base() {
         let (_temp, repo, tip) = cloned_repo();
         git(&repo, &["checkout", "-q", "-b", "local-base"]);
-        git(
-            &repo,
-            &["commit", "-q", "--allow-empty", "-m", "local only"],
-        );
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "local only"]);
         let local_tip = git(&repo, &["rev-parse", "HEAD"]);
         let base = local("local-base");
 
-        assert_eq!(
-            resolve_with(&repo, &base)
-                .await
-                .map(|b| (b.commit, b.source)),
-            Ok((tip, BaseSource::Remote))
-        );
+        assert_eq!(resolve_with(&repo, &base).await.map(|b| (b.commit, b.source)), Ok((tip, BaseSource::Remote)));
 
-        git(
-            &repo,
-            &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
-        );
-        assert_eq!(
-            resolve_with(&repo, &base)
-                .await
-                .map(|b| (b.commit, b.source)),
-            Ok((local_tip.clone(), BaseSource::Local))
-        );
+        git(&repo, &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"]);
+        assert_eq!(resolve_with(&repo, &base).await.map(|b| (b.commit, b.source)), Ok((local_tip.clone(), BaseSource::Local)));
 
-        git(
-            &repo,
-            &["update-ref", "refs/remotes/upstream/trunk", &local_tip],
-        );
-        git(
-            &repo,
-            &[
-                "symbolic-ref",
-                "refs/remotes/origin/HEAD",
-                "refs/remotes/upstream/trunk",
-            ],
-        );
-        let refused = resolve_with(&repo, &base)
-            .await
-            .expect_err("origin/HEAD outside origin");
+        git(&repo, &["update-ref", "refs/remotes/upstream/trunk", &local_tip]);
+        git(&repo, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/upstream/trunk"]);
+        let refused = resolve_with(&repo, &base).await.expect_err("origin/HEAD outside origin");
         assert!(refused.contains("not at a branch of origin"), "{refused}");
     }
 
@@ -872,23 +708,17 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let plain = temp.path().join("plain");
         std::fs::create_dir_all(&plain).unwrap();
-        let refused = resolve_with(&plain, &local("trunk"))
-            .await
-            .expect_err("no vcs");
+        let refused = resolve_with(&plain, &local("trunk")).await.expect_err("no vcs");
         assert!(refused.contains("not under version control"), "{refused}");
 
         std::fs::create_dir_all(plain.join(".jj")).unwrap();
-        let refused = resolve_with(&plain, &local("trunk"))
-            .await
-            .expect_err("jj without git");
+        let refused = resolve_with(&plain, &local("trunk")).await.expect_err("jj without git");
         assert!(refused.contains("not colocated with Git"), "{refused}");
 
         let empty = temp.path().join("empty");
         std::fs::create_dir_all(&empty).unwrap();
         git(&empty, &["init", "-q"]);
-        let refused = resolve_default_base(empty.to_str().unwrap(), None)
-            .await
-            .expect_err("no commit");
+        let refused = resolve_default_base(empty.to_str().unwrap(), None).await.expect_err("no commit");
         assert!(refused.contains("no commits yet"), "{refused}");
     }
 
@@ -896,15 +726,10 @@ mod tests {
     /// `answer`, in a repository whose `origin/HEAD` is gone.
     #[cfg(unix)]
     async fn with_jj_answering(answer: &str) -> (Result<ResolvedBase, String>, String, String) {
-        let fake =
-            crate::test_helpers::FakeProgram::install("jj", &format!("printf '%s\\n' '{answer}'"))
-                .await;
+        let fake = crate::test_helpers::FakeProgram::install("jj", &format!("printf '%s\\n' '{answer}'")).await;
         let (_temp, repo, tip) = cloned_repo();
         std::fs::create_dir_all(repo.join(".jj")).unwrap();
-        git(
-            &repo,
-            &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
-        );
+        git(&repo, &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"]);
         let resolved = resolve(&repo).await;
         (resolved, fake.invocations(), tip)
     }
@@ -913,14 +738,7 @@ mod tests {
     #[tokio::test]
     async fn jj_trunk_naming_a_fetched_origin_branch_is_the_default_base() {
         let (resolved, invocations, tip) = with_jj_answering("trunk@origin").await;
-        assert_eq!(
-            resolved,
-            Ok(ResolvedBase {
-                branch: "trunk".to_string(),
-                commit: tip,
-                source: BaseSource::Remote
-            })
-        );
+        assert_eq!(resolved, Ok(ResolvedBase { branch: "trunk".to_string(), commit: tip, source: BaseSource::Remote }));
         assert_eq!(
             invocations,
             "jj --ignore-working-copy --color=never config get revset-aliases.\"trunk()\"\n",
@@ -946,10 +764,7 @@ mod tests {
         ] {
             let (resolved, _, _) = with_jj_answering(answer).await;
             let refused = resolved.expect_err(answer);
-            assert!(
-                refused.contains("trunk() alias did not name one"),
-                "{answer:?}: {refused}"
-            );
+            assert!(refused.contains("trunk() alias did not name one"), "{answer:?}: {refused}");
         }
     }
 
@@ -962,65 +777,33 @@ mod tests {
     async fn jj_trunk_naming_an_unusable_origin_ref_is_refused_with_the_reason() {
         type Arrange = fn(&Path);
         let cases: [(&str, Arrange, &str); 3] = [
-            (
-                "symbolic ref",
-                |repo| {
-                    git(
-                        repo,
-                        &[
-                            "symbolic-ref",
-                            "refs/remotes/origin/alias",
-                            "refs/remotes/origin/trunk",
-                        ],
-                    );
-                },
-                "is itself a symbolic ref",
-            ),
-            (
-                "missing commit",
-                |repo| {
-                    std::fs::write(
-                        repo.join(".git/refs/remotes/origin/alias"),
-                        "0123456789abcdef0123456789abcdef01234567\n",
-                    )
-                    .unwrap();
-                },
-                "names a commit this repository does not have",
-            ),
-            (
-                "tag object",
-                |repo| {
-                    git(repo, &["tag", "-a", "-m", "annotated", "v1"]);
-                    let tag = git(repo, &["rev-parse", "refs/tags/v1"]);
-                    git(repo, &["update-ref", "refs/remotes/origin/alias", &tag]);
-                },
-                "names a tag object, not a commit",
-            ),
+            ("symbolic ref", |repo| {
+                git(repo, &["symbolic-ref", "refs/remotes/origin/alias", "refs/remotes/origin/trunk"]);
+            }, "is itself a symbolic ref"),
+            ("missing commit", |repo| {
+                std::fs::write(
+                    repo.join(".git/refs/remotes/origin/alias"),
+                    "0123456789abcdef0123456789abcdef01234567\n",
+                )
+                .unwrap();
+            }, "names a commit this repository does not have"),
+            ("tag object", |repo| {
+                git(repo, &["tag", "-a", "-m", "annotated", "v1"]);
+                let tag = git(repo, &["rev-parse", "refs/tags/v1"]);
+                git(repo, &["update-ref", "refs/remotes/origin/alias", &tag]);
+            }, "names a tag object, not a commit"),
         ];
-        let fake =
-            crate::test_helpers::FakeProgram::install("jj", "printf 'alias@origin\\n'").await;
+        let fake = crate::test_helpers::FakeProgram::install("jj", "printf 'alias@origin\\n'").await;
         for (name, arrange, why) in cases {
             let (_temp, repo, _) = cloned_repo();
             std::fs::create_dir_all(repo.join(".jj")).unwrap();
-            git(
-                &repo,
-                &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
-            );
+            git(&repo, &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"]);
             arrange(&repo);
 
             let refused = resolve(&repo).await.expect_err(name);
-            assert!(
-                refused.contains("trunk() alias names alias@origin"),
-                "{name}: {refused}"
-            );
-            assert!(
-                refused.contains(&format!("refs/remotes/origin/alias {why}")),
-                "{name}: {refused}"
-            );
-            assert!(
-                !refused.contains("has not been fetched"),
-                "{name}: {refused}"
-            );
+            assert!(refused.contains("trunk() alias names alias@origin"), "{name}: {refused}");
+            assert!(refused.contains(&format!("refs/remotes/origin/alias {why}")), "{name}: {refused}");
+            assert!(!refused.contains("has not been fetched"), "{name}: {refused}");
         }
         assert!(fake.invocations().contains("config get"));
     }
@@ -1035,19 +818,13 @@ mod tests {
         .await;
         let (_temp, repo, _) = cloned_repo();
         std::fs::create_dir_all(repo.join(".jj")).unwrap();
-        git(
-            &repo,
-            &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
-        );
+        git(&repo, &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"]);
         assert!(resolve(&repo).await.is_err());
         drop(fake);
 
         let _absent = crate::test_helpers::FakeProgram::without(&["wt", "jj"]).await;
         let refused = resolve(&repo).await.expect_err("jj is not installed");
-        assert!(
-            refused.contains("git remote set-head origin --auto"),
-            "{refused}"
-        );
+        assert!(refused.contains("git remote set-head origin --auto"), "{refused}");
     }
 
     /// JJ is asked only in a JJ repository, and only when `origin/HEAD`
@@ -1055,18 +832,14 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn jj_is_consulted_only_when_it_is_needed() {
-        let fake =
-            crate::test_helpers::FakeProgram::install("jj", "printf 'trunk@origin\\n'").await;
+        let fake = crate::test_helpers::FakeProgram::install("jj", "printf 'trunk@origin\\n'").await;
 
         let (_temp, repo, tip) = cloned_repo();
         std::fs::create_dir_all(repo.join(".jj")).unwrap();
         assert_eq!(resolve(&repo).await.map(|b| b.commit), Ok(tip));
 
         let (_temp, repo, _) = cloned_repo();
-        git(
-            &repo,
-            &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
-        );
+        git(&repo, &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"]);
         assert!(resolve(&repo).await.is_err(), "not a JJ repository");
 
         assert_eq!(fake.invocations(), "");
@@ -1084,32 +857,15 @@ mod tests {
 
         // Once it has integrated into `trunk`, the same state is refused.
         let local = git(&repo, &["rev-parse", "refs/heads/trunk"]);
-        git(
-            &repo,
-            &[
-                "update-ref",
-                &super::super::integration::marker_ref("trunk"),
-                &local,
-            ],
-        );
+        git(&repo, &["update-ref", &super::super::integration::marker_ref("trunk"), &local]);
         let refused = resolve(&repo).await.unwrap_err();
-        assert!(
-            refused.contains("integrated") && refused.contains("git push origin trunk"),
-            "{refused}"
-        );
-        assert!(
-            !refused.contains("  "),
-            "no runs of spaces in the message: {refused}"
-        );
+        assert!(refused.contains("integrated") && refused.contains("git push origin trunk"), "{refused}");
+        assert!(!refused.contains("  "), "no runs of spaces in the message: {refused}");
 
         // The same when the project names `trunk` as its local base: the
         // answer comes from the repository, not from the project record.
-        let base = ProjectBase::LocalBranch {
-            branch: "trunk".to_string(),
-        };
-        assert!(resolve_default_base(repo.to_str().unwrap(), Some(&base))
-            .await
-            .is_err());
+        let base = ProjectBase::LocalBranch { branch: "trunk".to_string() };
+        assert!(resolve_default_base(repo.to_str().unwrap(), Some(&base)).await.is_err());
 
         // Publishing it, or origin being ahead of it, ends the refusal.
         git(&repo, &["push", "-q", "origin", "trunk"]);
@@ -1121,39 +877,21 @@ mod tests {
     async fn a_diverged_local_branch_with_integrated_work_is_refused_and_a_behind_one_is_not() {
         let (_temp, repo, _) = cloned_repo();
         let first = git(&repo, &["rev-parse", "refs/heads/trunk"]);
-        git(
-            &repo,
-            &[
-                "update-ref",
-                &super::super::integration::marker_ref("trunk"),
-                &first,
-            ],
-        );
+        git(&repo, &["update-ref", &super::super::integration::marker_ref("trunk"), &first]);
 
         // Origin moves on; the local branch is behind: origin's contains it.
-        git(
-            &repo,
-            &["commit", "-q", "--allow-empty", "-m", "origin only"],
-        );
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "origin only"]);
         git(&repo, &["push", "-q", "origin", "trunk"]);
         git(&repo, &["reset", "-q", "--hard", &first]);
-        assert!(
-            resolve(&repo).await.is_ok(),
-            "behind origin: starting from origin loses nothing"
-        );
+        assert!(resolve(&repo).await.is_ok(), "behind origin: starting from origin loses nothing");
 
         // Local work that origin lacks, on top of the old commit: diverged.
-        git(
-            &repo,
-            &["commit", "-q", "--allow-empty", "-m", "local only"],
-        );
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "local only"]);
         assert!(resolve(&repo).await.is_err());
     }
 
     fn preferring(branch: &str) -> ProjectBase {
-        ProjectBase::PreferredLocalBranch {
-            branch: branch.to_string(),
-        }
+        ProjectBase::PreferredLocalBranch { branch: branch.to_string() }
     }
 
     /// A project that chose its local branch starts there when the local
@@ -1169,83 +907,34 @@ mod tests {
 
         // Same commit: either way the same answer, from different sources.
         let base = resolve_default_base(path, Some(&chosen)).await.unwrap();
-        assert_eq!(
-            (base.commit.as_str(), base.source),
-            (origin_tip.as_str(), BaseSource::Local)
-        );
+        assert_eq!((base.commit.as_str(), base.source), (origin_tip.as_str(), BaseSource::Local));
 
         // Local ahead (with work SlashIt integrated: the guard would refuse
         // an unchosen project, and does not apply to a chosen one).
-        git(
-            &repo,
-            &["commit", "-q", "--allow-empty", "-m", "local ahead"],
-        );
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "local ahead"]);
         let local_tip = git(&repo, &["rev-parse", "refs/heads/trunk"]);
-        git(
-            &repo,
-            &[
-                "update-ref",
-                &super::super::integration::marker_ref("trunk"),
-                &origin_tip,
-            ],
-        );
+        git(&repo, &["update-ref", &super::super::integration::marker_ref("trunk"), &origin_tip]);
         let base = resolve_default_base(path, Some(&chosen)).await.unwrap();
-        assert_eq!(
-            (base.commit.as_str(), base.source),
-            (local_tip.as_str(), BaseSource::Local)
-        );
-        assert_eq!(
-            base.branch_origin(),
-            BranchOrigin::LocalBase {
-                branch: "trunk".into()
-            }
-        );
-        assert!(
-            resolve_default_base(path, Some(&legacy)).await.is_err(),
-            "the guard still protects an unchosen project"
-        );
+        assert_eq!((base.commit.as_str(), base.source), (local_tip.as_str(), BaseSource::Local));
+        assert_eq!(base.branch_origin(), BranchOrigin::LocalBase { branch: "trunk".into() });
+        assert!(resolve_default_base(path, Some(&legacy)).await.is_err(), "the guard still protects an unchosen project");
 
         // Remote ahead: origin gained commits that were fetched; the chosen
         // local branch is still where tasks start.
         let clone = _temp.path().join("other");
-        git(
-            _temp.path(),
-            &[
-                "clone",
-                "-q",
-                "-b",
-                "trunk",
-                _temp.path().join("origin.git").to_str().unwrap(),
-                clone.to_str().unwrap(),
-            ],
-        );
-        git(
-            &clone,
-            &["commit", "-q", "--allow-empty", "-m", "remote only"],
-        );
+        git(_temp.path(), &["clone", "-q", "-b", "trunk", _temp.path().join("origin.git").to_str().unwrap(), clone.to_str().unwrap()]);
+        git(&clone, &["commit", "-q", "--allow-empty", "-m", "remote only"]);
         git(&clone, &["push", "-q", "origin", "HEAD:trunk"]);
         git(&repo, &["fetch", "-q", "origin"]);
         let remote_tip = git(&repo, &["rev-parse", "refs/remotes/origin/trunk"]);
         assert_ne!(remote_tip, local_tip);
         let base = resolve_default_base(path, Some(&chosen)).await.unwrap();
-        assert_eq!(
-            base.commit, local_tip,
-            "diverged: the chosen local branch, exactly"
-        );
+        assert_eq!(base.commit, local_tip, "diverged: the chosen local branch, exactly");
         git(&repo, &["reset", "-q", "--hard", &origin_tip]);
         let behind = resolve_default_base(path, Some(&chosen)).await.unwrap();
-        assert_eq!(
-            behind.commit, origin_tip,
-            "behind origin: still the local branch, not origin's newer commit"
-        );
+        assert_eq!(behind.commit, origin_tip, "behind origin: still the local branch, not origin's newer commit");
         assert_ne!(behind.commit, remote_tip);
-        assert_eq!(
-            resolve_default_base(path, Some(&legacy))
-                .await
-                .unwrap()
-                .commit,
-            remote_tip
-        );
+        assert_eq!(resolve_default_base(path, Some(&legacy)).await.unwrap().commit, remote_tip);
     }
 
     /// Choosing the local branch makes origin irrelevant: a remote added
@@ -1259,40 +948,14 @@ mod tests {
         git(&repo, &["commit", "-q", "--allow-empty", "-m", "local"]);
         let local_tip = git(&repo, &["rev-parse", "refs/heads/trunk"]);
 
-        git(
-            &repo,
-            &["update-ref", "refs/remotes/upstream/elsewhere", &local_tip],
-        );
-        git(
-            &repo,
-            &[
-                "symbolic-ref",
-                "refs/remotes/origin/HEAD",
-                "refs/remotes/upstream/elsewhere",
-            ],
-        );
-        assert_eq!(
-            resolve_default_base(path, Some(&chosen))
-                .await
-                .unwrap()
-                .commit,
-            local_tip,
-            "a malformed origin/HEAD is not read"
-        );
-        assert!(
-            resolve_default_base(path, Some(&local("trunk")))
-                .await
-                .is_err(),
-            "an unchosen project still reads it"
-        );
+        git(&repo, &["update-ref", "refs/remotes/upstream/elsewhere", &local_tip]);
+        git(&repo, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/upstream/elsewhere"]);
+        assert_eq!(resolve_default_base(path, Some(&chosen)).await.unwrap().commit, local_tip, "a malformed origin/HEAD is not read");
+        assert!(resolve_default_base(path, Some(&local("trunk"))).await.is_err(), "an unchosen project still reads it");
 
-        let refused = resolve_default_base(path, Some(&preferring("gone")))
-            .await
-            .unwrap_err();
+        let refused = resolve_default_base(path, Some(&preferring("gone"))).await.unwrap_err();
         assert!(refused.contains("does not exist"), "{refused}");
-        let refused = resolve_default_base(path, Some(&preferring("-evil")))
-            .await
-            .unwrap_err();
+        let refused = resolve_default_base(path, Some(&preferring("-evil"))).await.unwrap_err();
         assert!(refused.contains("will not use it"), "{refused}");
     }
 
@@ -1304,26 +967,12 @@ mod tests {
         let loaded: ProjectBase = serde_json::from_str(legacy).unwrap();
         assert_eq!(loaded, local("main"));
         assert!(!loaded.prefers_local());
-        assert_eq!(
-            serde_json::to_string(&loaded).unwrap(),
-            legacy,
-            "writing it back changes nothing"
-        );
+        assert_eq!(serde_json::to_string(&loaded).unwrap(), legacy, "writing it back changes nothing");
 
         let chosen = loaded.choosing(true);
         let stored = serde_json::to_string(&chosen).unwrap();
-        assert_eq!(
-            stored,
-            r#"{"kind":"preferred_local_branch","branch":"main"}"#
-        );
-        assert_eq!(
-            serde_json::from_str::<ProjectBase>(&stored).unwrap(),
-            chosen
-        );
-        assert_eq!(
-            chosen.choosing(false),
-            loaded,
-            "the branch is kept when the choice is withdrawn"
-        );
+        assert_eq!(stored, r#"{"kind":"preferred_local_branch","branch":"main"}"#);
+        assert_eq!(serde_json::from_str::<ProjectBase>(&stored).unwrap(), chosen);
+        assert_eq!(chosen.choosing(false), loaded, "the branch is kept when the choice is withdrawn");
     }
 }

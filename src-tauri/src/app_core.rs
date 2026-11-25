@@ -15,11 +15,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::config::paths::AppPaths;
 use crate::config::Storage;
+use crate::config::paths::AppPaths;
 use crate::domain::{self, Task};
 use crate::pty::PtyState;
-use crate::{commands, config, lifecycle, storage_accounting, worktree, AppState};
+use crate::{AppState, commands, config, lifecycle, storage_accounting, worktree};
 
 /// What hydration found and did, for the caller to log.
 ///
@@ -1031,9 +1031,11 @@ mod tests {
             pointer.exists() && document.exists(),
             "nothing is deleted on an unconfirmed absence"
         );
-        assert!(paths
-            .pending_project_conversation_deletion_file(project_id)
-            .exists());
+        assert!(
+            paths
+                .pending_project_conversation_deletion_file(project_id)
+                .exists()
+        );
         assert!(
             report
                 .project_conversation_cleanup_failures
@@ -1046,9 +1048,11 @@ mod tests {
         // The next start confirms the configuration, then finishes.
         let (_state, _report) = build_state_with_paths(paths.clone()).await.unwrap();
         assert!(!pointer.exists() && !document.exists());
-        assert!(!paths
-            .pending_project_conversation_deletion_file(project_id)
-            .exists());
+        assert!(
+            !paths
+                .pending_project_conversation_deletion_file(project_id)
+                .exists()
+        );
     }
 
     /// On a filesystem that cannot synchronize a directory the configuration is
@@ -1078,9 +1082,11 @@ mod tests {
                 pointer.exists() && document.exists(),
                 "nothing is deleted on an unprovable absence"
             );
-            assert!(paths
-                .pending_project_conversation_deletion_file(project_id)
-                .exists());
+            assert!(
+                paths
+                    .pending_project_conversation_deletion_file(project_id)
+                    .exists()
+            );
             assert!(
                 report
                     .project_conversation_cleanup_failures
@@ -1113,17 +1119,21 @@ mod tests {
         let (first_state, first_report) = build_state_with_paths(paths.clone()).await.unwrap();
         assert_eq!(first_report.projects, 0);
         assert_eq!(first_report.project_conversation_cleanup_failures.len(), 1);
-        assert!(!first_state
-            .project
-            .projects
-            .read()
-            .await
-            .contains_key(&project_id));
+        assert!(
+            !first_state
+                .project
+                .projects
+                .read()
+                .await
+                .contains_key(&project_id)
+        );
         assert!(pointer.exists());
         assert!(document.exists());
-        assert!(paths
-            .pending_project_conversation_deletion_file(project_id)
-            .exists());
+        assert!(
+            paths
+                .pending_project_conversation_deletion_file(project_id)
+                .exists()
+        );
 
         // Repair the unreadable document, then a later restart retries and
         // finishes the same deletion.
@@ -1132,17 +1142,21 @@ mod tests {
 
         assert_eq!(report.projects, 0);
         assert!(report.project_conversation_cleanup_failures.is_empty());
-        assert!(!state
-            .project
-            .projects
-            .read()
-            .await
-            .contains_key(&project_id));
+        assert!(
+            !state
+                .project
+                .projects
+                .read()
+                .await
+                .contains_key(&project_id)
+        );
         assert!(!pointer.exists());
         assert!(!document.exists());
-        assert!(!paths
-            .pending_project_conversation_deletion_file(project_id)
-            .exists());
+        assert!(
+            !paths
+                .pending_project_conversation_deletion_file(project_id)
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -1177,23 +1191,29 @@ mod tests {
             report.project_tasks_cleanup_failures
         );
         assert!(!routed.exists());
-        assert!(!state
-            .project
-            .projects
-            .read()
-            .await
-            .contains_key(&project_id));
-        assert!(!paths
-            .pending_project_tasks_deletion_file(project_id)
-            .exists());
+        assert!(
+            !state
+                .project
+                .projects
+                .read()
+                .await
+                .contains_key(&project_id)
+        );
+        assert!(
+            !paths
+                .pending_project_tasks_deletion_file(project_id)
+                .exists()
+        );
         // The legacy candidate that never existed was a no-op.
         let (second, report) = build_state_with_paths(paths.clone()).await.unwrap();
         assert!(report.project_tasks_cleanup_failures.is_empty());
-        assert!(!second
-            .storage
-            .paths()
-            .pending_project_tasks_deletion_file(project_id)
-            .exists());
+        assert!(
+            !second
+                .storage
+                .paths()
+                .pending_project_tasks_deletion_file(project_id)
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -1222,9 +1242,11 @@ mod tests {
             board[0].exists(),
             "an uncommitted deletion must not delete Task records"
         );
-        assert!(!paths
-            .pending_project_tasks_deletion_file(project_id)
-            .exists());
+        assert!(
+            !paths
+                .pending_project_tasks_deletion_file(project_id)
+                .exists()
+        );
         assert!(!state.project.projects.read().await.is_empty());
     }
 
@@ -1283,9 +1305,11 @@ mod tests {
 
         assert!(pointer.exists());
         assert!(document.exists());
-        assert!(paths
-            .pending_project_conversation_deletion_file(project_id)
-            .exists());
+        assert!(
+            paths
+                .pending_project_conversation_deletion_file(project_id)
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -1310,9 +1334,11 @@ mod tests {
 
         assert!(pointer.exists());
         assert!(document.exists());
-        assert!(paths
-            .pending_project_conversation_deletion_file(project_id)
-            .exists());
+        assert!(
+            paths
+                .pending_project_conversation_deletion_file(project_id)
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -1682,13 +1708,7 @@ mod tests {
         assert!(handoff.review_mode_unproven);
         // The restart does not repeat the recovery or change the record.
         assert!(!migrate_task(&mut restarted));
-        assert!(
-            restarted
-                .worker_handoff
-                .as_ref()
-                .unwrap()
-                .review_mode_unproven
-        );
+        assert!(restarted.worker_handoff.as_ref().unwrap().review_mode_unproven);
     }
 
     #[test]
@@ -1715,21 +1735,11 @@ mod tests {
                 stage: domain::task::WorkerHandoffStage::Started {},
             });
             // The Task is then edited to the other mode before recovery.
-            task.review_mode = if run_mode == Automatic {
-                Manual
-            } else {
-                Automatic
-            };
+            task.review_mode = if run_mode == Automatic { Manual } else { Automatic };
             assert!(migrate_task(&mut task));
             let handoff = task.worker_handoff.as_ref().unwrap();
-            assert_eq!(
-                handoff.review_mode, run_mode,
-                "the run's own record decides"
-            );
-            assert!(
-                !handoff.review_mode_unproven,
-                "an existing record is proven"
-            );
+            assert_eq!(handoff.review_mode, run_mode, "the run's own record decides");
+            assert!(!handoff.review_mode_unproven, "an existing record is proven");
         }
     }
 
@@ -1826,11 +1836,7 @@ mod tests {
     /// startup drops it and the person decides again. A clean task is untouched.
     #[test]
     fn a_new_attempt_decision_loaded_from_disk_is_dropped_at_startup() {
-        let mut task = task_with(
-            domain::TaskStatus::Error,
-            domain::TaskPhase::Idle,
-            "default",
-        );
+        let mut task = task_with(domain::TaskStatus::Error, domain::TaskPhase::Idle, "default");
         task.new_attempt = Some(domain::task::NewAttemptDecision {
             decision_id: uuid::Uuid::new_v4(),
             for_run: 1,
@@ -2897,11 +2903,13 @@ mod tests {
         // The detached registration is now merely prunable, and acquisition
         // still leaves it for the user (see the next test); once they prune
         // it, the checkout is acquired again.
-        assert!(state
-            .worktree_manager
-            .reattach(&repo, "task-abcd1234")
-            .await
-            .is_err());
+        assert!(
+            state
+                .worktree_manager
+                .reattach(&repo, "task-abcd1234")
+                .await
+                .is_err()
+        );
         run_git(std::path::Path::new(&repo), &["worktree", "prune"]);
         let again = state
             .worktree_manager
@@ -2976,9 +2984,11 @@ mod tests {
         let (state, _) = build_state_with_paths(paths.clone())
             .await
             .expect("hydration");
-        assert!(notice_of(&state, task_id)
-            .await
-            .is_some_and(|m| m.contains(reason)));
+        assert!(
+            notice_of(&state, task_id)
+                .await
+                .is_some_and(|m| m.contains(reason))
+        );
         drop(state);
         std::fs::create_dir_all(&checkout).unwrap();
         let (state, _) = build_state_with_paths(paths).await.expect("hydration");
@@ -2995,9 +3005,11 @@ mod tests {
         let (state, _) = build_state_with_paths(paths.clone())
             .await
             .expect("hydration");
-        assert!(notice_of(&state, task_id)
-            .await
-            .is_some_and(|m| m.contains(reason)));
+        assert!(
+            notice_of(&state, task_id)
+                .await
+                .is_some_and(|m| m.contains(reason))
+        );
         drop(state);
         let repo_dir = std::path::Path::new(&repo);
         run_git(repo_dir, &["worktree", "unlock", &checkout]);
