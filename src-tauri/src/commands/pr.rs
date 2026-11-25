@@ -1337,16 +1337,18 @@ fn same_resource_kind(prior: &PrReviewPlan, comments: &[PrReviewComment], cid: u
 /// same comment. When that association is not certain (no comment number, a
 /// repeated number, a changed comment kind, a removed comment, or no fresh
 /// item for it) the override cannot follow, and the analysis must not
-/// silently discard it: re-analysis is refused with the reason.
+/// silently discard it: re-analysis is refused with the reason. An override
+/// on a fix already delivered no longer instructs anything (its commit records
+/// what was done, and it cannot be cleared), so it never blocks re-analysis.
 fn refuse_unassociable_overrides(
     fresh_items: &[PrReviewItem],
     prior: &PrReviewPlan,
     comments: &[PrReviewComment],
 ) -> Result<(), String> {
-    for prev in prior
+    for prev in delivery_view(prior)
         .items
         .iter()
-        .filter(|i| i.proposed_change_override.is_some())
+        .filter(|i| i.proposed_change_override.is_some() && !fix_delivered(i))
     {
         let reason = match prev.comment_id {
             None => Some("it has no comment number"),
@@ -1990,11 +1992,11 @@ fn refuse_stale_human_edits(stored: &PrReviewPlan, sent: &PrReviewPlan) -> Resul
                 .to_string(),
         );
     }
-    let delivered_edit = stored.items.iter().zip(&sent.items).any(|(stored_item, sent_item)| {
+    // Read through the lifecycle backfill, as Apply does, so a fix recorded
+    // only in `last_apply` counts as delivered.
+    let delivered_edit = delivery_view(stored).items.iter().zip(&sent.items).any(|(stored_item, sent_item)| {
         stored_item.proposed_change_override != sent_item.proposed_change_override
-            && (stored_item.fix_done
-                || stored_item.fix_commit.is_some()
-                || stored_item.fix_effect.is_some())
+            && fix_delivered(stored_item)
     });
     if delivered_edit {
         return Err(
@@ -2004,6 +2006,12 @@ fn refuse_stale_human_edits(stored: &PrReviewPlan, sent: &PrReviewPlan) -> Resul
         );
     }
     Ok(())
+}
+
+/// Whether the item's fix was already made: done, committed or recorded with
+/// its effect.
+fn fix_delivered(item: &PrReviewItem) -> bool {
+    item.fix_done || item.fix_commit.is_some() || item.fix_effect.is_some()
 }
 
 /// Records, on a copy that passed [`refuse_stale_analysis`], that it changes
@@ -12168,6 +12176,48 @@ mod tests {
                 .unwrap_err()
                 .contains("no comment number")
         );
+    }
+
+    /// A delivered fix's override cannot be cleared, so it must not block
+    /// re-analysis; a pending one still does. Delivery is read through the
+    /// backfill, so a fix recorded only in `last_apply` counts.
+    #[test]
+    fn a_delivered_override_never_blocks_reanalysis() {
+        let text = comment_text(42, "same", Some("2024-05-30T00:00:00Z"));
+        let mut item = fresh_item(42);
+        item.proposed_change_override = Some("mine".to_string());
+        item.fix_done = true;
+        let delivered = prior_plan(vec![item.clone()], vec![text.clone()], Some("2024-06-01T00:00:00Z"), vec![]);
+        let mut backfilled_only = delivered.clone();
+        backfilled_only.items[0].fix_done = false;
+        assert!(delivery_view(&backfilled_only).items[0].fix_done, "the fixture must backfill");
+        for prior in [&delivered, &backfilled_only] {
+            assert!(refuse_unassociable_overrides(&[], prior, &[]).is_ok());
+            assert!(refuse_unassociable_overrides(&[fresh_item(7)], prior, &[text.clone()]).is_ok());
+        }
+        item.fix_done = false;
+        let pending = prior_plan(vec![item], vec![text.clone()], None, vec![]);
+        assert!(refuse_unassociable_overrides(&[], &pending, &[]).is_err());
+    }
+
+    /// A fix recorded only in `last_apply` is delivered: its override is
+    /// frozen, while a pending item's override stays editable.
+    #[test]
+    fn a_backfilled_delivered_fix_cannot_be_overridden() {
+        let text = comment_text(42, "same", Some("2024-05-30T00:00:00Z"));
+        let mut item = fresh_item(42);
+        item.fix_done = true;
+        let mut stored = prior_plan(vec![item], vec![text.clone()], Some("2024-06-01T00:00:00Z"), vec![]);
+        stored.items[0].fix_done = false;
+        let mut sent = stored.clone();
+        sent.items[0].proposed_change_override = Some("again".to_string());
+        let err = refuse_stale_human_edits(&stored, &sent).unwrap_err();
+        assert!(err.contains("already made"), "{err}");
+
+        let pending = prior_plan(vec![fresh_item(42)], vec![text], None, vec![]);
+        let mut sent = pending.clone();
+        sent.items[0].proposed_change_override = Some("mine".to_string());
+        assert!(refuse_stale_human_edits(&pending, &sent).is_ok());
     }
 
     #[test]
