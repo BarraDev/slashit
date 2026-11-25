@@ -1340,7 +1340,7 @@ mod tests {
             e.kind, EntryKind::ProjectActionDecision { action_id, approved: false } if action_id == first
         )).count();
         assert_eq!(rejections, 1);
-        let projection = conversation.coordinator_projection("Add the Task again", "Project", None, &[]);
+        let projection = crate::conversation_context::projection_for_test(&conversation, "Add the Task again");
         let history = projection["recent_history"].as_array().unwrap();
         let decision = history.iter().find(|e| e["kind"] == "project_action_decision").unwrap();
         assert_eq!(decision["decision"], "rejected");
@@ -2158,7 +2158,7 @@ mod tests {
             Some(ProjectActionOutcome::AlreadyQueued { task_id: task.id, title: "Queued elsewhere".into() })
         );
         // The Coordinator is told what was found, not that this approval did it.
-        let projection = conversation.coordinator_projection("next", "p", None, &[]);
+        let projection = crate::conversation_context::projection_for_test(&conversation, "next");
         assert!(projection.to_string().contains("found_already_queued"));
     }
 

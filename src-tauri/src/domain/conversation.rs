@@ -11,7 +11,6 @@ use super::{Task, TaskCategory, TaskPriority, TaskStatus};
 pub const MESSAGE_LIMIT: usize = 16_000;
 pub const TASK_TITLE_LIMIT: usize = 200;
 pub const TASK_DESCRIPTION_LIMIT: usize = 8_000;
-pub const PROJECTION_MESSAGE_COUNT: usize = 16;
 pub const TASK_INDEX_LIMIT: usize = 40;
 /// How much of a Task's description an approval card carries.
 pub const INPUT_PREVIEW_LIMIT: usize = 2_000;
@@ -842,7 +841,7 @@ fn is_proposal_decision(kind: &EntryKind) -> bool {
     )
 }
 
-fn decision_label(approved: bool) -> &'static str {
+pub fn decision_label(approved: bool) -> &'static str {
     if approved { "approved" } else { "rejected" }
 }
 
@@ -956,60 +955,6 @@ impl Conversation {
         }
         Ok(output)
     }
-
-    pub fn coordinator_projection(
-        &self,
-        current_message: &str,
-        project_name: &str,
-        project_root: Option<&str>,
-        tasks: &[serde_json::Value],
-    ) -> serde_json::Value {
-        self.coordinator_projection_before(current_message, project_name, project_root, tasks, None)
-    }
-
-    /// `tasks` is the Project's whole Task index, in the order `list_tasks`
-    /// pages through it. The projection keeps the first `TASK_INDEX_LIMIT`
-    /// entries and reports `tasks_total` and `tasks_truncated`, so the
-    /// Coordinator knows the index is partial and can read the rest with
-    /// `list_tasks` and an offset.
-    pub fn coordinator_projection_before(
-        &self,
-        current_message: &str,
-        project_name: &str,
-        project_root: Option<&str>,
-        tasks: &[serde_json::Value],
-        exclude_entry: Option<Uuid>,
-    ) -> serde_json::Value {
-        let recent = self.entries.iter().filter(|entry| Some(entry.id) != exclude_entry).rev()
-            .filter_map(|entry| match &entry.kind {
-                EntryKind::HumanMessage { text } | EntryKind::CoordinatorReply { text } =>
-                    Some(serde_json::json!({"kind":"message", "role": entry.role, "text": text.chars().take(4000).collect::<String>()})),
-                EntryKind::ActionProposed { action_id } => self.actions.iter().find(|action| action.id == *action_id).map(|action|
-                    serde_json::json!({"kind":"action_proposed", "target_task_id":action.target_task_id,"target_task_title":action.target_task_title.chars().take(500).collect::<String>(),"request":action.request.chars().take(3000).collect::<String>(),"explanation":action.explanation.chars().take(2000).collect::<String>()})),
-                EntryKind::ActionDecision { action_id, approved, request } => self.actions.iter().find(|action| action.id == *action_id).map(|action|
-                    serde_json::json!({"kind":"action_decision","approved":approved,"decision":decision_label(*approved),"scope":DECISION_SCOPE,"target_task_id":action.target_task_id,"target_task_title":action.target_task_title.chars().take(500).collect::<String>(),"request":request.as_deref().unwrap_or(&action.request).chars().take(3000).collect::<String>()})),
-                EntryKind::WorkerStarted { action_id } => Some(serde_json::json!({"kind":"worker_started","action_id":action_id})),
-                EntryKind::WorkerResult { action_id, result } => Some(serde_json::json!({"kind":"worker_result","action_id":action_id,"result":result.chars().take(3000).collect::<String>()})),
-                EntryKind::RunFailed { role, message, .. } => Some(serde_json::json!({"kind":"run_failed","role":role,"message":message.chars().take(1000).collect::<String>()})),
-                EntryKind::ProjectActionProposed { action_id } => self.project_action(*action_id).map(|action| serde_json::json!({"kind":"project_action_proposed","action_id":action_id,"summary":action.mutation.summary()})),
-                EntryKind::ProjectActionDecision { action_id, approved } => self.project_action(*action_id).map(|action| serde_json::json!({"kind":"project_action_decision","action_id":action_id,"approved":approved,"decision":decision_label(*approved),"scope":DECISION_SCOPE,"summary":action.mutation.summary()})),
-                EntryKind::ProjectActionApplied { action_id, task_id } => Some(match self.project_action(*action_id).and_then(|action| action.outcome.as_ref()) {
-                    Some(ProjectActionOutcome::AlreadyQueued { .. }) => serde_json::json!({"kind":"project_action_applied","action_id":action_id,"task_id":task_id,"outcome":"found_already_queued"}),
-                    _ => serde_json::json!({"kind":"project_action_applied","action_id":action_id,"task_id":task_id}),
-                }),
-                EntryKind::ProjectActionRefused { action_id, reason } => Some(serde_json::json!({"kind":"project_action_refused","action_id":action_id,"reason":reason.chars().take(1000).collect::<String>()})),
-                EntryKind::ActionWithdrawn { action_id, .. } => Some(serde_json::json!({"kind":"action_withdrawn","action_id":action_id,"scope":DECISION_SCOPE,"note":"The Human withdrew an earlier approval of a retired direct delegation. Nothing was started."})),
-            }).take(PROJECTION_MESSAGE_COUNT).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>();
-        serde_json::json!({
-            "project": {"name": project_name, "root": project_root},
-            "current_message": current_message,
-            "history_semantics": HISTORY_SEMANTICS,
-            "recent_history": recent,
-            "tasks": tasks.iter().take(TASK_INDEX_LIMIT).collect::<Vec<_>>(),
-            "tasks_total": tasks.len(),
-            "tasks_truncated": tasks.len() > TASK_INDEX_LIMIT,
-        })
-    }
 }
 
 #[cfg(test)]
@@ -1085,20 +1030,7 @@ mod tests {
             },
         );
         let prior_history = conversation.clone();
-        conversation.push(
-            Role::Human,
-            EntryKind::HumanMessage {
-                text: "why?".into(),
-            },
-        );
-        let current_id = conversation.entries.last().unwrap().id;
-        let projection = prior_history.coordinator_projection_before(
-            "why?",
-            "Project",
-            None,
-            &[],
-            Some(current_id),
-        );
+        let projection = project(&prior_history, "why?", &[]);
         assert_eq!(projection["recent_history"].as_array().unwrap().len(), 4);
         assert!(projection.to_string().contains("action_proposed"));
         assert!(projection.to_string().contains("action_decision"));
@@ -1128,7 +1060,7 @@ mod tests {
         assert!(!stored.contains("this_proposal_only") && !stored.contains("history_semantics"));
         let reloaded: Conversation = serde_json::from_str(&stored).unwrap();
 
-        let projection = reloaded.coordinator_projection("Add it again", "Project", None, &[]);
+        let projection = project(&reloaded, "Add it again", &[]);
         assert!(projection["history_semantics"].as_str().unwrap().contains("that proposal only"));
         let decision = &projection["recent_history"][1];
         assert_eq!(decision["kind"], "project_action_decision");
@@ -1145,13 +1077,13 @@ mod tests {
             .map(|position| serde_json::json!({ "position": position }))
             .collect();
 
-        let partial = conversation.coordinator_projection("hi", "Project", None, &tasks);
+        let partial = project(&conversation, "hi", &tasks);
         assert_eq!(partial["tasks"].as_array().unwrap().len(), TASK_INDEX_LIMIT);
         assert_eq!(partial["tasks"][0]["position"], 0);
         assert_eq!(partial["tasks_total"], TASK_INDEX_LIMIT + 5);
         assert_eq!(partial["tasks_truncated"], true);
 
-        let complete = conversation.coordinator_projection("hi", "Project", None, &tasks[..3]);
+        let complete = project(&conversation, "hi", &tasks[..3]);
         assert_eq!(complete["tasks"].as_array().unwrap().len(), 3);
         assert_eq!(complete["tasks_total"], 3);
         assert_eq!(complete["tasks_truncated"], false);
@@ -1236,7 +1168,7 @@ mod tests {
         assert_eq!(stored["actions"][6]["status"], "failed");
         assert_eq!(stored["revision"], 12);
 
-        let projection = conversation.coordinator_projection("next", "Project", None, &[]).to_string();
+        let projection = project(&conversation, "next", &[]).to_string();
         for kind in ["action_proposed", "action_decision", "worker_started", "worker_result", "run_failed"] {
             assert!(projection.contains(kind), "{kind} is still projected");
         }
@@ -1265,7 +1197,7 @@ mod tests {
         assert_eq!(reloaded.actions[0].status, ActionStatus::Withdrawn);
         assert!(!reloaded.has_unmediated_worker_result());
 
-        let projection = reloaded.coordinator_projection("why", "Project", None, &[]);
+        let projection = project(&reloaded, "why", &[]);
         let withdrawal = projection["recent_history"]
             .as_array()
             .unwrap()
@@ -1274,6 +1206,22 @@ mod tests {
             .expect("the withdrawal is projected");
         assert_eq!(withdrawal["scope"], "this_proposal_only");
         assert!(withdrawal["note"].as_str().unwrap().contains("Nothing was started"));
+    }
+
+    /// The context projection the Coordinator receives, as JSON, for `message`.
+    fn project(conversation: &Conversation, message: &str, tasks: &[serde_json::Value]) -> serde_json::Value {
+        use crate::conversation_context::{build_coordinator_context, ContextRequest, TurnInput};
+        let built = build_coordinator_context(&ContextRequest {
+            conversation,
+            project_name: "Project",
+            project_root: None,
+            turn: TurnInput::Ordinary { message, tasks },
+            budget: Default::default(),
+            fixed_chars: 0,
+            read_reserve_chars: 0,
+        })
+        .expect("the fixture fits the budget");
+        serde_json::from_str(&built.projection).unwrap()
     }
 
     fn entry(kind: EntryKind) -> Entry {

@@ -34,9 +34,11 @@ or use TaskStatus as liveness. Runs are fresh provider processes and do not
 depend on provider session continuity. A process restart has no live Run owner.
 
 A Human message is durably written before a Coordinator starts. The Coordinator
-receives a bounded projection: Project identity and root, current message,
-selected recent conversational messages, and a bounded index of Tasks. It uses
-read-only tools. Durable history and the projection sent to a provider are
+receives a bounded projection built by one deterministic Context Builder
+([context-management.md](context-management.md)): Project identity and root,
+the current message, open proposals read from their records, selected recent
+history entries with omission and truncation markers, and a bounded index of
+Tasks, all within an explicit character budget. It uses read-only tools. Durable history and the projection sent to a provider are
 separate; provider transcripts and arbitrary Project records are not included.
 
 The strict output contract is `Reply { text }`, `CreateTask`, `EditTask`,
@@ -256,7 +258,9 @@ explicit Human approval, and Task-scoped Worker execution through the normal
 Task lifecycle. Direct delegation to a Worker is retired (its historical
 records stay readable). Pull request and CI capabilities, tracker
 synchronization, Workspace Conversations, context compaction, multiple Workers,
-provider-session resume, and richer provider adapters remain future work. The
+provider-session resume, and richer provider adapters remain future work.
+Historical retrieval, derived summaries and Project Memory are future
+directions recorded in [context-management.md](context-management.md). The
 Conversation direction is one continuous Conversation per Project with bounded,
 rebuilt provider
 context, not several concurrent Conversations; see
