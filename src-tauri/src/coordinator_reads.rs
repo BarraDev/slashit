@@ -520,6 +520,65 @@ pub fn read_reserve_chars(per_read_cap: usize) -> usize {
     READS_PER_TURN * per_read_cap + envelope + 2 + (READS_PER_TURN - 1)
 }
 
+/// The stop reason a cancelled provider run reports.
+pub const RUN_STOPPED: &str = "Run stopped";
+
+/// How one provider invocation, or a refused prompt, ended, as diagnostics name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Answered,
+    ReadRequested,
+    Failed,
+    Cancelled,
+    OverBudget,
+}
+
+impl Outcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Answered => "answered",
+            Self::ReadRequested => "read_requested",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::OverBudget => "over_budget",
+        }
+    }
+}
+
+/// The size of one prompt as `drive` measures it before sending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptSize {
+    pub base_prompt_chars: usize,
+    /// The prompt as sent: the base prompt plus any read evidence and notice.
+    pub prompt_chars: usize,
+    /// The prompt plus the fixed text outside it, as measured against `limit_chars`.
+    pub measured_chars: usize,
+    pub limit_chars: usize,
+    /// Reads answered before this prompt was built.
+    pub structured_reads: usize,
+    pub refusal_notice_included: bool,
+}
+
+/// One provider invocation of a turn, reported once its outcome is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvocationReport {
+    /// 1-based position of the invocation within the turn.
+    pub sequence: usize,
+    pub size: PromptSize,
+    /// The model asked for a read that the read budget refused.
+    pub read_refused: bool,
+    pub provider_ms: u128,
+    pub outcome: Outcome,
+}
+
+/// What `drive` reports to its observer. A refused prompt was never sent, so it
+/// is not an invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveEvent {
+    Refused(PromptSize),
+    Invocation(InvocationReport),
+}
+
 /// Runs the Coordinator, answering its read requests until it returns a
 /// non-read output. `run` performs one fresh Coordinator run for a prompt and
 /// returns its raw output with the guard that must outlive the turn; it is
@@ -530,12 +589,14 @@ pub fn read_reserve_chars(per_read_cap: usize) -> usize {
 /// answer from what it already collected; asking again ends the turn.
 ///
 /// Before every invocation the exact prompt about to be sent is measured with
-/// `limits`; an invocation over the limit is never started.
+/// `limits`; an invocation over the limit is never started. `observe` receives
+/// one event per refused prompt and per invocation, after its outcome is known.
 pub async fn drive<G, Run, RunFut, ReadFut>(
     base_prompt: &str,
     limits: PromptLimits,
     mut run: Run,
     mut read_state: impl FnMut(CoordinatorOutput) -> ReadFut,
+    mut observe: impl FnMut(DriveEvent),
 ) -> Result<(CoordinatorOutput, G), String>
 where
     Run: FnMut(String, Option<G>) -> RunFut,
@@ -545,25 +606,67 @@ where
     let mut evidence: Vec<Value> = Vec::new();
     let mut refused = false;
     let mut guard: Option<G> = None;
+    let base_prompt_chars = base_prompt.chars().count();
+    let mut sequence = 0usize;
     loop {
         let prompt = if evidence.is_empty() {
             base_prompt.to_owned()
         } else {
             followup_prompt(base_prompt, &availability_notice(evidence.len(), refused), &Value::Array(evidence.clone()).to_string())
         };
-        let sent = prompt.chars().count().saturating_add(limits.other_fixed_chars);
-        if sent > limits.max_chars {
+        let prompt_chars = prompt.chars().count();
+        let measured_chars = prompt_chars.saturating_add(limits.other_fixed_chars);
+        let size = PromptSize {
+            base_prompt_chars,
+            prompt_chars,
+            measured_chars,
+            limit_chars: limits.max_chars,
+            structured_reads: evidence.len(),
+            refusal_notice_included: refused,
+        };
+        if measured_chars > limits.max_chars {
+            observe(DriveEvent::Refused(size));
             return Err(format!(
-                "The next provider run would send {sent} characters, over the {}-character context budget, so it was not started",
+                "The next provider run would send {measured_chars} characters, over the {}-character context budget, so it was not started",
                 limits.max_chars
             ));
         }
+        sequence += 1;
+        let started = std::time::Instant::now();
         let (raw, next_guard) = run(prompt, guard.take()).await?;
-        let output = crate::domain::conversation::Conversation::parse_output(&raw?)?;
+        let mut report = InvocationReport {
+            sequence,
+            size,
+            read_refused: false,
+            provider_ms: started.elapsed().as_millis(),
+            outcome: Outcome::Failed,
+        };
+        let raw = match raw {
+            Ok(raw) => raw,
+            Err(reason) => {
+                report.outcome = if reason == RUN_STOPPED { Outcome::Cancelled } else { Outcome::Failed };
+                observe(DriveEvent::Invocation(report));
+                return Err(reason);
+            }
+        };
+        let output = match crate::domain::conversation::Conversation::parse_output(&raw) {
+            Ok(output) => output,
+            Err(reason) => {
+                observe(DriveEvent::Invocation(report));
+                return Err(reason);
+            }
+        };
         match read_state(output).await {
-            Err(output) => return Ok((output, next_guard)),
+            Err(output) => {
+                report.outcome = Outcome::Answered;
+                observe(DriveEvent::Invocation(report));
+                return Ok((output, next_guard));
+            }
             Ok(result) => {
-                if evidence.len() == READS_PER_TURN {
+                report.outcome = Outcome::ReadRequested;
+                report.read_refused = evidence.len() == READS_PER_TURN;
+                observe(DriveEvent::Invocation(report));
+                if report.read_refused {
                     if refused {
                         return Err(format!(
                             "The Coordinator kept asking for reads after the {READS_PER_TURN}-read budget"
@@ -1197,6 +1300,7 @@ mod tests {
                 let answer = read(&output, project, &tasks).ok_or(output);
                 async move { answer }
             },
+            |_| {},
         )
         .await
         .map(|(output, ())| output);
@@ -1269,6 +1373,7 @@ mod tests {
                 async move { Ok((Ok(next), 7u32)) }
             },
             |output| async move { read(&output, Uuid::new_v4(), &HashMap::new()).ok_or(output) },
+            |_| {},
         )
         .await;
         assert!(matches!(result, Ok((CoordinatorOutput::Reply { .. }, 7))));
@@ -1403,9 +1508,105 @@ mod tests {
                 let big = big.clone();
                 async move { if matches!(output, CoordinatorOutput::InspectProject {}) { Ok(json!(big)) } else { Err(output) } }
             },
+            |_| {},
         )
         .await;
         assert!(result.unwrap_err().contains("context budget"));
         assert_eq!(*started.lock().unwrap(), 1, "only the first invocation ran");
+    }
+
+    #[tokio::test]
+    async fn every_invocation_reports_its_sequence_size_and_reads() {
+        let list = r#"{"type":"list_tasks"}"#.to_owned();
+        let mut script = vec![list; READS_PER_TURN + 1];
+        script.push(r#"{"type":"reply","text":"done"}"#.into());
+        let script = Arc::new(Mutex::new(script.into_iter()));
+        let sent = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = sent.clone();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let log = events.clone();
+        const OTHER_FIXED: usize = 10;
+        let result = drive(
+            "BASE",
+            PromptLimits { max_chars: 100_000, other_fixed_chars: OTHER_FIXED },
+            move |prompt, _guard: Option<()>| {
+                seen.lock().unwrap().push(prompt);
+                let next = script.lock().unwrap().next().expect("script exhausted");
+                async move { Ok((Ok(next), ())) }
+            },
+            |output| {
+                let answer = read(&output, Uuid::new_v4(), &HashMap::new()).ok_or(output);
+                async move { answer }
+            },
+            move |event| log.lock().unwrap().push(event),
+        )
+        .await;
+        assert!(result.is_ok());
+        let sent = sent.lock().unwrap().clone();
+        let events = events.lock().unwrap().clone();
+        assert_eq!(sent.len(), READS_PER_TURN + 2);
+        assert_eq!(events.len(), sent.len(), "one event per invocation, no refusal");
+        for (index, (prompt, event)) in sent.iter().zip(&events).enumerate() {
+            let DriveEvent::Invocation(report) = event else { panic!("expected an invocation") };
+            let chars = prompt.chars().count();
+            assert_eq!(report.sequence, index + 1);
+            assert_eq!(report.size.prompt_chars, chars);
+            assert_eq!(report.size.base_prompt_chars, 4);
+            assert_eq!(report.size.measured_chars, chars + OTHER_FIXED);
+            assert_eq!(report.size.limit_chars, 100_000);
+            assert_eq!(report.size.structured_reads, index.min(READS_PER_TURN));
+            assert_eq!(report.size.refusal_notice_included, index > READS_PER_TURN);
+        }
+        let outcomes: Vec<Outcome> = events
+            .iter()
+            .map(|event| match event {
+                DriveEvent::Invocation(report) => report.outcome,
+                DriveEvent::Refused(_) => panic!("nothing was refused"),
+            })
+            .collect();
+        assert_eq!(
+            outcomes,
+            [vec![Outcome::ReadRequested; READS_PER_TURN + 1], vec![Outcome::Answered]].concat()
+        );
+        let refused: Vec<bool> = events
+            .iter()
+            .map(|event| match event {
+                DriveEvent::Invocation(report) => report.read_refused,
+                DriveEvent::Refused(_) => false,
+            })
+            .collect();
+        assert_eq!(refused, [false, false, false, true, false]);
+    }
+
+    #[tokio::test]
+    async fn an_over_budget_prompt_is_refused_before_any_invocation() {
+        let started = Arc::new(Mutex::new(0usize));
+        let count = started.clone();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let log = events.clone();
+        let result = drive(
+            "BASE",
+            PromptLimits { max_chars: 2, other_fixed_chars: 1 },
+            move |_prompt, _guard: Option<()>| {
+                *count.lock().unwrap() += 1;
+                async move { Ok((Ok(r#"{"type":"reply","text":"x"}"#.to_owned()), ())) }
+            },
+            |output| async move { Err::<Value, _>(output) },
+            move |event| log.lock().unwrap().push(event),
+        )
+        .await;
+        assert!(result.unwrap_err().contains("context budget"));
+        assert_eq!(*started.lock().unwrap(), 0);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [DriveEvent::Refused(PromptSize {
+                base_prompt_chars: 4,
+                prompt_chars: 4,
+                measured_chars: 5,
+                limit_chars: 2,
+                structured_reads: 0,
+                refusal_notice_included: false,
+            })]
+        );
     }
 }

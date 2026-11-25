@@ -8,6 +8,8 @@ use crate::conversation_actions::{self, Decision};
 use crate::conversation_context::{
     build_coordinator_context, ContextBudget, ContextError, ContextRequest, ContextSite, ReturnedAction, TurnInput,
 };
+use crate::coordinator_diagnostics::{self as diagnostics, Correlation, Trigger, TurnTally};
+use crate::coordinator_reads::{DriveEvent, Outcome, RUN_STOPPED};
 use crate::conversation_executions::{self, ExecutionView};
 use crate::domain::AgentStatus;
 use crate::AppState;
@@ -460,11 +462,12 @@ pub async fn send_project_message(
             text: message.clone(),
         },
     );
+    let message_entry_id = conversation.entries.last().map_or_else(Uuid::nil, |entry| entry.id);
     state
         .storage
         .save_conversation(&conversation)
         .map_err(|error| human_save_failure(&error))?;
-    answer_human_message(&state, &project, &prior_history, &message).await
+    answer_human_message(&state, &project, &prior_history, &message, message_entry_id).await
 }
 
 /// Runs the Coordinator for one saved Human message and records its outcome.
@@ -480,6 +483,7 @@ async fn answer_human_message(
     project: &crate::domain::Project,
     prior_history: &Conversation,
     message: &str,
+    message_entry_id: Uuid,
 ) -> Result<Snapshot, String> {
     let project_id = project.id;
     let tasks = state.task.tasks.read().await;
@@ -493,6 +497,13 @@ async fn answer_human_message(
     drop(repositories);
     let budget = state.conversation.context_budget;
     let (limits, fixed_chars) = invocation_limits(ContextSite::Ordinary, budget);
+    let correlation = Correlation {
+        conversation_id: prior_history.id,
+        conversation_revision: prior_history.revision,
+        site: ContextSite::Ordinary,
+        trigger: Trigger::HumanMessage(message_entry_id),
+    };
+    let started = std::time::Instant::now();
     let context = match build_coordinator_context(&ContextRequest {
         conversation: prior_history,
         project_name: &project.name,
@@ -503,8 +514,12 @@ async fn answer_human_message(
         read_reserve_chars: crate::coordinator_reads::read_reserve_chars(budget.per_read_cap_chars),
     }) {
         Ok(context) => context,
-        Err(error) => return record_budget_failure(state, project_id, &error).await,
+        Err(error) => {
+            log_context_refusal(&correlation, &error, started.elapsed().as_millis());
+            return record_budget_failure(state, project_id, &error).await;
+        }
     };
+    eprintln!("{}", diagnostics::context_line(&correlation, &context.snapshot, started.elapsed().as_millis()));
     let prompt = ordinary_prompt(&context.projection);
     // Failures before the provider starts are recorded like run failures, so the
     // Human message never stays unanswered and invisible.
@@ -516,7 +531,7 @@ async fn answer_human_message(
         Some(executor) => executor.clone(),
         None => return record_failed_turn(state, project_id, "Task executor is not ready").await,
     };
-    let answer = coordinator_turn(state, &executor, prior_history.id, project_id, &prompt, limits, |prompt| ClaudeRunConfig {
+    let answer = coordinator_turn(state, &executor, &correlation, project_id, &prompt, limits, |prompt| ClaudeRunConfig {
         prompt, working_dir: working_directory.path.clone(), tools: ToolAccess::ReadOnly, max_turns: Some(4), max_budget_usd: None,
         session_id: None, resume_session: None, model: Some(project.agent_config.model.clone().unwrap_or_else(|| "sonnet".into())),
         system_prompt: Some(COORDINATOR_SYSTEM_PROMPT.into()),
@@ -732,9 +747,10 @@ pub async fn retry_project_message(
         return Err("No failed Coordinator turn is waiting for a retry".into());
     };
     let message = message.to_owned();
+    let message_entry_id = conversation.entries[human_index].id;
     let mut prior_history = conversation.clone();
     prior_history.entries.truncate(human_index);
-    answer_human_message(&state, &project, &prior_history, &message).await
+    answer_human_message(&state, &project, &prior_history, &message, message_entry_id).await
 }
 
 /// One Coordinator turn: runs the Coordinator and answers its read-only
@@ -744,13 +760,14 @@ pub async fn retry_project_message(
 async fn coordinator_turn(
     state: &AppState,
     executor: &Arc<crate::queue::TaskExecutor>,
-    conversation_id: Uuid,
+    correlation: &Correlation,
     project_id: Uuid,
     base_prompt: &str,
     limits: crate::coordinator_reads::PromptLimits,
     config_for: impl Fn(String) -> ClaudeRunConfig,
 ) -> Result<(CoordinatorOutput, crate::queue::ProjectRunLease), String> {
-    crate::coordinator_reads::drive(
+    let tally = Mutex::new(TurnTally::default());
+    let result = crate::coordinator_reads::drive(
         base_prompt,
         limits,
         |prompt, lease| {
@@ -760,7 +777,7 @@ async fn coordinator_turn(
                 // live between reads and a Stop cannot fall into a gap.
                 match lease {
                     Some(lease) => Ok(run_with_lease(lease, config).await),
-                    None => run_with_cancellation(executor, conversation_id, config, true).await,
+                    None => run_with_cancellation(executor, correlation.conversation_id, config, true).await,
                 }
             }
         },
@@ -769,8 +786,28 @@ async fn coordinator_turn(
             let tasks = state.task.tasks.read().await;
             crate::coordinator_reads::read(&output, project_id, &tasks, &state.pr_statuses, &facts).ok_or(output)
         },
+        |event: DriveEvent| {
+            eprintln!("{}", diagnostics::invocation_line(correlation, &event));
+            tally.lock().unwrap_or_else(std::sync::PoisonError::into_inner).record(&event);
+        },
     )
-    .await
+    .await;
+    let tally = tally.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    eprintln!(
+        "{}",
+        diagnostics::turn_end_line(correlation, &tally, tally.final_outcome(result.is_ok()))
+    );
+    result
+}
+
+/// The `[coordinator-context]` and `[coordinator-turn]` lines of a turn the
+/// Builder refused before any provider call.
+fn log_context_refusal(correlation: &Correlation, error: &ContextError, construction_ms: u128) {
+    eprintln!("{}", diagnostics::context_refusal_line(correlation, error, construction_ms));
+    eprintln!(
+        "{}",
+        diagnostics::turn_end_line(correlation, &TurnTally::default(), Outcome::OverBudget)
+    );
 }
 
 /// The Project facts `inspect_project` may report, copied out so no lock is
@@ -817,7 +854,7 @@ async fn run_with_lease(
 ) -> (Result<String, String>, crate::queue::ProjectRunLease) {
     let mut cancel_rx = lease.cancel_receiver();
     let result = async {
-        if *cancel_rx.borrow() { return Err("Run stopped".into()); }
+        if *cancel_rx.borrow() { return Err(RUN_STOPPED.into()); }
         let runner = ClaudeRunner::start_leased(config, None).await?;
         tokio::select! {
             result = runner.wait() => {
@@ -828,7 +865,7 @@ async fn run_with_lease(
             _ = cancel_rx.changed() => {
                 let _ = runner.kill().await;
                 let _ = runner.wait().await;
-                Err("Run stopped".into())
+                Err(RUN_STOPPED.into())
             }
         }
     }.await;
@@ -1186,9 +1223,16 @@ async fn continue_from_worker_result(
     drop(repositories);
     let budget = state.conversation.context_budget;
     let (limits, fixed_chars) = invocation_limits(ContextSite::Continuation, budget);
+    let correlation = Correlation {
+        conversation_id: conversation.id,
+        conversation_revision: conversation.revision,
+        site: ContextSite::Continuation,
+        trigger: Trigger::ReturnedAction(selected.id),
+    };
+    let started = std::time::Instant::now();
     // A budget failure here keeps the continuation's own semantics: the saved
     // Worker result stays unmediated and Retry is offered again.
-    let context = build_coordinator_context(&ContextRequest {
+    let context = match build_coordinator_context(&ContextRequest {
         conversation: &conversation,
         project_name: &project.name,
         project_root: root.as_deref(),
@@ -1203,8 +1247,14 @@ async fn continue_from_worker_result(
         budget,
         fixed_chars,
         read_reserve_chars: crate::coordinator_reads::read_reserve_chars(budget.per_read_cap_chars),
-    })
-    .map_err(|error| error.to_string())?;
+    }) {
+        Ok(context) => context,
+        Err(error) => {
+            log_context_refusal(&correlation, &error, started.elapsed().as_millis());
+            return Err(error.to_string().into());
+        }
+    };
+    eprintln!("{}", diagnostics::context_line(&correlation, &context.snapshot, started.elapsed().as_millis()));
     let working_directory = coordinator_working_directory(root.as_deref())?;
     let prompt = continuation_prompt(&context.projection);
     let executor = state
@@ -1212,7 +1262,7 @@ async fn continue_from_worker_result(
         .get()
         .ok_or("Task executor is not ready")?
         .clone();
-    let (output, run_lease) = coordinator_turn(state, &executor, conversation.id, project_id, &prompt, limits, |prompt| ClaudeRunConfig {
+    let (output, run_lease) = coordinator_turn(state, &executor, &correlation, project_id, &prompt, limits, |prompt| ClaudeRunConfig {
         prompt, working_dir: working_directory.path.clone(), tools: ToolAccess::ReadOnly, max_turns: Some(4), max_budget_usd: None,
         session_id: None, resume_session: None, model: Some(project.agent_config.model.clone().unwrap_or_else(|| "sonnet".into())),
         system_prompt: Some(FOLLOW_UP_SYSTEM_PROMPT.into()),
