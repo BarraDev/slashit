@@ -337,7 +337,9 @@ judged by its branch alone. The proposed path for reviewing a correction made
 after the pull request exists, in a new Human Review arrival, is in
 [post-pr-corrections.md](post-pr-corrections.md). That document also proposes
 completing a merged Task only when GitHub reports that the pull request merged
-at the approved commit.
+at the approved commit. While a pull request exists, it moves an approved correction
+to PR Created only once the pull request's head is observed at the approved
+commit and SlashIt's publication record says it published that commit.
 
 ### Local delivery
 

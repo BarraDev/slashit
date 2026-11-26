@@ -45,8 +45,9 @@ from the next:
   Created.
 
 So the design adds two entry transitions from a published Task into a new
-arrival, one guard that keeps pull request status reads from cutting a
-correction short, and one completion rule (D) that finishes a Task on merge
+arrival, one guard (G1, with its evidence rule G2) that lets an open pull
+request read move a correction to PR Created only once the pull request is
+observed at the approved commit, and one completion rule (D) that finishes a Task on merge
 only when the approved revision is the revision that was merged. Everything
 after the entry is the existing Human Review loop. `a_post_pr_correction_needs_no_new_review_record_field` shows that the
 record already expresses the whole sequence.
@@ -134,13 +135,66 @@ and `transition_to_human_review` records a new arrival.
 
 - New guard G1. `refresh_task_pr_state` and `link_pr_to_task` (`commands/pr.rs`)
   move a Task to PR Created whenever its pull request is OPEN, and first end
-  its live owner. For a published Task in Queue, In Progress or AI Review, or
-  in Human Review with no current approval, they record only the pull
-  request's state: no status change, and no owner ended. A Human Review Task
-  with a current approval (the delivery step) is still moved, as today.
+  its live owner. For a published Task (one already linked to that pull
+  request when the read starts) they record only the pull request's state,
+  with no status change and no owner ended, unless the open delivery evidence
+  (G2) is verified. In Queue, In Progress or AI Review, or in Human Review
+  with no current approval, G2 never holds, so the Task and its run stay
+  where they are.
 - Test: `a_refresh_during_a_correction_run_records_the_state_and_keeps_the_run`,
   `a_refresh_of_a_reopened_review_does_not_move_it_to_pr_created`,
   `the_prompt_of_a_published_tasks_correction_carries_the_feedback`.
+
+### G2. Open delivery evidence
+
+Open-PR reconciliation moves a published Task from Human Review to PR Created
+only on verified publication evidence that the open pull request now holds
+the approved revision. The check is one pure function,
+`open_delivery(task, observed)` in `domain/publication.rs`, the open-PR
+counterpart of D's `merged_delivery`. It runs under the lifecycle lease, on
+the Task as staged, inside the same write that would set PR Created. Both
+callers pass it the `state` and full `headRefOid` of one `gh pr view` answer
+(`refresh_pr_url`'s `PrStatus`; `link_pr_to_task` reads the same answer
+instead of the state alone).
+
+Evidence, all required:
+
+- **Approval evidence.** The current decision of the current arrival is
+  Approved, with a recorded `approved_tip` B (as in D).
+- **Observation.** The answer reports `state` OPEN and a full `headRefOid` H,
+  and H equals B. An abbreviated, missing or different head is not evidence.
+- **Publication evidence.** `pr_publication` is `Published` for B, for this
+  pull request (`commit` = B, `pr_url` = the linked URL). R5 writes this
+  record for every correction, including the `At` case where nothing is
+  pushed. An absent record, one naming another commit or pull request, or one
+  that is `Pending`, `Unknown` or `Refused` is not evidence.
+
+Verdicts:
+
+| Verdict | When | Effect |
+|---|---|---|
+| Delivered | All evidence present | Status PR Created, as today's link. |
+| Not yet observed | Any evidence missing | Only the pull request's state is recorded. Status stays Human Review, the approval of B stays current, no owner is ended, and `pr_error` names B, H and what is missing. Check now asks again. |
+
+A Task not yet linked to the pull request (the first Approve & Create PR)
+keeps today's move: the pull request was just opened from the approved commit
+SlashIt pushed, and approval coverage (#355) reports any head that differs.
+
+D is unchanged and is not weakened by G2. G2 decides only whether an open
+pull request may show the correction as delivered. Completion still requires
+the merged head to equal the approved commit, so a Task G2 kept in Human
+Review that merges at the old head is held by D, and approval provenance
+(#355: the exact commit on each approval, stale once the branch or head
+moves) is read, never rewritten, by both rules.
+
+- Tests (domain unit tests of `open_delivery` for each row, and command tests
+  with a fake `gh` answer):
+  `an_approved_correction_is_not_moved_to_pr_created_while_the_pr_holds_the_old_commit`
+  (see R5a), `a_published_correction_observed_at_the_approved_head_moves_to_pr_created`,
+  `an_open_answer_without_a_full_head_keeps_the_correction_in_human_review`,
+  `an_approved_correction_without_a_published_record_stays_in_human_review`,
+  `an_unsettled_publication_keeps_the_correction_in_human_review`,
+  `a_first_pull_request_link_still_moves_the_task_to_pr_created`.
 
 ### R4. Approve the corrected commit
 
@@ -156,9 +210,12 @@ approved (old commit), changes requested, approved (new commit).
 Human Review, approved, to PR Created. This is the existing Approve & Create
 PR or Create PR path. The button reads **Approve & Update PR** when a pull
 request is linked. The approved commit is pushed without force and only when
-the remote does not already contain it, then the existing link moves the Task
-to PR Created. Approval coverage (#355) shows the approval as current only
-once the poll reads the pull request head at that commit.
+the remote does not already contain it. The existing link then moves the Task
+to PR Created only when G2 is verified: the publication record is `Published`
+at the approved commit and the same `gh pr view` answer reads the pull
+request's head at that commit. Otherwise the Task stays in Human Review with
+its approval current (R5a). Approval coverage (#355) then shows the approval
+as current, because the head it reads is the approved commit.
 
 The push to an existing pull request writes `pr_publication` through the
 existing publication record (`domain/publication.rs`): `pending` before the
@@ -173,8 +230,34 @@ holds the Task if the pull request merges at that later head.
 
 - Test: `approving_a_correction_fast_forwards_the_existing_pull_request`
   (fake `gh` and a local bare remote; asserts one push of exactly the
-  approved object ID, no new pull request, status PR Created),
+  approved object ID, `pr_publication` Published at it, no new pull request,
+  and status PR Created only after the answer reads the head at it),
   `a_remote_ahead_of_the_correction_is_refused_and_keeps_the_approval`.
+
+### R5a. B approved while the open pull request still holds A
+
+Human Review, approved at B, pull request OPEN at head A (A ≠ B). This is the
+state after R4 and before R5 finishes: R5 not run yet, its push refused or
+failed, a crash left `pr_publication` `Pending` or `Unknown`, or GitHub's
+answer still reports the old head.
+
+- Effect of any open-PR read (Check now, a PR helper's refresh, the link at
+  the end of R5): G2 is not verified, so only the pull request's state is
+  recorded. The Task stays in Human Review, the approval of B stays current
+  and is not withdrawn, the approval of A stays in history, and nothing is
+  cleaned up. The panel shows coverage as not covering the head (B approved,
+  pull request at A), and `pr_error` names both.
+- Leaves only by: R5 publishing B and a read observing H = B (to PR Created);
+  Review again (R1, which withdraws B's approval into history) followed by
+  Request Changes;
+  a merge, which D holds because the merged head A is not the approved B; or
+  a person's manual move, recorded as a Moved entry, after which coverage
+  still reports B as not at the head.
+- Test: `an_approved_correction_is_not_moved_to_pr_created_while_the_pr_holds_the_old_commit`
+  (entries A approved, changes requested, B approved; fake `gh` OPEN at A;
+  `pr_publication` absent, then Pending at B, then Published at B with the
+  answer still at A: status Human Review each time; then the answer at B:
+  PR Created, entries unchanged).
 
 ### D. Merged pull request: completion needs delivery evidence
 
@@ -309,6 +392,9 @@ what merged, and `error_message` says so.
 | Restack, integration, cleanup or recovery unfinished | R1 and R2 refused by `queue_entry_refusal`. |
 | Board write fails | Nothing changed (`WriteError::NotPublished`), or the board adopts the published file (`PublishedNotDurable`) and the reply says so. R2 is one write, so its feedback and the Queue move land together or not at all. |
 | PR status refresh during the correction | G1: state recorded, Task and run untouched. |
+| B approved, pull request still at A (R5 not run, refused, crashed, or GitHub not yet reporting B) | G2 not verified: state recorded, Task stays in Human Review with B's approval current. Check now or a retried R5 moves it once the head reads B and the record is Published at B. |
+| Pull request head reported abbreviated or missing | G2 not verified, nothing moved. |
+| `pr_publication` absent or naming another commit while the head reads B (B pushed outside SlashIt) | G2 not verified. Approve & Update PR finds the remote `At` B, records Published with no push, and the next read moves the Task. |
 | PR merged during the correction run | Nothing is recorded while the Task is outside the PR lifecycle, as today. When the run reaches Human Review, D holds it (no current approval). At R5 the merged pull request is found and the push is refused ("not open"). No second pull request is opened. |
 | PR merged while the correction waits in Human Review | D holds it: no current approval, or H ≠ the approved commit. |
 | PR merged after the correction was approved but before R5 | D holds it: H is the old head, not the approved commit. |
@@ -325,14 +411,15 @@ what merged, and `error_message` says so.
 
 ## Implementation Tasks
 
-G1 and D are safe alone and must land before R1 and R2. Otherwise a
-reopened review could be pulled back to PR Created with no approval of its
-head.
+G1, G2 and D are safe alone and must land before R1 and R2. Otherwise a
+reopened review, or an approved correction the pull request does not yet
+hold, could be pulled to PR Created with no delivery of its approved head.
 
-1. **Keep pull request status reads from moving or stopping a correction (G1).**
-   `refresh_task_pr_state` and `link_pr_to_task`, `commands/pr.rs`. Tests:
-   `a_refresh_during_a_correction_run_records_the_state_and_keeps_the_run`,
-   `a_refresh_of_a_reopened_review_does_not_move_it_to_pr_created`.
+1. **Move a published Task to PR Created only on open delivery evidence
+   (G1, G2).** `open_delivery` in `domain/publication.rs`; `refresh_task_pr_state`
+   and `link_pr_to_task` in `commands/pr.rs` pass it the state and full head
+   of one answer and, for a Task already linked, record only the state and
+   end no owner unless it is verified. Tests from G1, G2 and R5a.
 2. **Complete a merged Task only on delivery evidence (D).**
    `merged_delivery` in `domain/publication.rs`, the head passed through
    `apply_polled_pr_state`, and the Held verdict added to the stable-blocker
