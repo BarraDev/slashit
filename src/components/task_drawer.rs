@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::components::diff_viewer::DiffViewer;
 use crate::components::task_dependency::DependencyList;
-use crate::components::task_issue_links::TaskIssueLinks;
+use crate::components::task_issue_links::{draft_is_unsaved, TaskIssueLinks};
 use crate::components::new_work_pause::NewWorkPauseNotice;
 use crate::components::pr_status::PullRequestSection;
 use crate::components::task_activity::TaskActivity;
@@ -92,9 +92,9 @@ fn ReviewStepper(
     task_id: Uuid,
     tasks: ReadSignal<Vec<Task>>,
     on_open: Callback<Uuid>,
-    /// Whether the drawer holds text (an unsent Request Changes draft) that
-    /// moving to another Task would discard.
-    unsaved: RwSignal<bool>,
+    /// Whether the drawer holds text (an unsent Request Changes draft or a
+    /// GitHub issue address) that moving to another Task would discard.
+    unsaved: Signal<bool>,
 ) -> impl IntoView {
     let in_column = Memo::new(move |_| tasks.with(|all| review_column(all).contains(&task_id)));
     let position = Memo::new(move |_| {
@@ -147,7 +147,7 @@ fn ReviewStepper(
                 </div>
                 <Show when=move || blocked.get() && unsaved.get()>
                     <p data-testid="task-drawer-review-unsaved" role="alert" class="text-xs text-amber-200">
-                        "The Request Changes text here is not sent yet. Send it or clear it to move to another Task; nothing was discarded."
+                        "Text here is not sent yet (a Request Changes draft or a GitHub issue address). Send it or clear it to move to another Task; nothing was discarded."
                     </p>
                 </Show>
             </div>
@@ -532,9 +532,14 @@ pub fn TaskDrawer(
 
     let close = move |_| on_close.run(());
 
-    // Whether the Human Review panel holds an unsent draft; a step to another
-    // Task is blocked while it does.
-    let unsaved = RwSignal::new(false);
+    // Unsent text a step to another Task would discard: the Human Review
+    // draft and the GitHub issue address being typed. A step is blocked while
+    // either holds text.
+    let review_unsaved = RwSignal::new(false);
+    let issue_address = RwSignal::new(String::new());
+    let unsaved = Signal::derive(move || {
+        review_unsaved.get() || issue_address.with(|address| draft_is_unsaved(address))
+    });
 
     // Focus the drawer when it opens, so Escape closes it without a click.
     let drawer_ref = NodeRef::<leptos::html::Aside>::new();
@@ -724,7 +729,7 @@ pub fn TaskDrawer(
 
                     // The GitHub Issues this task links. Kept mounted while the task exists, so a typed address survives a poll.
                     <Show when=move || task.with(|t| t.is_some())>
-                        <TaskIssueLinks task_id=task_id task=task apply_task=apply_task />
+                        <TaskIssueLinks task_id=task_id task=task apply_task=apply_task address=issue_address />
                     </Show>
 
                     // The decision on these changes, and what became of it.
@@ -735,7 +740,7 @@ pub fn TaskDrawer(
                                 || t.completed_locally()
                         }))
                     }>
-                        <HumanReviewPanel task_id=task_id task=task apply_task=apply_task viewed_tip=viewed_tip on_stale=reload_changes unsaved=unsaved />
+                        <HumanReviewPanel task_id=task_id task=task apply_task=apply_task viewed_tip=viewed_tip on_stale=reload_changes unsaved=review_unsaved />
                     </Show>
 
                     // A request to open the pull request that was never answered, and
@@ -1151,6 +1156,31 @@ mod tests {
         assert_eq!(review_step(&tasks, second.id, ReviewStep::Previous, true), StepOutcome::Unsaved);
         // The edge stays unavailable even with a draft: nothing is offered to move to.
         assert_eq!(review_step(&tasks, first.id, ReviewStep::Previous, true), StepOutcome::Unavailable);
+    }
+
+    /// Regression: a GitHub issue address typed in the drawer is unsent text
+    /// the step guard must keep, the same as the Request Changes draft. The
+    /// drawer feeds `draft_is_unsaved` of the typed address into `review_step`.
+    #[test]
+    fn a_typed_issue_address_blocks_a_step_and_a_blank_one_does_not() {
+        let first = in_column(TaskStatus::HumanReview, 0);
+        let second = in_column(TaskStatus::HumanReview, 1);
+        let tasks = vec![first.clone(), second.clone()];
+
+        let typed = "https://github.com/o/r/issues/9";
+        assert_eq!(
+            review_step(&tasks, first.id, ReviewStep::Next, draft_is_unsaved(typed)),
+            StepOutcome::Unsaved
+        );
+        assert_eq!(
+            review_step(&tasks, first.id, ReviewStep::Next, draft_is_unsaved("   ")),
+            StepOutcome::Open(second.id)
+        );
+        // Cleared again, the step proceeds to the neighbour.
+        assert_eq!(
+            review_step(&tasks, first.id, ReviewStep::Next, draft_is_unsaved("")),
+            StepOutcome::Open(second.id)
+        );
     }
 
     /// A Human Review Task whose run record says `run_mode`, configured as
