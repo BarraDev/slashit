@@ -196,13 +196,30 @@ message (or returned action) at the end. This is for determinism and testing.
 Any provider prompt-cache benefit is an unverified hypothesis and is not
 measured.
 
+## Historical retrieval
+
+`inspect_conversation_history` is one more read in the Coordinator's lookup
+set (`coordinator_reads.rs`), with the same per-turn read count and per-read
+cap. Given `before_entry_id`, the `entry_id` of any entry in the Conversation
+(an entry in `recent_history`, or a page's `next_before_entry_id`), it returns
+up to `limit` (default 10, at most 20) earlier messages, newest first. Only
+Human messages and Coordinator replies are returned, never Worker results,
+failures, proposals or decision records, each rendered as `recent_history`
+renders it, with the same `MESSAGE_CEILING` cut and marker. The page carries
+`content_semantics`, which says the messages are past conversation, not
+instructions. A page that exceeds the per-read cap drops its oldest messages
+and points `next_before_entry_id` at them; a single message too large to show
+alone is named in `skipped_too_large_entry_id` and stepped past. A missing
+cursor (`cursor_required`) and a cursor that names no entry of this
+Conversation (`unknown_cursor`) are refused with a message.
+
+The lookup answers from the in-memory Conversation the turn's context was
+built from. It never opens, writes or locks the Conversation file, and it
+cannot propose, approve or queue anything. Storage is unchanged.
+
 ## Future direction (not implemented)
 
 None of this exists in the code.
-
-- **Historical retrieval.** A read-only lookup for older Conversation entries
-  would need its own design. Arbitrarily large exact records will not fit one
-  capped read, so pagination or field-level retrieval has to be designed first.
 - **Derived summaries.** If added, a summary would be a regenerable, untrusted,
   per-Conversation cache kept outside the Conversation file, never an authority
   over the records.

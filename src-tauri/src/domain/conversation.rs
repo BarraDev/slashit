@@ -701,6 +701,12 @@ pub enum CoordinatorOutput {
     },
     /// Read-only: this Project's name, Workspace, base branch and Task counts.
     InspectProject {},
+    /// Read-only: a bounded page of this Conversation's messages that come
+    /// before `before_entry_id`, newest first. A missing cursor is refused.
+    InspectConversationHistory {
+        before_entry_id: Option<Uuid>,
+        limit: Option<u8>,
+    },
 }
 
 /// Scope attached to every projected Human decision on a proposal.
@@ -710,7 +716,7 @@ pub const DECISION_SCOPE: &str = "this_proposal_only";
 pub const HISTORY_SEMANTICS: &str = "A decision entry records the Human's answer to one specific earlier proposal and applies to that proposal only. It is not a standing instruction. A rejected proposal never forbids a later proposal. When the current message explicitly asks for the same or an equivalent change again, treat it as a new request and propose it again; SlashIt will ask for a new approval.";
 
 /// The JSON Schema a Coordinator's final answer must match, passed to Claude
-/// Code as `--json-schema`. It describes the eleven advertised variants and
+/// Code as `--json-schema`. It describes the twelve advertised variants and
 /// leaves out the retired `delegate_to_task`.
 ///
 /// The root is an object whose only property, the required `output`, holds the
@@ -802,6 +808,10 @@ pub fn coordinator_output_schema() -> serde_json::Value {
             ]),
             branch("inspect_task_pull_request", vec![("target_task_id", task_id())]),
             branch("inspect_project", vec![]),
+            branch("inspect_conversation_history", vec![
+                ("before_entry_id", json!({ "type": ["string", "null"], "description": "entry_id of a Conversation entry; earlier messages are returned" })),
+                ("limit", optional_limit(20)),
+            ]),
         ]
     });
     json!({
@@ -947,7 +957,9 @@ impl Conversation {
             CoordinatorOutput::InspectTask { .. }
             | CoordinatorOutput::InspectTaskPullRequest { .. }
             | CoordinatorOutput::InspectProject {} => {}
-            CoordinatorOutput::ListTasks { limit, .. } | CoordinatorOutput::InspectTaskActivity { limit, .. } => {
+            CoordinatorOutput::ListTasks { limit, .. }
+            | CoordinatorOutput::InspectTaskActivity { limit, .. }
+            | CoordinatorOutput::InspectConversationHistory { limit, .. } => {
                 if *limit == Some(0) {
                     return Err("A read limit must be at least 1".into());
                 }
@@ -1330,10 +1342,10 @@ mod coordinator_schema_tests {
     use super::*;
     use serde_json::json;
 
-    const ADVERTISED: [&str; 11] = [
+    const ADVERTISED: [&str; 12] = [
         "reply", "create_task", "edit_task", "move_task", "enqueue_task", "execute_request",
         "inspect_task", "list_tasks", "inspect_task_activity", "inspect_task_pull_request",
-        "inspect_project",
+        "inspect_project", "inspect_conversation_history",
     ];
 
     /// Exhaustive on purpose: a new variant fails to compile here until it is
@@ -1351,6 +1363,7 @@ mod coordinator_schema_tests {
             CoordinatorOutput::InspectTaskActivity { .. } => Some("inspect_task_activity"),
             CoordinatorOutput::InspectTaskPullRequest { .. } => Some("inspect_task_pull_request"),
             CoordinatorOutput::InspectProject {} => Some("inspect_project"),
+            CoordinatorOutput::InspectConversationHistory { .. } => Some("inspect_conversation_history"),
             CoordinatorOutput::DelegateToTask { .. } => None,
         }
     }
@@ -1401,6 +1414,7 @@ mod coordinator_schema_tests {
             CoordinatorOutput::InspectTaskActivity { target_task_id: id, limit: None },
             CoordinatorOutput::InspectTaskPullRequest { target_task_id: id },
             CoordinatorOutput::InspectProject {},
+            CoordinatorOutput::InspectConversationHistory { before_entry_id: Some(id), limit: Some(5) },
             CoordinatorOutput::DelegateToTask {
                 text: "retired".into(),
                 target_task_id: id,
@@ -1410,7 +1424,7 @@ mod coordinator_schema_tests {
     }
 
     #[test]
-    fn the_schema_has_exactly_the_eleven_advertised_variants() {
+    fn the_schema_has_exactly_the_twelve_advertised_variants() {
         let schema = coordinator_output_schema();
         let names: Vec<&str> = branches(&schema)
             .iter()
