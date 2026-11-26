@@ -220,7 +220,7 @@ pub fn sync_refusal_message(refusal: &str, read_back: Result<&Readiness, &str>) 
         Ok(report) => {
             let saved = match report.base_sync {
                 BaseSync::FetchRemote => "New tasks fetch origin's default branch first.",
-                BaseSync::Local => "New tasks start from the local base without fetching.",
+                BaseSync::Local => "New tasks do not fetch origin first. They start from the base the refs already name: origin's default branch as last fetched when it is recorded, otherwise the project's local base branch.",
             };
             format!("{refusal}\n\nSaved setting now: {saved}")
         }
@@ -262,7 +262,10 @@ mod tests {
         let refusal = "The choice was not saved: origin names no default branch";
         let message = sync_refusal_message(refusal, Ok(&readiness(BaseSync::Local)));
         assert!(message.starts_with(refusal));
-        assert!(message.ends_with("New tasks start from the local base without fetching."));
+        assert!(message.ends_with(
+            "New tasks do not fetch origin first. They start from the base the refs already name: origin's default branch as last fetched when it is recorded, otherwise the project's local base branch."
+        ));
+        assert!(!message.contains("local base without fetching"), "{message}");
 
         // Saved, but not confirmed durable: the warning is kept verbatim and the saved state is the new one.
         let warning = "The change was applied, but SlashIt could not confirm that it reached stable storage";
