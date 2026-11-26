@@ -403,29 +403,39 @@ async fn project_conversation_shows_the_run_an_approval_started() {
         }).count());
         let enqueue = format!(r#"{{"type":"enqueue_task","text":"This is ready to build.","target_task_id":"{task_id}"}}"#);
         std::fs::write(scripted.join("1"), &enqueue)?;
-        open_conversations(driver, &project_id).await?;
-        let history = "[data-testid=\"conversation-history\"]";
         let card = "[data-testid=\"conversation-execution\"]";
 
-        // 1. Approval queues the Task, and the card names the approval's queued run.
-        submit_message(driver, "Please get this started.").await?;
-        await_text(driver, "[data-testid=\"project-action-proposal\"]", &title).await?;
-        ui::visible(driver, "[data-testid=\"project-action-approve\"]").await?.click().await?;
-        await_text(driver, history, &format!("Task queued: {title}")).await?;
-        await_text(driver, &format!("{card}[data-state=\"queued\"] [data-testid=\"conversation-execution-task\"]"), &title).await?;
-        await_text(driver, &format!("{card}[data-state=\"queued\"] [data-testid=\"conversation-execution-run\"]"), "Run not established yet").await?;
-        if worker_runs()? != 0 { bail!("approving started a run before the scheduler promoted the Task"); }
+        // Every step after the application is running. A failure is captured while the
+        // application is still alive, before the session is closed.
+        let steps = async {
+            open_conversations(driver, &project_id).await?;
+            let history = "[data-testid=\"conversation-history\"]";
 
-        // 2. The executor runs it. The card settles to the coding result, and the Conversation starts nothing.
-        ui::invoke(driver, "update_queue_config", json!({ "autoPromote": true })).await?;
-        let settled = super::await_status(driver, &project_id, &task_id, &["human_review", "error"]).await?;
-        if settled["status"] != "human_review" || settled["worktree_path"].is_null() {
-            bail!("the queued Task did not run through the executor to Human Review: {settled}");
+            // 1. Approval queues the Task, and the card names the approval's queued run.
+            submit_message(driver, "Please get this started.").await?;
+            await_text(driver, "[data-testid=\"project-action-proposal\"]", &title).await?;
+            ui::visible(driver, "[data-testid=\"project-action-approve\"]").await?.click().await?;
+            await_text(driver, history, &format!("Task queued: {title}")).await?;
+            await_text(driver, &format!("{card}[data-state=\"queued\"] [data-testid=\"conversation-execution-task\"]"), &title).await?;
+            await_text(driver, &format!("{card}[data-state=\"queued\"] [data-testid=\"conversation-execution-run\"]"), "Run not established yet").await?;
+            if worker_runs()? != 0 { bail!("approving started a run before the scheduler promoted the Task"); }
+
+            // 2. The executor runs it. The card settles to the coding result, and the Conversation starts nothing.
+            ui::invoke(driver, "update_queue_config", json!({ "autoPromote": true })).await?;
+            let settled = super::await_status(driver, &project_id, &task_id, &["human_review", "error"]).await?;
+            if settled["status"] != "human_review" || settled["worktree_path"].is_null() {
+                bail!("the queued Task did not run through the executor to Human Review: {settled}");
+            }
+            await_text(driver, &format!("{card}[data-state=\"completed\"] [data-testid=\"conversation-execution-run\"]"), "Run 1").await?;
+            await_text(driver, &format!("{card}[data-state=\"completed\"] [data-testid=\"conversation-execution-result\"]"), fake_agent::REPORTED_RESULT).await?;
+            if worker_runs()? != 1 { bail!("expected exactly one Task run, found {}", worker_runs()?); }
+            Ok::<(), anyhow::Error>(())
+        }.await;
+        if steps.is_err() {
+            capture_execution_evidence(driver, context.artifacts_dir(), &project_id, &task_id, &agent).await;
         }
-        await_text(driver, &format!("{card}[data-state=\"completed\"] [data-testid=\"conversation-execution-run\"]"), "Run 1").await?;
-        await_text(driver, &format!("{card}[data-state=\"completed\"] [data-testid=\"conversation-execution-result\"]"), fake_agent::REPORTED_RESULT).await?;
-        if worker_runs()? != 1 { bail!("expected exactly one Task run, found {}", worker_runs()?); }
-        context.close_session(session, "execution", &Ok(())).await?;
+        context.close_session(session, "execution", &steps).await?;
+        steps?;
 
         // 3. After a restart the card is rebuilt from the Task record, and no run is replayed.
         let restarted = context.start_session("execution-restart").await?;
@@ -669,8 +679,81 @@ pub(super) async fn await_text(driver: &WebDriver, selector: &str, text: &str) -
             return Ok(());
         }
         if started.elapsed() > EXECUTION_DEADLINE {
-            bail!("{selector} never displayed {text:?}");
+            bail!("{selector} never displayed {text:?}; last seen: {}", bounded_text(&matches.to_string(), 800));
         }
         tokio::time::sleep(POLL).await;
     }
+}
+
+/// Read by `capture_execution_evidence`: the execution cards as the page shows
+/// them, and the end of the Conversation history.
+const PAGE_EVIDENCE_SCRIPT: &str = "return {
+    url: location.pathname + location.hash,
+    conversation_panel: !!document.querySelector('[data-testid=\"project-conversation\"]'),
+    cards: Array.from(document.querySelectorAll('[data-testid=\"conversation-execution\"]'), card => ({
+        state: card.getAttribute('data-state'),
+        text: (card.textContent || '').slice(0, 500),
+    })),
+    history_tail: (document.querySelector('[data-testid=\"conversation-history\"]')?.textContent || '').slice(-400),
+};";
+
+/// Evidence for a failed execution journey, read while the application is alive.
+///
+/// It records what the Task record says about its run, the approval-to-run
+/// evidence, the execution projection the page reads, what the page shows, and
+/// how many provider runs happened. Every value is bounded, so the file stays
+/// small enough to upload with the failure artifacts.
+async fn capture_execution_evidence(
+    driver: &WebDriver,
+    artifacts: &std::path::Path,
+    project_id: &str,
+    task_id: &str,
+    agent: &FakeAgent,
+) {
+    let task = match ui::invoke(driver, "list_tasks", json!({ "projectId": project_id })).await {
+        Ok(listed) => match super::find_task(&listed, task_id) {
+            Some(task) => task_evidence(&task),
+            None => json!({ "missing": true }),
+        },
+        Err(error) => json!({ "error": format!("{error:#}") }),
+    };
+    let executions = ui::invoke(driver, "get_project_conversation_executions", json!({ "projectId": project_id })).await
+        .unwrap_or_else(|error| json!({ "error": format!("{error:#}") }));
+    let page = super::page(driver, PAGE_EVIDENCE_SCRIPT, vec![]).await
+        .unwrap_or_else(|error| json!({ "error": format!("{error:#}") }));
+    let provider = match agent.invocations() {
+        Ok(runs) => json!({
+            "total": runs.len(),
+            "without_prompt": runs.iter().filter(|run| run.prompt.is_none()).count(),
+            "coordinator": runs.iter().filter(|run| run.prompt.as_deref().is_some_and(|prompt| prompt.contains("\"current_message\""))).count(),
+            "worker": runs.iter().filter(|run| run.prompt.as_deref().is_some_and(|prompt| !prompt.contains("\"current_message\""))).count(),
+        }),
+        Err(error) => json!({ "error": format!("{error:#}") }),
+    };
+    let evidence = json!({ "task": task, "executions": executions, "page": page, "provider": provider });
+    let path = artifacts.join("execution-evidence.json");
+    match std::fs::write(&path, serde_json::to_string_pretty(&evidence).unwrap_or_default()) {
+        Ok(()) => eprintln!("execution evidence: {}", path.display()),
+        Err(error) => eprintln!("execution evidence could not be written: {error}"),
+    }
+}
+
+/// What a Task record says about its run, without the full text of its activity.
+fn task_evidence(task: &Value) -> Value {
+    let activity = task["activity"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let recent: Vec<String> = activity.iter().rev().take(30).rev().map(|entry| bounded_text(&entry.to_string(), 300)).collect();
+    json!({
+        "status": task["status"],
+        "phase": task["phase"],
+        "worktree_set": !task["worktree_path"].is_null(),
+        "branch_set": !task["branch_name"].is_null(),
+        "approved_execution": bounded_text(&task["approved_execution"].to_string(), 400),
+        "executed_approvals": bounded_text(&task["executed_approvals"].to_string(), 800),
+        "activity_count": activity.len(),
+        "recent_activity": recent,
+    })
+}
+
+fn bounded_text(text: &str, limit: usize) -> String {
+    text.chars().take(limit).collect()
 }
