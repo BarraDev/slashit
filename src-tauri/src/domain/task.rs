@@ -3892,6 +3892,87 @@ mod tests {
         assert_eq!(loaded.activity, task.activity);
     }
 
+    // Characterization tests for docs/architecture/post-pr-corrections.md.
+    // They record how a published approval behaves today, so the design's
+    // implementation Tasks change these expectations on purpose.
+
+    const PUBLISHED_TIP: &str = "1111111111111111111111111111111111111111";
+    const CORRECTED_TIP: &str = "2222222222222222222222222222222222222222";
+
+    /// A Task whose approval of `PUBLISHED_TIP` was delivered as a pull request.
+    fn published_task() -> Task {
+        let mut task = startable_task();
+        task.human_review.record_arrival();
+        task.human_review.approve(Some(PUBLISHED_TIP.to_string()), chrono::Utc::now());
+        task.status = TaskStatus::PrCreated;
+        task.record_move(&TaskStatus::HumanReview);
+        assert!(task.human_review.is_approved(), "delivery keeps the approval");
+        task
+    }
+
+    /// Today a move from PR Created back to Human Review opens no arrival, so
+    /// the published approval stays the current decision: Request Changes
+    /// refuses it as approved, and renewal refuses it for having a pull
+    /// request. The design's "reopen review" transition (R1) flips this.
+    #[test]
+    fn today_a_move_back_to_human_review_keeps_the_published_approval_current() {
+        let mut task = published_task();
+        task.status = TaskStatus::HumanReview;
+        task.record_move(&TaskStatus::PrCreated);
+        assert!(task.human_review.is_approved());
+        assert_eq!(task.human_review.approved_tip(), Some(PUBLISHED_TIP));
+    }
+
+    /// Today a move from PR Created into Queue retires the published approval
+    /// into the history, but records no feedback: the next run is told only
+    /// the description, which it already delivered.
+    #[test]
+    fn today_a_queue_move_from_pr_created_retires_the_approval_without_feedback() {
+        let mut task = published_task();
+        task.status = TaskStatus::Queue;
+        task.record_move(&TaskStatus::PrCreated);
+        task.reset_execution_state();
+        assert!(!task.human_review.is_approved());
+        assert!(task.human_review.pending_feedback().is_empty());
+        assert_eq!(task.human_review.entries.len(), 1);
+        assert_eq!(task.human_review.entries[0].approved_tip.as_deref(), Some(PUBLISHED_TIP));
+    }
+
+    /// The record already expresses a whole post-PR correction with no new
+    /// field: the published approval is closed, the change request belongs to
+    /// the next run, the run's arrival opens a fresh decision, and the new
+    /// exact-commit approval is current while the old one stays in history.
+    #[test]
+    fn a_post_pr_correction_needs_no_new_review_record_field() {
+        let mut task = published_task();
+        // Request Changes from PR Created (R2): withdraw, then request.
+        task.human_review.withdraw_approval();
+        task.human_review.push(HumanReviewDecision::ChangesRequested, Some("fix CI".into()), chrono::Utc::now());
+        assert_eq!(task.human_review.pending_feedback(), vec!["fix CI"]);
+        // The correction run reaches Human Review (R3).
+        task.human_review.record_arrival();
+        assert!(task.human_review.current_decision().is_none());
+        assert!(task.human_review.pending_feedback().is_empty(), "the run answered the feedback");
+        // A new exact-commit approval (R4).
+        task.human_review.approve(Some(CORRECTED_TIP.to_string()), chrono::Utc::now());
+        assert_eq!(task.human_review.approved_tip(), Some(CORRECTED_TIP));
+        let decisions: Vec<_> = task
+            .human_review
+            .entries
+            .iter()
+            .map(|e| (e.sequence, e.decision, e.approved_tip.as_deref()))
+            .collect();
+        assert_eq!(
+            decisions,
+            vec![
+                (1, HumanReviewDecision::Approved, Some(PUBLISHED_TIP)),
+                (2, HumanReviewDecision::ChangesRequested, None),
+                (3, HumanReviewDecision::Approved, Some(CORRECTED_TIP)),
+            ]
+        );
+        assert!(task.human_review.binds(true, Some(PUBLISHED_TIP)).is_err(), "the old commit is not covered");
+    }
+
     #[test]
     fn a_move_is_recorded_only_when_the_column_changes() {
         let mut task = startable_task();

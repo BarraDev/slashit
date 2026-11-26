@@ -333,7 +333,9 @@ The panel then names the approved commit and the pull request's head, and says
 that changes after the approved commit need review in the pull request. Once a
 pull request exists, the approval is not renewed; the pull request's review and
 merge decide later changes. A Task without a recorded GitHub pull request is
-judged by its branch alone.
+judged by its branch alone. The proposed path for reviewing a correction made
+after the pull request exists, in a new Human Review arrival, is in
+[post-pr-corrections.md](post-pr-corrections.md).
 
 ### Local delivery
 
