@@ -141,6 +141,10 @@ slashit status                              # App status overview
 slashit projects                            # List projects
 slashit tasks [--project ID]                # List tasks
 slashit runs TASK_ID                        # Show one Task's recent execution evidence
+slashit review TASK_ID                      # Review state as JSON
+slashit delivery TASK_ID                    # Delivery state as JSON
+slashit request TASK_ID approve --commit SHA --actor NAME   # Ask a person (or: open-pr)
+slashit open-pr TASK_ID --request ID --actor NAME           # Use a person's authorization once
 slashit create --project ID "Task title"    # Create task
 slashit move TASK_ID queue                  # Move task to status
 slashit edit TASK_ID --title "New title"    # Edit task

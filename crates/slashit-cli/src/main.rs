@@ -70,6 +70,49 @@ enum Commands {
         /// Task ID
         task_id: String,
     },
+    /// Show a Task's review state as JSON (read-only)
+    ///
+    /// Decisions, whether the approval still covers the branch, the branch's
+    /// commit, and the requests agents filed with what became of them.
+    Review {
+        /// Task ID
+        task_id: String,
+    },
+    /// Show a Task's delivery state as JSON (read-only)
+    Delivery {
+        /// Task ID
+        task_id: String,
+    },
+    /// Ask a person to approve a commit, or to authorize opening its pull request
+    ///
+    /// This only files the request. A person decides it in the desktop app;
+    /// `slashit review` shows the answer.
+    Request {
+        /// Task ID
+        task_id: String,
+        #[arg(value_parser = ["approve", "open-pr"])]
+        operation: String,
+        /// Full object ID of the commit, as `slashit review` reports it
+        #[arg(long)]
+        commit: String,
+        /// The name you give yourself, shown to the person and recorded
+        #[arg(long)]
+        actor: String,
+    },
+    /// Open the pull request a person authorized
+    ///
+    /// Works once, for the commit the request names, within the time the
+    /// authorization allows.
+    OpenPr {
+        /// Task ID
+        task_id: String,
+        /// Request ID that `slashit request <task> open-pr` returned
+        #[arg(long)]
+        request: String,
+        /// The name you give yourself, recorded as who opened it
+        #[arg(long)]
+        actor: String,
+    },
     /// Create a new task
     Create {
         /// Project ID
@@ -277,7 +320,13 @@ async fn main() -> Result<()> {
     // Format output based on command type
     match &cli.command {
         // The record is JSON by nature; there is no table form.
-        Commands::Inspect { .. } | Commands::Quiesce { .. } | Commands::Resume { .. } => {
+        Commands::Inspect { .. }
+        | Commands::Review { .. }
+        | Commands::Delivery { .. }
+        | Commands::Request { .. }
+        | Commands::OpenPr { .. }
+        | Commands::Quiesce { .. }
+        | Commands::Resume { .. } => {
             println!("{}", serde_json::to_string_pretty(&response.data)?)
         }
         Commands::Status => output::print_status(&response.data),
@@ -308,6 +357,10 @@ fn task_refs(command: &mut Commands) -> Vec<&mut String> {
     match command {
         Commands::Inspect { task_id }
         | Commands::Runs { task_id }
+        | Commands::Review { task_id }
+        | Commands::Delivery { task_id }
+        | Commands::Request { task_id, .. }
+        | Commands::OpenPr { task_id, .. }
         | Commands::Move { task_id, .. }
         | Commands::Edit { task_id, .. }
         | Commands::SetModel { task_id, .. }
@@ -396,6 +449,23 @@ fn request_for(command: &Commands) -> Result<IpcRequest> {
         },
         Commands::Runs { task_id } => IpcRequest::GetTaskEvidence {
             task_id: task_id.clone(),
+        },
+        Commands::Review { task_id } => IpcRequest::GetReviewState {
+            task_id: task_id.clone(),
+        },
+        Commands::Delivery { task_id } => IpcRequest::GetDeliveryState {
+            task_id: task_id.clone(),
+        },
+        Commands::Request { task_id, operation, commit, actor } => IpcRequest::RequestOperation {
+            task_id: task_id.clone(),
+            operation: operation.clone(),
+            commit: commit.clone(),
+            actor: actor.clone(),
+        },
+        Commands::OpenPr { task_id, request, actor } => IpcRequest::OpenPr {
+            task_id: task_id.clone(),
+            request_id: request.clone(),
+            actor: actor.clone(),
         },
         Commands::Create {
             project,
@@ -579,6 +649,30 @@ mod dispatch_tests {
             IpcRequest::GetTask { task_id } => assert_eq!(task_id, TASK),
             other => panic!("inspect mapped to {other:?}"),
         }
+    }
+
+    #[test]
+    fn review_and_delivery_commands_map_to_their_requests() {
+        match request_for_args(&["slashit", "review", TASK]) {
+            IpcRequest::GetReviewState { task_id } => assert_eq!(task_id, TASK),
+            other => panic!("review mapped to {other:?}"),
+        }
+        match request_for_args(&["slashit", "delivery", TASK]) {
+            IpcRequest::GetDeliveryState { task_id } => assert_eq!(task_id, TASK),
+            other => panic!("delivery mapped to {other:?}"),
+        }
+        let args = ["slashit", "request", TASK, "open-pr", "--commit", "c0", "--actor", "a"];
+        match request_for_args(&args) {
+            IpcRequest::RequestOperation { operation, commit, actor, .. } => {
+                assert_eq!((operation.as_str(), commit.as_str(), actor.as_str()), ("open-pr", "c0", "a"));
+            }
+            other => panic!("request mapped to {other:?}"),
+        }
+        match request_for_args(&["slashit", "open-pr", TASK, "--request", "r", "--actor", "a"]) {
+            IpcRequest::OpenPr { request_id, .. } => assert_eq!(request_id, "r"),
+            other => panic!("open-pr mapped to {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["slashit", "approve", TASK]).is_err());
     }
 
     #[test]

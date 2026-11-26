@@ -402,6 +402,12 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub executed_approvals: Vec<ExecutedApproval>,
 
+    /// What external agents asked a person to approve or authorize, oldest
+    /// first, with the decision and the one use of it. See
+    /// [`super::agent_request`]. Only the desktop app writes a decision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_requests: Vec<super::agent_request::AgentRequest>,
+
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -1076,6 +1082,7 @@ impl Task {
             new_attempt_confirmed: false,
             approved_execution: None,
             executed_approvals: Vec::new(),
+            agent_requests: Vec::new(),
             created_at: now,
             updated_at: now,
         }

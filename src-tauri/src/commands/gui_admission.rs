@@ -70,6 +70,7 @@ impl<'de, R: Runtime> CommandArg<'de, R> for GuiMutation {
 const READ_ONLY: &[&str] = &[
     "get_conversation_draft",
     "greet",
+    "list_agent_requests",
     "get_theme",
     "list_themes",
     "get_appearance_mode",

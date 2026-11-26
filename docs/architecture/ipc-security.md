@@ -95,6 +95,10 @@ Done through Queue. This is a refusal of these verbs, not an authorization
 boundary: the control channel does not distinguish a person from an agent that
 runs as the same OS user, and it does not gate the desktop's own actions.
 
+`OpenPr` publishes a branch, but only the one commit a person authorized, once
+([agent-review-delivery.md](agent-review-delivery.md)). It is not an
+agent-spawning verb.
+
 Other verbs change state without running anything: `SetTaskModel`,
 `SetTaskReviewMode` and `SetTaskDependencies` edit what a Task's *next* run is
 started with (`task.model`, `review_mode`, `dependencies`). They are classified
@@ -139,6 +143,10 @@ Two questions, answered in order, for every request:
    No remote export contract exists. The CLI and Tauri reach the local endpoint,
    which is OS-verified, so both keep working. Export over TCP is refused with
    the same message as the other gated verbs, even with a valid token.
+
+`RequestOperation` and `OpenPr` need a verified peer too: one puts a decision in
+front of a person and the other publishes. Neither records a decision, and no
+verb does; see [agent-review-delivery.md](agent-review-delivery.md).
 
 Every mutating request is written to an audit line with the verb, the endpoint
 and whether the peer was OS-verified. Payloads are never logged — task

@@ -20,6 +20,9 @@ use slashit_activity::{Column, Entry, Kind, RunResult};
 use uuid::Uuid;
 
 use super::storage::ProjectTasksFile;
+use crate::domain::agent_request::{
+    AgentRequest, HumanDecision, RequestUse, RequestedOperation, UseOutcome,
+};
 use crate::domain::conversation::ExistingCheckoutEvidence;
 use crate::domain::task::{
     ApprovedExecution, BranchOrigin, CheckoutAdmission, DependencyAdmission,
@@ -389,6 +392,22 @@ fn full_task(project_id: Uuid) -> Task {
         run: 1,
         digest: "digest".into(),
         checkout: Some(evidence),
+    }];
+    task.agent_requests = vec![AgentRequest {
+        id: Uuid::new_v4(),
+        operation: RequestedOperation::OpenPr,
+        commit: commit('b'),
+        arrival: 1,
+        requested_by: "agent".into(),
+        requested_at: at(13),
+        expires_at: at(14),
+        invalidated_at: Some(at(15)),
+        decision: Some(HumanDecision { authorized: true, decided_at: at(13), expires_at: Some(at(14)) }),
+        used: Some(RequestUse {
+            executed_by: "agent".into(),
+            started_at: at(13),
+            outcome: Some(UseOutcome::PrOpened { url: "https://github.com/o/r/pull/1".into() }),
+        }),
     }];
     task
 }

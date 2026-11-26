@@ -5,6 +5,7 @@ pub mod repository_service;
 pub mod project_service;
 pub mod workspace_service;
 pub mod task_service;
+pub mod agent_request_service;
 pub mod agent_service;
 pub mod session_service;
 pub mod jj_service;

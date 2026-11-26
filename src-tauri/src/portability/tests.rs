@@ -430,6 +430,7 @@ fn live_runtime_and_execution_authority_fields_are_not_portable() {
         "branch_name",
         "approved_execution",
         "executed_approvals",
+        "agent_requests",
         "worker_handoff",
         "checkout_admission",
         "pending_republish",

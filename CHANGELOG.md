@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **Agent review and delivery from the CLI.** `slashit review` and
+  `slashit delivery` read a Task's state as JSON. `slashit request` asks a
+  person to approve a commit or to authorize opening its pull request, decided
+  only in the desktop app, and `slashit open-pr` uses that authorization once.
+  A moved branch invalidates it. A Task board that holds such a request cannot
+  be read by an earlier version.
+
 ## [0.0.4]
 
 An experimental prerelease. It is not production-ready. It keeps the startup

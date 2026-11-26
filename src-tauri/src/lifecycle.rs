@@ -1941,8 +1941,12 @@ fn publish_typed(
     tasks_w: &mut HashMap<Uuid, Task>,
     storage: &Storage,
     project_id: Uuid,
-    staged: HashMap<Uuid, Task>,
+    mut staged: HashMap<Uuid, Task>,
 ) -> Result<(), RecordWriteError> {
+    // Part of the same write as whatever moved the Task, whichever path did.
+    for task in staged.values_mut() {
+        task.retire_agent_requests_outside_review();
+    }
     let list: Vec<Task> = staged.values().cloned().collect();
     let saved = storage.save_project_tasks(project_id, &list);
     // A board the file already holds but could not confirm durable is still

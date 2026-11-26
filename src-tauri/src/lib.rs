@@ -314,6 +314,9 @@ pub fn run() {
                     feature_diagnostics: None,
                     paths: state.paths.clone(),
                     start_guard: state.start_guard.clone(),
+                    app: Some(Arc::new(GuiApp {
+                        handle: app.handle().clone(),
+                    })),
                 });
                 // Serving the endpoints claimed before hydration. Nothing is
                 // bound here, so this can no longer fail because another
@@ -532,6 +535,8 @@ pub fn run() {
             get_unconfirmed_pr_repository,
             complete_task_locally,
             approve_task_again,
+            list_agent_requests,
+            decide_agent_request,
             get_approval_status,
             get_worker_recovery_evidence,
             accept_worker_result,
@@ -733,6 +738,22 @@ async fn request_quit_inner(app: &tauri::AppHandle) {
             "agent_count": agent_count,
         }),
     );
+}
+
+/// The desktop app's state, for the control channel's review and delivery
+/// verbs. A person can be asked here.
+struct GuiApp {
+    handle: tauri::AppHandle,
+}
+
+impl ipc::AppAccess for GuiApp {
+    fn state(&self) -> &AppState {
+        self.handle.state::<AppState>().inner()
+    }
+
+    fn shows_requests_to_a_person(&self) -> bool {
+        true
+    }
 }
 
 /// The GUI's answer to the operations that differ between front ends.

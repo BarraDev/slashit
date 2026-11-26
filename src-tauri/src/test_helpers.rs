@@ -787,6 +787,7 @@ pub fn ipc_test_context(paths: std::sync::Arc<crate::config::paths::AppPaths>) -
         feature_diagnostics: None,
         paths,
         start_guard: plenty_of_disk(),
+        app: None,
     }
 }
 
@@ -1020,6 +1021,7 @@ pub fn create_test_task(title: &str) -> Task {
         new_attempt_confirmed: false,
         approved_execution: None,
         executed_approvals: Vec::new(),
+        agent_requests: Vec::new(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }

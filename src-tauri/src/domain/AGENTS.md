@@ -5,6 +5,7 @@ Domain models shared across backend modules. These types define the core data st
 ## Models
 
 - **agent.rs** - Agent types and status
+- **agent_request.rs** - An external agent's request to have changes approved or a pull request authorized: what it is bound to, the person's decision, the one use of it, and its derived state. See `docs/architecture/agent-review-delivery.md`
 - **integration.rs** - The durable record of integrating a Task's approved commit into a local branch, including the checkout a person confirmed moving it in
 - **project.rs** - Project definition and metadata, including where its tasks start and whether a person chose the local branch over a remote default
 - **github_issue_link.rs** - Linking a GitHub Issue to a Task: the one accepted Issue address form (parsing refuses other hosts, pull requests, queries, fragments and non-positive numbers), and the repeated-link check. The read that confirms the Issue lives in `commands/github.rs`
