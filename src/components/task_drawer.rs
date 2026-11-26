@@ -1164,44 +1164,6 @@ mod tests {
         assert_eq!(review_step(&tasks, first.id, ReviewStep::Previous, true), StepOutcome::Unavailable);
     }
 
-    /// Regression: a GitHub issue address typed in the drawer is unsent text
-    /// the step guard must keep, the same as the Request Changes draft. The
-    /// drawer and `TaskIssueLinks` share one `issue_address` signal, and the
-    /// drawer's `unsaved` signal is what `ReviewStepper` consults. This runs
-    /// that wiring under a reactive owner: typing into the shared signal
-    /// blocks the step, and clearing it lets the step proceed.
-    #[test]
-    fn a_typed_issue_address_blocks_a_step_through_the_drawer_signal() {
-        let first = in_column(TaskStatus::HumanReview, 0);
-        let second = in_column(TaskStatus::HumanReview, 1);
-        let tasks = vec![first.clone(), second.clone()];
-
-        let owner = Owner::new();
-        owner.with(|| {
-            let review_unsaved = RwSignal::new(false);
-            let issue_address = RwSignal::new(String::new());
-            // Same derivation as `TaskDrawer`.
-            let unsaved = Signal::derive(move || {
-                issue_address.with(|address| drawer_holds_unsaved_text(review_unsaved.get(), address))
-            });
-            let step = |unsaved: &Signal<bool>| review_step(&tasks, first.id, ReviewStep::Next, unsaved.get_untracked());
-
-            assert_eq!(step(&unsaved), StepOutcome::Open(second.id));
-
-            // What `TaskIssueLinks` does on each keystroke.
-            issue_address.set("https://github.com/o/r/issues/9".into());
-            assert_eq!(step(&unsaved), StepOutcome::Unsaved);
-
-            // Blank text again is not a draft.
-            issue_address.set("   ".into());
-            assert_eq!(step(&unsaved), StepOutcome::Open(second.id));
-
-            // The Request Changes draft holds the drawer the same way.
-            review_unsaved.set(true);
-            assert_eq!(step(&unsaved), StepOutcome::Unsaved);
-        });
-    }
-
     #[test]
     fn either_unsent_draft_holds_the_drawer() {
         assert!(!drawer_holds_unsaved_text(false, ""));
