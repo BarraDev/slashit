@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::components::toast;
 use crate::components::workspace_management::WorkspaceManagement;
 use crate::models::Project;
-use crate::services::{list_projects, remove_project, rename_project};
+use crate::services::{list_projects, remove_project, rename_project, set_project_pr_review_defaults};
 
 #[component]
 pub fn ProjectOrganizer(
@@ -341,6 +341,40 @@ fn ProjectRow(
         }
         next
     });
+    // The PR review defaults as the list reports them now; a toggle saves at once.
+    let defaults = Memo::new(move |_| {
+        projects.with(|ps| {
+            ps.iter()
+                .find(|p| p.id == id)
+                .map(|p| p.pr_review_defaults)
+                .unwrap_or_default()
+        })
+    });
+    let saving_defaults = RwSignal::new(false);
+    let save_defaults = move |next: crate::models::PrReviewDefaults| {
+        if saving_defaults.get_untracked() {
+            return;
+        }
+        saving_defaults.set(true);
+        spawn_local(async move {
+            match set_project_pr_review_defaults(id.to_string(), next).await {
+                Ok(updated) => {
+                    let _ = projects.try_update(|list| {
+                        for project in list.iter_mut().filter(|p| p.id == id) {
+                            project.pr_review_defaults = updated.pr_review_defaults;
+                        }
+                    });
+                    let _ = action_error.try_set(None);
+                }
+                Err(e) => {
+                    let _ = action_error.try_set(Some(format!(
+                        "Could not save the PR review defaults: {e}"
+                    )));
+                }
+            }
+            let _ = saving_defaults.try_set(false);
+        });
+    };
     let saving = RwSignal::new(false);
     let confirming = RwSignal::new(false);
     let removing = RwSignal::new(false);
@@ -518,6 +552,40 @@ fn ProjectRow(
                     "Remove"
                 </button>
             </form>
+
+            <div class="mt-3 flex flex-wrap items-center gap-4 text-xs text-white/70">
+                <span class="text-white/50">"PR review defaults (off unless set):"</span>
+                <label class="flex items-center gap-1.5 cursor-pointer">
+                    <input
+                        type="checkbox"
+                        data-testid="project-organizer-auto-push"
+                        class="accent-yellow-500"
+                        prop:checked=move || defaults.get().auto_push
+                        disabled=move || saving_defaults.get() || removing.get()
+                        on:change=move |ev| {
+                            let mut next = defaults.get_untracked();
+                            next.auto_push = event_target_checked(&ev);
+                            save_defaults(next);
+                        }
+                    />
+                    "Auto-push branch"
+                </label>
+                <label class="flex items-center gap-1.5 cursor-pointer">
+                    <input
+                        type="checkbox"
+                        data-testid="project-organizer-auto-reply"
+                        class="accent-yellow-500"
+                        prop:checked=move || defaults.get().auto_reply
+                        disabled=move || saving_defaults.get() || removing.get()
+                        on:change=move |ev| {
+                            let mut next = defaults.get_untracked();
+                            next.auto_reply = event_target_checked(&ev);
+                            save_defaults(next);
+                        }
+                    />
+                    "Auto-reply to comments"
+                </label>
+            </div>
 
             {move || confirming.get().then(|| view! {
                 <div data-testid="project-organizer-confirm" class="mt-3 flex flex-wrap items-center justify-between gap-2 text-sm text-white/70">

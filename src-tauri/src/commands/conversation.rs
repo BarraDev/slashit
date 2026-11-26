@@ -1821,6 +1821,7 @@ mod tests {
                     created_at: chrono::Utc::now(),
                     updated_at: chrono::Utc::now(),
                     removed_at: None,
+                    pr_review_defaults: Default::default(),
                 },
             );
             let mut task = board_task(project_id, TaskStatus::Error);
@@ -1992,6 +1993,7 @@ mod tests {
                     created_at: chrono::Utc::now(),
                     updated_at: chrono::Utc::now(),
                     removed_at: None,
+                    pr_review_defaults: Default::default(),
                 },
             );
             let task = board_task(project_id, TaskStatus::Backlog);
@@ -2307,6 +2309,7 @@ mod tests {
                     created_at: chrono::Utc::now(),
                     updated_at: chrono::Utc::now(),
                     removed_at: None,
+                    pr_review_defaults: Default::default(),
                 },
             );
             let mut task = board_task(project_id, TaskStatus::Error);
@@ -2686,6 +2689,7 @@ mod tests {
                     created_at: chrono::Utc::now(),
                     updated_at: chrono::Utc::now(),
                     removed_at: None,
+                    pr_review_defaults: Default::default(),
                 },
             );
             let app = tauri::test::mock_app();

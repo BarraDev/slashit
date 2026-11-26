@@ -1881,6 +1881,7 @@ pub(super) mod tests {
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
                 removed_at: None,
+                pr_review_defaults: Default::default(),
             },
         );
 
@@ -2009,6 +2010,7 @@ pub(super) mod tests {
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
                 removed_at: None,
+                pr_review_defaults: Default::default(),
             },
         );
 
@@ -2166,6 +2168,7 @@ pub(super) mod tests {
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
                 removed_at: None,
+                pr_review_defaults: Default::default(),
             },
         );
 
@@ -2252,6 +2255,7 @@ pub(super) mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             removed_at: None,
+            pr_review_defaults: Default::default(),
         };
         ctx.projects.write().await.insert(
             with_repo_id,
@@ -3113,6 +3117,7 @@ mod task_configuration_writes {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             removed_at: None,
+            pr_review_defaults: Default::default(),
         }
     }
 
@@ -3748,6 +3753,7 @@ mod import_lock_order {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             removed_at: None,
+            pr_review_defaults: Default::default(),
         }
     }
 

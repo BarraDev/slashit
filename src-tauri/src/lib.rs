@@ -473,6 +473,7 @@ pub fn run() {
             delete_project,
             remove_project,
             update_project,
+            set_project_pr_review_defaults,
             get_project_path,
             attach_project_to_workspace,
             detach_project_from_workspace,

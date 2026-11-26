@@ -154,6 +154,7 @@ pub async fn create_project(
         created_at: now,
         updated_at: now,
         removed_at: None,
+        pr_review_defaults: Default::default(),
     };
 
     create_project_committed(&state.project.projects, &state.repository.repositories, &state.storage, project).await
@@ -1237,6 +1238,52 @@ async fn update_project_committed(
     }
 }
 
+/// Saves a Project's PR Comment Review defaults. Only that field changes:
+/// the name, repository, agent configuration and everything else are kept.
+#[tauri::command]
+pub async fn set_project_pr_review_defaults(
+    _gui: GuiMutation,
+    state: tauri::State<'_, crate::AppState>,
+    id: String,
+    auto_push: bool,
+    auto_reply: bool,
+) -> Result<Option<Project>, String> {
+    let id = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    let _gate = state.task.project_gate.read(id).await;
+    set_project_pr_review_defaults_committed(
+        &state.project.projects,
+        &state.storage,
+        id,
+        crate::domain::PrReviewDefaults { auto_push, auto_reply },
+    )
+    .await
+}
+
+/// Core of [`set_project_pr_review_defaults`]; see [`create_project_committed`]
+/// for why the map is cloned first.
+async fn set_project_pr_review_defaults_committed(
+    projects: &RwLock<HashMap<Uuid, Project>>,
+    storage: &Storage,
+    id: Uuid,
+    defaults: crate::domain::PrReviewDefaults,
+) -> Result<Option<Project>, String> {
+    let mut projects_w = projects.write().await;
+    let mut proposed = projects_w.clone();
+    let Some(project) = proposed.get_mut(&id) else {
+        return Ok(None);
+    };
+    if project.is_removed() {
+        return Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string());
+    }
+    project.pr_review_defaults = defaults;
+    project.updated_at = chrono::Utc::now();
+    let result = project.clone();
+    let outcome = try_persist_projects(storage, &proposed);
+    crate::config::adopt_published(&mut *projects_w, proposed, outcome)
+        .map_err(|e| e.describe("persist project PR review defaults"))?;
+    Ok(Some(result))
+}
+
 #[tauri::command]
 pub async fn attach_project_to_workspace(
     _gui: GuiMutation,
@@ -1558,6 +1605,7 @@ pub(crate) mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             removed_at: None,
+            pr_review_defaults: Default::default(),
         }
     }
 
@@ -2362,6 +2410,31 @@ pub(crate) mod tests {
         assert!(document.exists());
         assert!(storage.load_config_strict().unwrap().projects.contains_key(&id.to_string()));
         assert!(!storage.paths().pending_project_conversation_deletion_file(id).exists());
+    }
+
+    #[tokio::test]
+    async fn setting_pr_review_defaults_persists_and_keeps_everything_else() {
+        let (storage, _temp) = create_test_storage();
+        let mut existing = make_test_project(Uuid::new_v4());
+        existing.agent_config.api_key = Some("secret-key".to_string());
+        existing.agent_config.model = Some("m".to_string());
+        let id = existing.id;
+        let before = existing.clone();
+        let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::from([(id, existing)]));
+
+        let defaults = crate::domain::PrReviewDefaults { auto_push: true, auto_reply: true };
+        let updated = set_project_pr_review_defaults_committed(&projects, &storage, id, defaults)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.pr_review_defaults, defaults);
+
+        let stored = storage.load_config().unwrap().projects.remove(&id.to_string()).unwrap();
+        assert_eq!(stored.pr_review_defaults, defaults);
+        assert_eq!(stored.name, before.name);
+        assert_eq!(stored.agent_config.api_key, before.agent_config.api_key);
+        assert_eq!(stored.agent_config.model, before.agent_config.model);
+        assert_eq!(stored.agent_config.command, before.agent_config.command);
     }
 
     #[cfg(unix)]

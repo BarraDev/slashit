@@ -81,6 +81,7 @@ mod project_tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             removed_at: None,
+            pr_review_defaults: Default::default(),
         };
         
         assert_eq!(project.name, "Test Project");
@@ -115,6 +116,34 @@ env = {}
         assert_eq!(read.base, project.base);
         let read: Project = serde_json::from_str(&serde_json::to_string(&project).unwrap()).unwrap();
         assert_eq!(read.base, project.base);
+    }
+
+    /// A Project stored before the PR review defaults existed loads with both
+    /// off; saved defaults survive a round trip.
+    #[test]
+    fn pr_review_defaults_load_off_for_legacy_records_and_round_trip() {
+        let legacy = r#"
+id = "7b0d6b0e-6d1c-4b3c-9f6e-0a1b2c3d4e5f"
+name = "legacy"
+agent_type = "claude_code"
+created_at = "2026-01-01T00:00:00Z"
+updated_at = "2026-01-01T00:00:00Z"
+
+[agent_config]
+agent_type = "claude_code"
+command = "claude"
+args = []
+env = {}
+"#;
+        let mut project: Project = toml::from_str(legacy).expect("a legacy project loads");
+        assert!(!project.pr_review_defaults.auto_push);
+        assert!(!project.pr_review_defaults.auto_reply);
+
+        project.pr_review_defaults = crate::domain::PrReviewDefaults { auto_push: false, auto_reply: true };
+        let read: Project = toml::from_str(&toml::to_string(&project).unwrap()).unwrap();
+        assert_eq!(read.pr_review_defaults, project.pr_review_defaults);
+        let read: Project = serde_json::from_str(&serde_json::to_string(&project).unwrap()).unwrap();
+        assert_eq!(read.pr_review_defaults, project.pr_review_defaults);
     }
 
     #[test]

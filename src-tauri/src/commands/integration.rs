@@ -1269,6 +1269,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
                 removed_at: None,
+                pr_review_defaults: Default::default(),
             },
         );
         git(&repo, &["branch", "task-a"]);
