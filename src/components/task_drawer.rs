@@ -39,6 +39,122 @@ enum Tab {
     Changes,
 }
 
+/// One step through the Human Review column.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReviewStep {
+    Previous,
+    Next,
+}
+
+/// What a step through the Human Review column does from the open Task.
+#[derive(Debug, PartialEq, Eq)]
+enum StepOutcome {
+    /// Open this Task in the drawer.
+    Open(Uuid),
+    /// A Task lies that way, but the drawer holds text that moving would lose.
+    Unsaved,
+    /// No Task lies that way: the edge of the column, or the open Task is not in it.
+    Unavailable,
+}
+
+/// The Human Review column in the order the board shows it.
+fn review_column(tasks: &[Task]) -> Vec<Uuid> {
+    let mut column: Vec<&Task> = tasks
+        .iter()
+        .filter(|t| t.status == TaskStatus::HumanReview)
+        .collect();
+    column.sort_by_key(|t| t.position);
+    column.into_iter().map(|t| t.id).collect()
+}
+
+/// The Task one step from `current` in the Human Review column, if any.
+fn review_neighbour(tasks: &[Task], current: Uuid, step: ReviewStep) -> Option<Uuid> {
+    let column = review_column(tasks);
+    let at = column.iter().position(|id| *id == current)?;
+    match step {
+        ReviewStep::Previous => at.checked_sub(1).map(|i| column[i]),
+        ReviewStep::Next => column.get(at + 1).copied(),
+    }
+}
+
+fn review_step(tasks: &[Task], current: Uuid, step: ReviewStep, unsaved: bool) -> StepOutcome {
+    match review_neighbour(tasks, current, step) {
+        None => StepOutcome::Unavailable,
+        Some(_) if unsaved => StepOutcome::Unsaved,
+        Some(id) => StepOutcome::Open(id),
+    }
+}
+
+/// Previous and next Human Review Tasks, reached without closing the drawer.
+/// Shown only while the open Task is in that column.
+#[component]
+fn ReviewStepper(
+    task_id: Uuid,
+    tasks: ReadSignal<Vec<Task>>,
+    on_open: Callback<Uuid>,
+    /// Whether the drawer holds text (an unsent Request Changes draft) that
+    /// moving to another Task would discard.
+    unsaved: RwSignal<bool>,
+) -> impl IntoView {
+    let in_column = Memo::new(move |_| tasks.with(|all| review_column(all).contains(&task_id)));
+    let position = Memo::new(move |_| {
+        tasks.with(|all| {
+            let column = review_column(all);
+            column.iter().position(|id| *id == task_id).map(|at| (at + 1, column.len()))
+        })
+    });
+    let blocked = RwSignal::new(false);
+    let step = move |step: ReviewStep| {
+        let outcome = tasks.with_untracked(|all| review_step(all, task_id, step, unsaved.get_untracked()));
+        match outcome {
+            StepOutcome::Open(id) => {
+                blocked.set(false);
+                on_open.run(id);
+            }
+            StepOutcome::Unsaved => blocked.set(true),
+            StepOutcome::Unavailable => {}
+        }
+    };
+    let can_step = move |step: ReviewStep| tasks.with(|all| review_neighbour(all, task_id, step).is_some());
+
+    view! {
+        <Show when=move || in_column.get()>
+            <div data-testid="task-drawer-review-stepper" class="px-5 pt-3 space-y-2">
+                <div class="flex items-center gap-2 text-xs text-white/60">
+                    <button
+                        data-testid="task-drawer-review-previous"
+                        class="px-2 py-1 rounded-md hover:bg-white/10 disabled:opacity-40 disabled:hover:bg-transparent"
+                        aria-label="Previous Human Review task"
+                        title="Previous Human Review task"
+                        disabled=move || !can_step(ReviewStep::Previous)
+                        on:click=move |_| step(ReviewStep::Previous)
+                    >
+                        "← Previous"
+                    </button>
+                    <span data-testid="task-drawer-review-position" class="flex-1 text-center tabular-nums">
+                        {move || position.get().map(|(at, total)| format!("{at} of {total} in Human Review"))}
+                    </span>
+                    <button
+                        data-testid="task-drawer-review-next"
+                        class="px-2 py-1 rounded-md hover:bg-white/10 disabled:opacity-40 disabled:hover:bg-transparent"
+                        aria-label="Next Human Review task"
+                        title="Next Human Review task"
+                        disabled=move || !can_step(ReviewStep::Next)
+                        on:click=move |_| step(ReviewStep::Next)
+                    >
+                        "Next →"
+                    </button>
+                </div>
+                <Show when=move || blocked.get() && unsaved.get()>
+                    <p data-testid="task-drawer-review-unsaved" role="alert" class="text-xs text-amber-200">
+                        "The Request Changes text here is not sent yet. Send it or clear it to move to another Task; nothing was discarded."
+                    </p>
+                </Show>
+            </div>
+        </Show>
+    }
+}
+
 #[component]
 pub fn TaskDrawer(
     task_id: Uuid,
@@ -416,6 +532,10 @@ pub fn TaskDrawer(
 
     let close = move |_| on_close.run(());
 
+    // Whether the Human Review panel holds an unsent draft; a step to another
+    // Task is blocked while it does.
+    let unsaved = RwSignal::new(false);
+
     // Focus the drawer when it opens, so Escape closes it without a click.
     let drawer_ref = NodeRef::<leptos::html::Aside>::new();
     Effect::new(move |_| {
@@ -451,6 +571,8 @@ pub fn TaskDrawer(
                         <DrawerHeader task=t.clone() badge=badge on_close=on_close />
                     }.into_any(),
                 }}
+
+                <ReviewStepper task_id=task_id tasks=tasks on_open=on_open unsaved=unsaved />
 
                 <div class="flex-1 min-h-0 overflow-y-auto px-5 py-4 space-y-4">
                     // Where the task is and what it is doing.
@@ -613,7 +735,7 @@ pub fn TaskDrawer(
                                 || t.completed_locally()
                         }))
                     }>
-                        <HumanReviewPanel task_id=task_id task=task apply_task=apply_task viewed_tip=viewed_tip on_stale=reload_changes />
+                        <HumanReviewPanel task_id=task_id task=task apply_task=apply_task viewed_tip=viewed_tip on_stale=reload_changes unsaved=unsaved />
                     </Show>
 
                     // A request to open the pull request that was never answered, and
@@ -969,6 +1091,66 @@ mod tests {
         let note = retry_note(&failed_task(None));
         assert!(!note.contains("continues"), "{note}");
         assert!(note.contains("Retry puts the task back in the queue."));
+    }
+
+    fn in_column(status: TaskStatus, position: i32) -> Task {
+        let mut task = failed_task(None);
+        task.status = status;
+        task.position = position;
+        task
+    }
+
+    #[test]
+    fn steps_follow_the_board_order_of_the_human_review_column_only() {
+        // Positions are out of insertion order, and an AI Review Task sits
+        // between two Human Review Tasks; neither may appear in the walk.
+        let third = in_column(TaskStatus::HumanReview, 2);
+        let other = in_column(TaskStatus::AiReview, 1);
+        let first = in_column(TaskStatus::HumanReview, 0);
+        let second = in_column(TaskStatus::HumanReview, 1);
+        let tasks = vec![third.clone(), other, first.clone(), second.clone()];
+
+        assert_eq!(review_column(&tasks), vec![first.id, second.id, third.id]);
+        assert_eq!(review_neighbour(&tasks, second.id, ReviewStep::Previous), Some(first.id));
+        assert_eq!(review_neighbour(&tasks, second.id, ReviewStep::Next), Some(third.id));
+        assert_eq!(review_step(&tasks, second.id, ReviewStep::Next, false), StepOutcome::Open(third.id));
+    }
+
+    #[test]
+    fn the_first_and_last_task_have_no_step_past_the_edge() {
+        let first = in_column(TaskStatus::HumanReview, 0);
+        let last = in_column(TaskStatus::HumanReview, 1);
+        let tasks = vec![first.clone(), last.clone()];
+
+        assert_eq!(review_step(&tasks, first.id, ReviewStep::Previous, false), StepOutcome::Unavailable);
+        assert_eq!(review_step(&tasks, last.id, ReviewStep::Next, false), StepOutcome::Unavailable);
+    }
+
+    #[test]
+    fn a_task_alone_in_its_column_or_no_longer_in_it_has_nowhere_to_step() {
+        let alone = in_column(TaskStatus::HumanReview, 0);
+        let left = in_column(TaskStatus::InProgress, 0);
+        let gone = failed_task(None).id;
+        let tasks = vec![alone.clone(), left.clone()];
+
+        for step in [ReviewStep::Previous, ReviewStep::Next] {
+            assert_eq!(review_step(&tasks, alone.id, step, false), StepOutcome::Unavailable);
+            assert_eq!(review_step(&tasks, left.id, step, false), StepOutcome::Unavailable);
+            assert_eq!(review_step(&tasks, gone, step, false), StepOutcome::Unavailable);
+        }
+        assert_eq!(review_step(&[], gone, ReviewStep::Next, false), StepOutcome::Unavailable);
+    }
+
+    #[test]
+    fn an_unsent_draft_blocks_a_step_that_would_leave_it_but_not_a_step_with_no_target() {
+        let first = in_column(TaskStatus::HumanReview, 0);
+        let second = in_column(TaskStatus::HumanReview, 1);
+        let tasks = vec![first.clone(), second.clone()];
+
+        assert_eq!(review_step(&tasks, first.id, ReviewStep::Next, true), StepOutcome::Unsaved);
+        assert_eq!(review_step(&tasks, second.id, ReviewStep::Previous, true), StepOutcome::Unsaved);
+        // The edge stays unavailable even with a draft: nothing is offered to move to.
+        assert_eq!(review_step(&tasks, first.id, ReviewStep::Previous, true), StepOutcome::Unavailable);
     }
 
     /// A Human Review Task whose run record says `run_mode`, configured as
