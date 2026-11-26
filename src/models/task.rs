@@ -377,6 +377,46 @@ pub struct PrReviewPlan {
     pub analyzed_worktree_oid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analyzed_worktree_fingerprint: Option<String>,
+    /// Mirrors the backend field: a copy whose count is behind the stored
+    /// plan's is refused, so it must round trip unchanged.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub human_edit_revision: u64,
+}
+
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
+}
+
+impl PrReviewItem {
+    /// Sets the Human's instruction; empty or blank text clears it, which
+    /// restores the original proposal. Changing the instruction the backend
+    /// will act on clears the approval, so it must be given again.
+    pub fn set_proposed_change_override(&mut self, text: &str) {
+        let before = self.effective_proposed_change().to_string();
+        self.proposed_change_override = if text.trim().is_empty() {
+            None
+        } else {
+            Some(text.to_string())
+        };
+        if self.effective_proposed_change() != before {
+            self.approved = false;
+        }
+    }
+
+    /// Whether a fix for this item was already made, so its instruction is
+    /// no longer editable (the backend refuses the edit as well).
+    pub fn instruction_is_locked(&self) -> bool {
+        self.fix_done || self.fix_commit.is_some() || self.fix_effect.is_some()
+    }
+
+    /// The instruction the backend will act on: the override when it has text,
+    /// otherwise the Worker's original proposal.
+    pub fn effective_proposed_change(&self) -> &str {
+        match self.proposed_change_override.as_deref() {
+            Some(text) if !text.trim().is_empty() => text,
+            _ => &self.proposed_change,
+        }
+    }
 }
 
 /// Mirrors the backend type of the same name.
@@ -524,6 +564,10 @@ pub struct PrReviewItem {
     pub decision: PrReviewDecisionKind,
     pub reasoning: String,
     pub proposed_change: String,
+    /// Mirrors the backend field: the Human's replacement for
+    /// `proposed_change`, which stays the Worker's original proposal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_change_override: Option<String>,
     #[serde(default)]
     pub approved: bool,
     #[serde(default)]

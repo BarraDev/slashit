@@ -1526,6 +1526,16 @@ pub struct PrReviewPlan {
     /// When the analysis that recorded `analyzed_head_oid` ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analyzed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Counts the saved writes that changed a Human override. A copy of the
+    /// plan whose count differs from the stored one was loaded before such a
+    /// write and is refused, so it cannot silently drop or replace the
+    /// override another copy saved.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub human_edit_revision: u64,
+}
+
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
 }
 
 /// The fingerprint ([`slashit_review_content::fingerprint`]) of the text of
@@ -1537,6 +1547,17 @@ pub struct PrReviewPlan {
 pub struct FixedContent {
     pub comment_id: u64,
     pub fingerprint: String,
+}
+
+impl PrReviewItem {
+    /// The one fix instruction every consumer uses: the Human's override when
+    /// it has text, otherwise the analysis's original proposal.
+    pub fn effective_proposed_change(&self) -> &str {
+        match self.proposed_change_override.as_deref() {
+            Some(text) if !text.trim().is_empty() => text,
+            _ => &self.proposed_change,
+        }
+    }
 }
 
 impl PrReviewPlan {
@@ -1759,6 +1780,13 @@ pub struct PrReviewItem {
     pub decision: PrReviewDecision,
     pub reasoning: String,
     pub proposed_change: String,
+    /// The Human's replacement for `proposed_change`. The analysis never
+    /// writes it: `proposed_change` stays the Worker's original proposal and
+    /// this sits beside it, so clearing it restores the original. Only a
+    /// Human operation sets or clears it; see
+    /// [`PrReviewItem::effective_proposed_change`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_change_override: Option<String>,
     #[serde(default)]
     pub approved: bool,
     /// User-provided note for a Question item, fed to the agent on the next

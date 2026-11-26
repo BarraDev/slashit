@@ -1115,7 +1115,13 @@ pub async fn analyze_pr_comments(
     let generated_at = chrono::Utc::now();
     if comments.is_empty() {
         // Don't cache empty plans — reviewers can still leave comments later
-        // and the user shouldn't have to remember to hit Re-analyze.
+        // and the user shouldn't have to remember to hit Re-analyze. A pending
+        // override has no comment left to follow, so it refuses as it would
+        // beside other comments.
+        if let Some(prev) = prior_plan.as_ref() {
+            refuse_unassociable_overrides(&[], prev, &comments)?;
+        }
+        let human_edit_revision = prior_plan.as_ref().map_or(0, |p| p.human_edit_revision);
         return Ok(PrReviewPlan {
             generated_at,
             pr_url,
@@ -1129,6 +1135,7 @@ pub async fn analyze_pr_comments(
             analyzed_worktree_oid: Some(facts.tip.clone()),
             analyzed_worktree_fingerprint: Some(facts.fingerprint.clone()),
             analyzed_at: Some(generated_at),
+            human_edit_revision,
         });
     }
 
@@ -1161,6 +1168,9 @@ pub async fn analyze_pr_comments(
     // already on the PR, so the freshly-triaged item should reflect that.
     // Skipped for a comment GitHub reports as edited after that apply: the
     // carried state describes the *old* text, not the one just re-triaged.
+    if let Some(prev) = prior_plan.as_ref() {
+        refuse_unassociable_overrides(&items, prev, &comments)?;
+    }
     let fixed_content = match prior_plan.as_ref() {
         Some(prev) => carry_forward_reanalysis_lifecycle(&mut items, prev, &comments),
         None => Vec::new(),
@@ -1183,6 +1193,7 @@ pub async fn analyze_pr_comments(
         return Err(analysis_not_stable(&facts, &after));
     }
 
+    let human_edit_revision = prior_plan.as_ref().map_or(0, |p| p.human_edit_revision);
     let mut plan = PrReviewPlan {
         generated_at,
         pr_url,
@@ -1196,6 +1207,7 @@ pub async fn analyze_pr_comments(
         analyzed_worktree_oid: Some(facts.tip),
         analyzed_worktree_fingerprint: Some(facts.fingerprint),
         analyzed_at: Some(generated_at),
+        human_edit_revision,
     };
     // A comment that was held or confirmed keeps that state in the new plan
     // even though the carry above only follows a comment that survived.
@@ -1326,6 +1338,64 @@ fn same_resource_kind(prior: &PrReviewPlan, comments: &[PrReviewComment], cid: u
     }
 }
 
+/// A Human override is carried only onto the one fresh item that names the
+/// same comment. When that association is not certain (no comment number, a
+/// repeated number, a changed comment kind, a removed comment, or no fresh
+/// item for it) the override cannot follow, and the analysis must not
+/// silently discard it: re-analysis is refused with the reason. An override
+/// on a fix already delivered no longer instructs anything (its commit records
+/// what was done, and it cannot be cleared), so it never blocks re-analysis.
+fn refuse_unassociable_overrides(
+    fresh_items: &[PrReviewItem],
+    prior: &PrReviewPlan,
+    comments: &[PrReviewComment],
+) -> Result<(), String> {
+    for prev in delivery_view(prior)
+        .items
+        .iter()
+        .filter(|i| i.proposed_change_override.is_some() && !fix_delivered(i))
+    {
+        let reason = match prev.comment_id {
+            None => Some("it has no comment number"),
+            Some(cid) => {
+                let prior_once = prior
+                    .items
+                    .iter()
+                    .filter(|i| i.comment_id == Some(cid))
+                    .count()
+                    == 1;
+                let fresh_comments = comments.iter().filter(|c| c.id == Some(cid)).count();
+                let fresh_items = fresh_items
+                    .iter()
+                    .filter(|i| i.comment_id == Some(cid))
+                    .count();
+                if !prior_once {
+                    Some("its comment number is repeated in the stored plan")
+                } else if fresh_comments == 0 {
+                    Some("its comment was removed")
+                } else if fresh_comments > 1 {
+                    Some("its comment number is repeated in the fetched comments")
+                } else if !same_resource_kind(prior, comments, cid) {
+                    Some("its comment changed kind")
+                } else if fresh_items != 1 {
+                    Some("the analysis did not produce exactly one item for its comment")
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(reason) = reason {
+            return Err(format!(
+                "Re-analysis refused: a Human instruction override on \"{}\" cannot be \
+                 matched to exactly one new review item ({reason}). To discard it, clear \
+                 the instruction, choose Save instructions, then re-analyze.",
+                prev.summary
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn carry_forward_reanalysis_lifecycle(
     items: &mut [PrReviewItem],
     prior: &PrReviewPlan,
@@ -1402,6 +1472,15 @@ fn carry_forward_reanalysis_lifecycle(
         };
         if !same_resource_kind(prior, comments, cid) {
             continue;
+        }
+
+        // The Human's instruction is not the analysis's to discard. It stays
+        // beside the fresh proposal, and the item needs a new Human decision,
+        // so any approval is cleared: the Human approved a plan the fresh
+        // analysis may have changed around the override.
+        if prev_item.proposed_change_override.is_some() {
+            item.proposed_change_override = prev_item.proposed_change_override.clone();
+            item.approved = false;
         }
 
         // An undelivered fix is a fact about the checkout, not about the
@@ -1505,12 +1584,61 @@ pub async fn discuss_pr_review_questions(
     // Discuss saves the whole plan it was sent. A copy from before another
     // analysis, a Sync or an Apply would overwrite what that run recorded, so
     // it is refused before the agent runs.
+    let mut plan = plan;
     if let Some(stored) = task.pr_review_plan.as_ref() {
         refuse_stale_copy_for_discuss(stored, &plan)?;
+        stamp_human_edit_revision(stored, &mut plan);
     }
     let merged = discuss_pr_review_questions_inner(task, working_dir, plan, cancel_rx).await?;
     save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, merged.clone()).await?;
     Ok(merged)
+}
+
+/// Saves the Human's fix-instruction overrides, and nothing else, without
+/// running an agent or reading the PR. It does not check the PR head or the
+/// checkout: nothing is executed, and Apply checks both before any fix runs.
+/// This is how a Human clears an override that blocks re-analysis.
+#[tauri::command]
+pub async fn save_pr_review_instructions(
+    _gui: GuiMutation,
+    state: tauri::State<'_, crate::AppState>,
+    task_id: String,
+    plan: PrReviewPlan,
+) -> Result<PrReviewPlan, String> {
+    let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    // Held across the read and the write, so no analysis, Apply or Sync
+    // saves in between.
+    let (_lease, _) = begin_pr_helper(&state, task_uuid, PrHelperPurpose::Inspection).await?;
+    let task = {
+        let tasks = state.task.tasks.read().await;
+        tasks.get(&task_uuid).cloned().ok_or("Task not found")?
+    };
+    crate::commands::project::refuse_if_project_removed(&state.project.projects, task.project_id)
+        .await?;
+    let stored = task
+        .pr_review_plan
+        .as_ref()
+        .ok_or("This Task has no stored review plan. Nothing was changed.")?;
+    let saved = with_saved_instructions(stored, &plan)?;
+    save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, saved.clone()).await?;
+    Ok(saved)
+}
+
+/// The stored plan with only the sent copy's overrides taken from it. The
+/// copy must be the stored analysis at the stored revision, and a delivered
+/// fix's override cannot change ([`refuse_stale_analysis`]). A changed
+/// override clears that item's approval, which was given for the old one.
+fn with_saved_instructions(stored: &PrReviewPlan, sent: &PrReviewPlan) -> Result<PrReviewPlan, String> {
+    refuse_stale_analysis(stored, sent)?;
+    let mut saved = stored.clone();
+    for (item, sent_item) in saved.items.iter_mut().zip(&sent.items) {
+        if item.proposed_change_override != sent_item.proposed_change_override {
+            item.proposed_change_override = sent_item.proposed_change_override.clone();
+            item.approved = false;
+        }
+    }
+    stamp_human_edit_revision(stored, &mut saved);
+    Ok(saved)
 }
 
 /// Core logic of `discuss_pr_review_questions` extracted for testability. Owns
@@ -1716,6 +1844,9 @@ pub async fn address_pr_review(
     // frontend hasn't backfilled yet) need fix_done / reply_posted derived from
     // the prior last_apply so the apply loop respects what's already on disk.
     let mut plan = plan;
+    if let Some(stored) = task.pr_review_plan.as_ref() {
+        stamp_human_edit_revision(stored, &mut plan);
+    }
     plan.backfill_lifecycle_from_last_apply();
     // A dry run is the same flag that makes every provider call below
     // read-only and skips the commit, push and replies; anything else can edit.
@@ -1790,8 +1921,10 @@ fn review_content(plan: &PrReviewPlan) -> PrReviewPlan {
     let mut content = plan.clone();
     content.last_apply = None;
     content.fixed_content.clear();
+    content.human_edit_revision = 0;
     for item in &mut content.items {
         item.decision = PrReviewDecision::Fix;
+        item.proposed_change_override = None;
         item.approved = false;
         item.user_note.clear();
         item.fix_done = false;
@@ -1894,7 +2027,56 @@ fn refuse_stale_analysis(stored: &PrReviewPlan, sent: &PrReviewPlan) -> Result<(
                 .to_string(),
         );
     }
+    refuse_stale_human_edits(stored, sent)
+}
+
+/// The Human's overrides are exempt from the content check above, so they
+/// are guarded here instead. A copy loaded before another write changed an
+/// override (its revision is behind) would silently drop or replace that
+/// edit. An override on a fix already delivered is refused too: the fix was
+/// made from the instruction it carries, so changing it would misreport what
+/// was delivered or re-run it.
+fn refuse_stale_human_edits(stored: &PrReviewPlan, sent: &PrReviewPlan) -> Result<(), String> {
+    if sent.human_edit_revision != stored.human_edit_revision {
+        return Err(
+            "Another save changed this review's fix instructions after this copy was loaded. \
+             Reload the review, then try again. Nothing was changed."
+                .to_string(),
+        );
+    }
+    // Read through the lifecycle backfill, as Apply does, so a fix recorded
+    // only in `last_apply` counts as delivered.
+    let delivered_edit = delivery_view(stored).items.iter().zip(&sent.items).any(|(stored_item, sent_item)| {
+        stored_item.proposed_change_override != sent_item.proposed_change_override
+            && fix_delivered(stored_item)
+    });
+    if delivered_edit {
+        return Err(
+            "A fix for this item was already made, so its fix instruction can no longer be \
+             changed. Nothing was changed."
+                .to_string(),
+        );
+    }
     Ok(())
+}
+
+/// Whether the item's fix was already made: done, committed or recorded with
+/// its effect.
+fn fix_delivered(item: &PrReviewItem) -> bool {
+    item.fix_done || item.fix_commit.is_some() || item.fix_effect.is_some()
+}
+
+/// Records, on a copy that passed [`refuse_stale_analysis`], that it changes
+/// the stored overrides: the next copy must carry the new revision.
+fn stamp_human_edit_revision(stored: &PrReviewPlan, sent: &mut PrReviewPlan) {
+    let changed = stored
+        .items
+        .iter()
+        .zip(&sent.items)
+        .any(|(a, b)| a.proposed_change_override != b.proposed_change_override);
+    if changed {
+        sent.human_edit_revision = stored.human_edit_revision + 1;
+    }
 }
 
 /// The whole-copy check Discuss needs, since Discuss saves the copy it is sent:
@@ -5188,6 +5370,7 @@ fn parse_review_items(output: &str, batch: &[PrReviewComment]) -> Vec<PrReviewIt
             reply_comment_id: None,
             fix_commit: None,
             fix_effect: None,
+            proposed_change_override: None,
         })
     }).collect()
 }
@@ -5222,16 +5405,23 @@ fn build_discuss_prompt(
                 &[("source", "your earlier triage reasoning")],
                 &item.reasoning,
             );
+            let instruction = frame_untrusted(
+                nonce,
+                &[("source", "the current fix instruction")],
+                item.effective_proposed_change(),
+            );
             format!(
                 "### Item #{i} (comment_id={id}, location: {loc})\n\
              Original reviewer comment:\n{original}\n\n\
              Your prior reasoning:\n{prior}\n\n\
+             Current fix instruction:\n{instruction}\n\n\
              User's note for you (from the SlashIt user, not from GitHub): {note}",
                 i = i,
                 id = id_str,
                 loc = loc,
                 original = original,
                 prior = prior,
+                instruction = instruction,
                 note = item.user_note,
             )
         })
@@ -5303,7 +5493,7 @@ fn build_review_fix_prompt(
         }).unwrap_or_else(|| "PR-level".to_string());
         let body = format!(
             "Summary: {summary}\nReasoning: {reasoning}\nProposed change: {change}",
-            summary = item.summary, reasoning = item.reasoning, change = item.proposed_change,
+            summary = item.summary, reasoning = item.reasoning, change = item.effective_proposed_change(),
         );
         format!(
             "Item #{i}:\n{framed}",
@@ -10460,6 +10650,7 @@ mod tests {
             analyzed_worktree_oid: None,
             analyzed_worktree_fingerprint: None,
             analyzed_at: None,
+            human_edit_revision: 0,
             generated_at: chrono::Utc::now(),
             pr_url: "https://github.com/org/repo/pull/1".to_string(),
             review_decision: None,
@@ -11525,8 +11716,8 @@ mod tests {
         let prompt = build_discuss_prompt(&task, "u", &[c], &[&item], nonce);
 
         let data = &prompt[prompt.find("## Items to re-evaluate").unwrap()..];
-        assert_eq!(data.matches(&format!("<{tag} ")).count(), 2, "{prompt}");
-        assert_eq!(data.matches(&format!("</{tag}>")).count(), 2, "{prompt}");
+        assert_eq!(data.matches(&format!("<{tag} ")).count(), 3, "{prompt}");
+        assert_eq!(data.matches(&format!("</{tag}>")).count(), 3, "{prompt}");
         let last_close = prompt.rfind(&format!("</{tag}>")).unwrap();
         let note_at = prompt.find("User's note for you").unwrap();
         assert!(
@@ -11849,6 +12040,7 @@ mod tests {
             reply_comment_id: None,
             fix_commit: None,
             fix_effect: None,
+            proposed_change_override: None,
         }
     }
 
@@ -11907,6 +12099,7 @@ mod tests {
             analyzed_worktree_oid: None,
             analyzed_worktree_fingerprint: None,
             analyzed_at: None,
+            human_edit_revision: 0,
             generated_at: at("2024-05-31T00:00:00Z"),
             pr_url: String::new(),
             review_decision: None,
@@ -11954,6 +12147,212 @@ mod tests {
         };
         next.backfill_lifecycle_from_last_apply();
         next
+    }
+
+    #[test]
+    fn apply_dry_run_and_discuss_prompts_carry_the_same_effective_instruction() {
+        let project_id = Uuid::new_v4();
+        let task = create_test_task_full("t", project_id, TaskStatus::HumanReview, 0);
+        let mut item = fresh_item(1);
+        item.proposed_change = "ORIGINAL TEXT".to_string();
+        item.decision = PrReviewDecision::Question;
+        item.user_note = "why".to_string();
+        item.proposed_change_override = Some("OVERRIDE TEXT".to_string());
+        let apply = build_review_fix_prompt(&task, "https://example.test/pr/1", &[], &[&item], false, "n1");
+        let dry = build_review_fix_prompt(&task, "https://example.test/pr/1", &[], &[&item], true, "n1");
+        let discuss = build_discuss_prompt(&task, "https://example.test/pr/1", &[], &[&item], "n1");
+        for prompt in [&apply, &dry, &discuss] {
+            assert!(prompt.contains("OVERRIDE TEXT"), "{prompt}");
+            assert!(!prompt.contains(&item.proposed_change), "{prompt}");
+        }
+        item.proposed_change_override = None;
+        assert_eq!(item.effective_proposed_change(), item.proposed_change);
+    }
+
+    #[test]
+    fn reanalysis_keeps_a_human_override_and_clears_its_approval() {
+        let text = comment_text(42, "same", Some("2024-05-30T00:00:00Z"));
+        let mut prev = fresh_item(42);
+        prev.proposed_change_override = Some("mine".to_string());
+        prev.approved = true;
+        let prior = prior_plan(vec![prev], vec![text.clone()], None, vec![]);
+        let mut items = vec![fresh_item(42)];
+        items[0].approved = true;
+        carry_forward_reanalysis_lifecycle(&mut items, &prior, &[text]);
+        assert_eq!(items[0].proposed_change_override.as_deref(), Some("mine"));
+        assert!(!items[0].approved, "needs a new Human decision");
+    }
+
+    #[test]
+    fn reanalysis_refuses_an_override_it_cannot_match_to_one_item() {
+        let text = comment_text(42, "same", Some("2024-05-30T00:00:00Z"));
+        let mut with = fresh_item(42);
+        with.proposed_change_override = Some("mine".to_string());
+        let prior = prior_plan(vec![with.clone()], vec![text.clone()], None, vec![]);
+        // Matched exactly once: allowed.
+        assert!(refuse_unassociable_overrides(&[fresh_item(42)], &prior, &[text.clone()]).is_ok());
+        // Removed comment.
+        let err = refuse_unassociable_overrides(&[], &prior, &[]).unwrap_err();
+        assert!(
+            err.contains("removed") && err.contains("Re-analysis refused"),
+            "{err}"
+        );
+        // Duplicate comment ids in the fetched comments.
+        assert!(refuse_unassociable_overrides(
+            &[fresh_item(42)],
+            &prior,
+            &[text.clone(), text.clone()]
+        )
+        .unwrap_err()
+        .contains("repeated"));
+        // No fresh item for the comment.
+        assert!(refuse_unassociable_overrides(&[fresh_item(7)], &prior, &[text.clone()]).is_err());
+        // Changed comment kind.
+        let mut other_kind = text.clone();
+        other_kind.kind = if text.kind == PrCommentKind::Review {
+            PrCommentKind::Conversation
+        } else {
+            PrCommentKind::Review
+        };
+        assert!(
+            refuse_unassociable_overrides(&[fresh_item(42)], &prior, &[other_kind])
+                .unwrap_err()
+                .contains("kind")
+        );
+        // Missing comment id.
+        let mut anon = with.clone();
+        anon.comment_id = None;
+        let prior = prior_plan(vec![anon], vec![text.clone()], None, vec![]);
+        assert!(
+            refuse_unassociable_overrides(&[fresh_item(42)], &prior, &[text])
+                .unwrap_err()
+                .contains("no comment number")
+        );
+    }
+
+    /// A delivered fix's override cannot be cleared, so it must not block
+    /// re-analysis; a pending one still does. Delivery is read through the
+    /// backfill, so a fix recorded only in `last_apply` counts.
+    #[test]
+    fn a_delivered_override_never_blocks_reanalysis() {
+        let text = comment_text(42, "same", Some("2024-05-30T00:00:00Z"));
+        let mut item = fresh_item(42);
+        item.proposed_change_override = Some("mine".to_string());
+        item.fix_done = true;
+        let delivered = prior_plan(vec![item.clone()], vec![text.clone()], Some("2024-06-01T00:00:00Z"), vec![]);
+        let mut backfilled_only = delivered.clone();
+        backfilled_only.items[0].fix_done = false;
+        assert!(delivery_view(&backfilled_only).items[0].fix_done, "the fixture must backfill");
+        for prior in [&delivered, &backfilled_only] {
+            assert!(refuse_unassociable_overrides(&[], prior, &[]).is_ok());
+            assert!(refuse_unassociable_overrides(&[fresh_item(7)], prior, &[text.clone()]).is_ok());
+        }
+        item.fix_done = false;
+        let pending = prior_plan(vec![item], vec![text.clone()], None, vec![]);
+        assert!(refuse_unassociable_overrides(&[], &pending, &[]).is_err());
+    }
+
+    /// A fix recorded only in `last_apply` is delivered: its override is
+    /// frozen, while a pending item's override stays editable.
+    #[test]
+    fn a_backfilled_delivered_fix_cannot_be_overridden() {
+        let text = comment_text(42, "same", Some("2024-05-30T00:00:00Z"));
+        let mut item = fresh_item(42);
+        item.fix_done = true;
+        let mut stored = prior_plan(vec![item], vec![text.clone()], Some("2024-06-01T00:00:00Z"), vec![]);
+        stored.items[0].fix_done = false;
+        let mut sent = stored.clone();
+        sent.items[0].proposed_change_override = Some("again".to_string());
+        let err = refuse_stale_human_edits(&stored, &sent).unwrap_err();
+        assert!(err.contains("already made"), "{err}");
+
+        let pending = prior_plan(vec![fresh_item(42)], vec![text], None, vec![]);
+        let mut sent = pending.clone();
+        sent.items[0].proposed_change_override = Some("mine".to_string());
+        assert!(refuse_stale_human_edits(&pending, &sent).is_ok());
+    }
+
+    fn overriding(plan: &PrReviewPlan, text: Option<&str>) -> PrReviewPlan {
+        let mut sent = plan.clone();
+        sent.items[0].proposed_change_override = text.map(str::to_string);
+        sent
+    }
+
+    /// The recovery a refused re-analysis names: the Human clears the
+    /// override, saves it on its own, and the next analysis runs. The refusal
+    /// occurs both beside other comments and when no comment is left.
+    #[test]
+    fn a_cleared_and_saved_override_lets_reanalysis_run_again() {
+        let text = comment_text(42, "same", Some("2024-05-30T00:00:00Z"));
+        let other = comment_text(7, "other", Some("2024-05-30T00:00:00Z"));
+        let base = prior_plan(vec![fresh_item(42)], vec![text], None, vec![]);
+        let stored = with_saved_instructions(&base, &overriding(&base, Some("mine"))).unwrap();
+        assert_eq!(stored.human_edit_revision, 1);
+        assert_eq!(stored.items[0].proposed_change_override.as_deref(), Some("mine"));
+
+        for (items, comments) in [(vec![fresh_item(7)], vec![other.clone()]), (vec![], vec![])] {
+            let err = refuse_unassociable_overrides(&items, &stored, &comments).unwrap_err();
+            assert!(err.contains("Save instructions"), "names the action that recovers: {err}");
+        }
+
+        let cleared = with_saved_instructions(&stored, &overriding(&stored, None)).unwrap();
+        assert_eq!(cleared.human_edit_revision, 2);
+        assert_eq!(cleared.items[0].proposed_change_override, None);
+        assert_eq!(review_content(&cleared), review_content(&stored), "the analysis is untouched");
+        assert!(refuse_unassociable_overrides(&[fresh_item(7)], &cleared, &[other]).is_ok());
+        assert!(refuse_unassociable_overrides(&[], &cleared, &[]).is_ok());
+    }
+
+    /// Only the overrides are saved: drafts, delivery records and the original
+    /// proposal come from the stored plan, and a changed override clears its
+    /// item's approval while an unchanged item keeps its own.
+    #[test]
+    fn saving_instructions_takes_only_the_overrides() {
+        let stored = prior_plan(
+            vec![fresh_item(1), fresh_item(2)],
+            vec![comment_text(1, "a", None), comment_text(2, "b", None)],
+            None,
+            vec![],
+        );
+        let mut sent = overriding(&stored, Some("mine"));
+        sent.items[1].user_note = "draft".to_string();
+        sent.items[1].approved = false;
+        let saved = with_saved_instructions(&stored, &sent).unwrap();
+        assert!(!saved.items[0].approved, "the approval was for the old instruction");
+        assert!(saved.items[1].approved && saved.items[1].user_note.is_empty());
+
+        let mut tampered = sent.clone();
+        tampered.items[0].proposed_change = "rewrite the module".to_string();
+        assert!(with_saved_instructions(&stored, &tampered).is_err());
+        let mut stale_record = sent;
+        stale_record.items[1].fix_done = true;
+        assert!(!with_saved_instructions(&stored, &stale_record).unwrap().items[1].fix_done);
+    }
+
+    #[test]
+    fn a_stale_copy_cannot_save_or_clear_an_override() {
+        let base = prior_plan(vec![fresh_item(42)], vec![comment_text(42, "a", None)], None, vec![]);
+        let stored = with_saved_instructions(&base, &overriding(&base, Some("mine"))).unwrap();
+        for text in [None, Some("other")] {
+            let err = with_saved_instructions(&stored, &overriding(&base, text)).unwrap_err();
+            assert!(err.contains("Reload the review"), "{err}");
+        }
+    }
+
+    /// A delivered fix's override is frozen, including a fix recorded only in
+    /// `last_apply`.
+    #[test]
+    fn a_delivered_fix_instruction_cannot_be_saved() {
+        let mut item = fresh_item(42);
+        item.fix_done = true;
+        let text = comment_text(42, "a", None);
+        let delivered = prior_plan(vec![item], vec![text], Some("2024-06-01T00:00:00Z"), vec![]);
+        let mut backfilled_only = delivered.clone();
+        backfilled_only.items[0].fix_done = false;
+        for stored in [&delivered, &backfilled_only] {
+            let err = with_saved_instructions(stored, &overriding(stored, Some("again"))).unwrap_err();
+            assert!(err.contains("already made"), "{err}");
+        }
     }
 
     #[test]
@@ -15473,6 +15872,7 @@ mod tests {
                     analyzed_worktree_oid: None,
                     analyzed_worktree_fingerprint: None,
                     analyzed_at: None,
+                    human_edit_revision: 0,
                 };
                 let app = tauri::test::mock_app();
                 app.manage(state);
@@ -15502,6 +15902,62 @@ mod tests {
                     serde_json::to_value(&before).unwrap(),
                     "a refused discussion changes no Task state"
                 );
+            }
+
+            /// Saving instructions works when the PR head moved after the
+            /// analysis: it reads no head and runs no agent, so the fake `gh`
+            /// records no call. The save persists; a copy from before it is
+            /// refused and changes nothing.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn saving_instructions_on_a_moved_head_makes_no_github_call() {
+                use tauri::Manager;
+
+                let _guard = PATH_LOCK.lock().await;
+                let moved = format!(r#"{{"headRefOid":"{}"}}"#, "b".repeat(40));
+                let mock = MockGh::setup("unused", &moved);
+                let (state, _tmp) = build_test_state().await;
+                let task_id =
+                    seed_task(&state, "/tmp", Some("task-save-instructions"), TaskStatus::HumanReview)
+                        .await;
+                let (_, mut plan) = crate::test_helpers::create_test_pr_review_setup();
+                plan.analyzed_head_oid = Some("a".repeat(40));
+                plan.analyzed_at = Some(chrono::Utc::now());
+                state.task.tasks.write().await.get_mut(&task_id).unwrap().pr_review_plan =
+                    Some(plan.clone());
+                let app = tauri::test::mock_app();
+                app.manage(state);
+                let stored_plan = || async {
+                    app.state::<crate::AppState>().task.tasks.read().await[&task_id]
+                        .pr_review_plan
+                        .clone()
+                        .unwrap()
+                };
+
+                let mut sent = plan.clone();
+                sent.items[0].proposed_change_override = Some("mine".to_string());
+                let saved = save_pr_review_instructions(
+                    GuiMutation::untracked(),
+                    app.state(),
+                    task_id.to_string(),
+                    sent,
+                )
+                .await
+                .expect("the override is saved without any agent or head read");
+                assert_eq!(saved.human_edit_revision, 1);
+                assert_eq!(stored_plan().await, saved, "the save is the stored plan");
+
+                let err = save_pr_review_instructions(
+                    GuiMutation::untracked(),
+                    app.state(),
+                    task_id.to_string(),
+                    plan,
+                )
+                .await
+                .expect_err("a copy from before the save cannot clear it");
+                assert!(err.contains("Reload the review"), "{err}");
+                assert_eq!(stored_plan().await, saved, "a refused save changes nothing");
+                assert_eq!(mock.read_log(), "", "no GitHub call was made");
             }
 
             /// Address needs the Editing helper lease, which a removed Project's Task
@@ -24748,6 +25204,7 @@ mod tests {
                     analyzed_worktree_oid: None,
                     analyzed_worktree_fingerprint: None,
                     analyzed_at: None,
+                    human_edit_revision: 0,
                     generated_at: chrono::Utc::now(),
                     pr_url: "https://github.com/testorg/testrepo/pull/321".to_string(),
                     review_decision: None,
@@ -24781,6 +25238,7 @@ mod tests {
                         reply_comment_id: None,
                         fix_commit: None,
                         fix_effect: None,
+                        proposed_change_override: None,
                     }],
                     raw_plan: "durable-marker-before-apply".to_string(),
                     last_apply: None,
@@ -25302,6 +25760,7 @@ mod tests {
                     reply_comment_id: None,
                     fix_commit: None,
                     fix_effect: None,
+                    proposed_change_override: None,
                 }
             }
 
@@ -25342,6 +25801,7 @@ mod tests {
                     analyzed_worktree_oid: None,
                     analyzed_worktree_fingerprint: None,
                     analyzed_at: None,
+                    human_edit_revision: 0,
                     generated_at: chrono::Utc::now(),
                     pr_url: pr_url.to_string(),
                     review_decision: None,
@@ -25593,6 +26053,7 @@ mod tests {
                     analyzed_worktree_oid: None,
                     analyzed_worktree_fingerprint: None,
                     analyzed_at: None,
+                    human_edit_revision: 0,
                     generated_at: chrono::Utc::now(),
                     pr_url: pr_url.to_string(),
                     review_decision: None,
@@ -29814,6 +30275,7 @@ mod tests {
                     fix_uncommitted: false,
                     fix_commit: None,
                     fix_effect: None,
+                    proposed_change_override: None,
                     reply_posted: false,
                     reply_uncertain: false,
                     reply_comment_id: None,
@@ -34807,6 +35269,7 @@ mod review_plan_provenance {
             analyzed_worktree_oid: head.map(str::to_string),
             analyzed_worktree_fingerprint: None,
             analyzed_at: head.map(|_| chrono::Utc::now()),
+            human_edit_revision: 0,
         }
     }
 
@@ -35163,6 +35626,7 @@ mod review_plan_provenance {
             fix_uncommitted: false,
             fix_commit: None,
             fix_effect: None,
+            proposed_change_override: None,
             reply_posted: false,
             reply_uncertain: false,
             last_agent_summary: None,
@@ -35186,6 +35650,7 @@ mod review_plan_provenance {
             analyzed_worktree_oid: Some(ANALYZED.to_string()),
             analyzed_worktree_fingerprint: None,
             analyzed_at: Some(chrono::Utc::now()),
+            human_edit_revision: 0,
         }
     }
 
@@ -36261,6 +36726,101 @@ mod review_plan_provenance {
         .expect_err("an unidentified approval is refused");
         assert!(err.contains("Nothing was changed"), "{err}");
         assert_eq!(gh.launches("gh"), 0, "no head read, no reply, no push");
+        assert_eq!(gh.launches("claude"), 0, "no fix agent runs");
+    }
+
+    fn with_override(plan: &PrReviewPlan, text: &str) -> PrReviewPlan {
+        let mut sent = plan.clone();
+        sent.items[0].proposed_change_override = Some(text.to_string());
+        sent
+    }
+
+    /// The override is exempt from the content check; the original is not.
+    #[test]
+    fn an_override_passes_the_content_check_but_the_original_stays_protected() {
+        let (task, stored) = analyzed_plan_with_items();
+        let stored_ref = task.pr_review_plan.as_ref();
+        let sent = with_override(&stored, "do it my way");
+        assert!(stored_plan_for_apply(stored_ref, &sent).is_ok());
+        assert!(refuse_stale_copy_for_discuss(&stored, &sent).is_ok());
+        assert_eq!(sent.items[0].proposed_change, stored.items[0].proposed_change);
+
+        let mut tampered = with_override(&stored, "do it my way");
+        tampered.items[0].proposed_change = "rewrite the whole module".to_string();
+        assert!(stored_plan_for_apply(stored_ref, &tampered).is_err());
+        let mut stale = with_override(&stored, "x");
+        stale.analyzed_head_oid = Some("other".to_string());
+        assert!(stored_plan_for_apply(stored_ref, &stale).is_err());
+    }
+
+
+    #[test]
+    fn a_stale_copy_cannot_overwrite_a_saved_override() {
+        let (task, mut stored) = analyzed_plan_with_items();
+        // Copy A sets an override and saves it.
+        let mut a = with_override(&stored, "from A");
+        stamp_human_edit_revision(&stored, &mut a);
+        assert_eq!(a.human_edit_revision, 1);
+        stored = a.clone();
+        // Copy B was loaded before and is refused, as is a plain stale copy.
+        let b = with_override(&task.pr_review_plan.clone().unwrap(), "from B");
+        let err = stored_plan_for_apply(Some(&stored), &b).unwrap_err();
+        assert!(err.contains("Reload the review"), "{err}");
+        let old = task.pr_review_plan.clone().unwrap();
+        assert!(refuse_stale_copy_for_discuss(&stored, &old).is_err());
+        // A copy that carries the revision is accepted, and clearing bumps it again.
+        let mut cleared = a.clone();
+        cleared.items[0].proposed_change_override = None;
+        assert!(refuse_stale_copy_for_discuss(&stored, &cleared).is_ok());
+        stamp_human_edit_revision(&stored, &mut cleared);
+        assert_eq!(cleared.human_edit_revision, 2);
+        // Unchanged overrides keep the revision.
+        let mut same = a.clone();
+        stamp_human_edit_revision(&stored, &mut same);
+        assert_eq!(same.human_edit_revision, 1);
+    }
+
+    #[test]
+    fn a_delivered_fix_cannot_be_overridden() {
+        let (_, mut stored) = analyzed_plan_with_items();
+        stored.items[0].fix_done = true;
+        let sent = with_override(&stored, "again");
+        let err = stored_plan_for_apply(Some(&stored), &sent).unwrap_err();
+        assert!(err.contains("already made"), "{err}");
+        assert!(refuse_stale_copy_for_discuss(&stored, &sent).is_err());
+        assert!(stored_plan_for_apply(Some(&stored), &stored).is_ok());
+    }
+
+    #[test]
+    fn a_stale_delivery_record_is_refused_with_an_override_present() {
+        let (_, stored) = analyzed_plan_with_items();
+        let mut sent = with_override(&stored, "mine");
+        sent.items[0].reply_posted = !stored.items[0].reply_posted;
+        let err = stored_plan_for_apply(Some(&stored), &sent).unwrap_err();
+        assert!(err.contains("posted or recorded"), "{err}");
+        assert!(refuse_stale_copy_for_discuss(&stored, &sent).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worktree_fingerprint_refusal_still_fires_with_an_override_present() {
+        let gh = crate::test_helpers::FakeProgram::install(
+            "gh",
+            &format!("printf '%s' '{{\"headRefOid\":\"{ANALYZED}\"}}'"),
+        )
+        .await;
+        gh.add("claude", "exit 0");
+        let dir = tempfile::tempdir().expect("tempdir");
+        real_checkout(dir.path());
+        std::fs::write(dir.path().join("committed.txt"), b"analyzed content").unwrap();
+        let (_, stored) = analyzed_plan_with_items();
+        let (task, sent) = stored_with_provenance(&stored, checkout_facts(dir.path()).await);
+        let sent = with_override(&sent, "mine");
+        std::fs::write(dir.path().join("committed.txt"), b"rewritten content").unwrap();
+        let err = preflight(&task, &sent, &dir)
+            .await
+            .expect_err("a changed checkout is refused despite the override");
+        assert!(err.contains("content is not what"), "{err}");
         assert_eq!(gh.launches("claude"), 0, "no fix agent runs");
     }
 }

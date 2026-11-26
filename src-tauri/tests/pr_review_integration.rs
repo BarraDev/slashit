@@ -582,6 +582,7 @@ fn create_test_discuss_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
             reply_comment_id: None,
             fix_commit: None,
             fix_effect: None,
+            proposed_change_override: None,
         },
         PrReviewItem {
             comment_id: Some(202),
@@ -601,6 +602,7 @@ fn create_test_discuss_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
             reply_comment_id: None,
             fix_commit: None,
             fix_effect: None,
+            proposed_change_override: None,
         },
         PrReviewItem {
             comment_id: Some(203),
@@ -620,6 +622,7 @@ fn create_test_discuss_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
             reply_comment_id: None,
             fix_commit: None,
             fix_effect: None,
+            proposed_change_override: None,
         },
     ];
 
@@ -628,6 +631,7 @@ fn create_test_discuss_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
         analyzed_worktree_oid: None,
         analyzed_worktree_fingerprint: None,
         analyzed_at: None,
+        human_edit_revision: 0,
         generated_at: chrono::Utc::now(),
         pr_url: task.pr_url.clone().unwrap(),
         review_decision: None,
@@ -639,6 +643,24 @@ fn create_test_discuss_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
     };
 
     (task, plan)
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn discuss_round_never_writes_the_human_override() {
+    let _guard = PATH_LOCK.lock().await;
+    let claude_json = r#"{"items":[{"comment_id":201,"summary":"Add retry","decision":"fix","reasoning":"ok","proposed_change":"Helper rewrote this."}]}"#;
+    let env = MockEnv::setup(claude_json);
+    let (task, mut plan) = create_test_discuss_setup();
+    plan.items[0].proposed_change_override = Some("Human wording".to_string());
+
+    let merged = discuss_pr_review_questions_inner(task, env.working_dir_str(), plan, never_cancelled())
+        .await
+        .expect("discuss merges successfully");
+
+    assert_eq!(merged.items[0].proposed_change, "Helper rewrote this.");
+    assert_eq!(merged.items[0].proposed_change_override.as_deref(), Some("Human wording"));
+    assert_eq!(merged.items[0].effective_proposed_change(), "Human wording");
 }
 
 #[cfg(unix)]
@@ -858,6 +880,7 @@ fn create_test_two_fix_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
             reply_comment_id: None,
             fix_commit: None,
             fix_effect: None,
+            proposed_change_override: None,
         },
         PrReviewItem {
             comment_id: Some(302),
@@ -877,6 +900,7 @@ fn create_test_two_fix_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
             reply_comment_id: None,
             fix_commit: None,
             fix_effect: None,
+            proposed_change_override: None,
         },
     ];
 
@@ -885,6 +909,7 @@ fn create_test_two_fix_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
         analyzed_worktree_oid: None,
         analyzed_worktree_fingerprint: None,
         analyzed_at: None,
+        human_edit_revision: 0,
         generated_at: chrono::Utc::now(),
         pr_url: task.pr_url.clone().unwrap(),
         review_decision: None,
@@ -1374,6 +1399,7 @@ fn backfill_lifecycle_from_last_apply_marks_fixed_items_and_skips_failed_replies
         analyzed_worktree_oid: None,
         analyzed_worktree_fingerprint: None,
         analyzed_at: None,
+        human_edit_revision: 0,
         generated_at: chrono::Utc::now(),
         pr_url: "x".to_string(),
         review_decision: None,

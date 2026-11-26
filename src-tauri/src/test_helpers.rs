@@ -1104,6 +1104,7 @@ pub fn create_test_pr_review_setup() -> (Task, crate::domain::task::PrReviewPlan
             reply_comment_id: None,
             fix_commit: None,
             fix_effect: None,
+            proposed_change_override: None,
         },
         PrReviewItem {
             comment_id: Some(102),
@@ -1123,6 +1124,7 @@ pub fn create_test_pr_review_setup() -> (Task, crate::domain::task::PrReviewPlan
             reply_comment_id: None,
             fix_commit: None,
             fix_effect: None,
+            proposed_change_override: None,
         },
     ];
 
@@ -1139,6 +1141,7 @@ pub fn create_test_pr_review_setup() -> (Task, crate::domain::task::PrReviewPlan
         analyzed_worktree_oid: None,
         analyzed_worktree_fingerprint: None,
         analyzed_at: None,
+        human_edit_revision: 0,
     };
 
     (task, plan)
