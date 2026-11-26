@@ -1097,6 +1097,24 @@ mod tests {
         assert_eq!(absent.merge_commit, None);
     }
 
+    /// One merged answer carries both pieces of delivery evidence that
+    /// docs/architecture/post-pr-corrections.md relies on: the pull request's
+    /// last head and the commit GitHub created on the base. After a squash
+    /// merge they are unrelated commits, so the head, not the ancestry of the
+    /// merge commit, is what says which revision was merged.
+    #[test]
+    fn a_squash_merged_answer_reads_the_merged_head_beside_the_merge_commit() {
+        let head = "1111111111111111111111111111111111111111";
+        let squash = "2222222222222222222222222222222222222222";
+        let merged = parse_pr_status(&json!({
+            "state": "MERGED",
+            "headRefOid": head,
+            "mergeCommit": { "oid": squash },
+        }));
+        assert_eq!(merged.head_oid.as_deref(), Some(head));
+        assert_eq!(merged.merge_commit.as_deref(), Some(squash));
+    }
+
     /// The wire shape the frontend's mirror in `src/models/task.rs` reads.
     /// Both sides test against this same literal.
     #[test]

@@ -45,15 +45,21 @@ from the next:
   Created.
 
 So the design adds two entry transitions from a published Task into a new
-arrival, plus two guards that keep pull request status reads from cutting a
-correction short. Everything after the entry is the existing Human Review
-loop. `a_post_pr_correction_needs_no_new_review_record_field` shows that the
+arrival, one guard that keeps pull request status reads from cutting a
+correction short, and one completion rule (D) that finishes a Task on merge
+only when the approved revision is the revision that was merged. Everything
+after the entry is the existing Human Review loop. `a_post_pr_correction_needs_no_new_review_record_field` shows that the
 record already expresses the whole sequence.
 
 Approve again keeps its #355 rule: once a pull request exists, an approval is
 not renewed within its arrival. A later commit is reviewed in a new arrival
 instead. The delivered approval therefore stays final at the commit it
 covered, and a new approval is a separate history entry.
+
+An approval of the corrected commit does not prove delivery. A Task is
+complete only when GitHub reports that the pull request merged at the approved
+commit (D). Otherwise the merge is recorded, the Task is held, and the Human
+decides.
 
 Approval and publication remain separate. Explicit Publish to PR
 (`commands/pr/publication.rs`) keeps working as it does now: it publishes
@@ -76,6 +82,8 @@ reason is named:
 - `pr_publication` needs reconciliation (`Pending` or `Unknown`). The person
   publishes again, which reconciles the record first.
 - A delivery is in flight (`DeliveriesInFlight::contains`).
+- The pull request is recorded merged or closed. A correction cannot reach it
+  any more, so the message suggests a follow-up Task.
 - A run or AI review is live. A PR helper (review Apply or Sync) is ended,
   exactly as any status move ends it. Apply's own analyzed-head binding (PR
   #302) refuses the next Apply against the moved head.
@@ -152,10 +160,113 @@ the remote does not already contain it, then the existing link moves the Task
 to PR Created. Approval coverage (#355) shows the approval as current only
 once the poll reads the pull request head at that commit.
 
+The push to an existing pull request writes `pr_publication` through the
+existing publication record (`domain/publication.rs`): `pending` before the
+push, `classify_outcome` after reading the remote back, and `replay` and
+`reconcile` for a retry or a crash. Explicit Publish to PR already writes this
+record, so a person or the panel can tell "approved, not yet published" from
+"published", and a crash during the push leaves a `Pending` record rather than
+nothing. When the remote already holds the commit (`At`), the record is written
+`Published` with no push. A remote that `Contains` the commit plus later
+commits is published as today, but coverage shows the approval as stale, and D
+holds the Task if the pull request merges at that later head.
+
 - Test: `approving_a_correction_fast_forwards_the_existing_pull_request`
   (fake `gh` and a local bare remote; asserts one push of exactly the
   approved object ID, no new pull request, status PR Created),
   `a_remote_ahead_of_the_correction_is_refused_and_keeps_the_approval`.
+
+### D. Merged pull request: completion needs delivery evidence
+
+This rule replaces the decision `complete_merged_task` makes today
+(`queue/executor.rs`), where a merge heard in PR Created or Human Review
+completes the Task without checking what was merged. It applies to every Task
+in those two columns, whether or not it had a correction. A Task a person
+already moved to Done keeps today's behavior, because the person made that
+decision.
+
+The check is one pure function, `merged_delivery(task, merged_head,
+merge_commit)` in `domain/publication.rs`. It runs under the lifecycle lease
+in `complete_merged_task`, on the Task as staged, before `terminalize_leased`.
+`apply_polled_pr_state` passes it the `head_oid` of the same cached answer it
+already uses for `merge_commit`.
+
+**Approval evidence.** The current decision of the current arrival is
+Approved, with a recorded `approved_tip` A. This is
+`HumanReviewRecord::current_decision` and `approved_tip`, and nothing new is
+recorded.
+
+**Merge evidence.** A single `gh pr view` answer (the existing poll fields)
+reports `state` MERGED, a full `headRefOid` H, which is the pull request's last
+head when it merged, and a full `mergeCommit` M. `parse_pr_status` keeps only
+full object IDs, so an abbreviated ID is not evidence. The existing check that
+the answer is still the cached one applies.
+
+**Publication evidence.** H equals A. GitHub's head at merge time is the
+branch SlashIt published to, so H = A shows both that A was published and
+that A is the revision that merged. The local `pr_publication` record is
+SlashIt's own account and must agree. When it needs reconciliation (`Pending`
+or `Unknown`), the evidence is ambiguous. A Task delivered by Create PR has no
+record, so its absence is not a contradiction.
+
+**Squash and rebase merges.** M is a new commit on the base. After a squash
+or rebase merge, neither A nor H is an ancestor of M, and M's tree differs
+from A's tree whenever the base moved. D therefore never checks M's ancestry
+or tree, and never needs the merge method: the same rule (H = A) covers merge
+commits, squash and rebase. M is recorded on the reference
+(`record_merge_commit`), as today, because dependent Tasks check their base
+for it.
+
+Verdicts:
+
+| Verdict | When | Effect |
+|---|---|---|
+| Delivered | Approval evidence, merge evidence, H = A, and no unsettled publication | Today's completion: `record_first` records MERGED and M, then the Task moves to Done with checkout cleanup. All approval entries remain in history. |
+| Unavailable (passing) | The answer has no full H or no full M, the poll failed, or the cache moved on | Nothing is written, and the reference stays OPEN in the record. The next poll or Check now asks again. This is the existing passing-refusal path. |
+| Held (stable) | No current approval (a premature merge), an approval with no recorded tip, H ≠ A (a stale approval, or an approved correction that was never published), or an unsettled `pr_publication` | The existing stable-blocker latch (the `RepositoryUnresolved` arm): MERGED and M are recorded, so the poll stops asking. `error_message` names A, H and the reason. Status, Task Checkout, branch, `human_review.entries`, `pr_publication` and `activity` are unchanged apart from the PrMerged entry. Nothing is cleaned up. |
+
+A held Task's evidence does not change later, because GitHub never moves a
+merged head. So a hold is never reconsidered automatically. The Human resolves
+it in one of these ways:
+
+- Move the Task to Done. This is an explicit decision, recorded as a Moved
+  entry, and the old and new approvals stay in history.
+- Open a follow-up Task for the work the merge lacks, and keep or finish this
+  one.
+- For an unsettled `pr_publication`, use Publish again to reconcile it first.
+  This changes the explanation, not the verdict.
+
+R1 and R2 are refused once the merge is recorded (see the shared refusals).
+
+Tests (executor tests use a fake `gh` answer, as the existing merge tests do,
+and `merged_delivery` has domain unit tests for each row):
+
+- Premature merge: `a_merge_heard_while_a_correction_awaits_review_holds_the_task`
+  (Human Review, new arrival, no decision) and
+  `a_merge_heard_during_a_correction_run_is_held_when_the_run_reaches_review`
+  (In Progress records nothing. Once the run reaches Human Review, the next
+  poll holds it.)
+- Stale approval: `a_merge_past_the_approved_commit_holds_the_task` (PR
+  Created, A approved, H a descendant of A pushed outside SlashIt. This is the
+  verified PR Created occurrence.)
+- Approved but unpublished correction:
+  `a_merge_of_the_old_head_after_the_correction_was_approved_holds_the_task`
+  (B approved in Human Review, R5 not run, H = A, `pr_publication` names A or
+  is absent).
+- Successful squash merge: `a_squash_merge_of_the_approved_correction_completes_the_task`
+  (H = B, M a commit with no ancestry to B, `pr_publication` Published at B.
+  The Task reaches Done, M is recorded, and entries keep (A approved, changes
+  requested, B approved).) Plus `parse_pr_status`'s
+  `a_squash_merged_answer_reads_the_merged_head_beside_the_merge_commit`,
+  which exists now and pins the answer shape.
+- Unavailable delivery evidence:
+  `a_merge_answer_without_a_full_head_changes_nothing_and_is_asked_again`,
+  `a_merge_answer_without_a_merge_commit_changes_nothing_and_is_asked_again`,
+  and `an_unsettled_publication_holds_a_merged_task` (ambiguous, so held).
+- `an_approval_without_a_recorded_commit_holds_a_merged_task` (a legacy
+  approval).
+- `a_held_merge_keeps_the_checkout_branch_and_review_history` (the hold writes
+  only the latch and the error).
 
 ### R6. Approve again on a published Task (unchanged refusal)
 
@@ -185,6 +296,11 @@ Coverage then reports the approval as not covering the pull request head.
 | Branch, Task Checkout, `base_commit` | Preserved. The correction continues from them. |
 | `activity` | Appended (Moved, ReadyForReview, run entries). |
 
+A Held verdict under D preserves everything in this table except
+`external_refs`, where the pull request reference records MERGED and M.
+Nothing becomes stale through a hold: the approval was already not proof of
+what merged, and `error_message` says so.
+
 ## Failure cases
 
 | Case | Outcome |
@@ -193,8 +309,13 @@ Coverage then reports the approval as not covering the pull request head.
 | Restack, integration, cleanup or recovery unfinished | R1 and R2 refused by `queue_entry_refusal`. |
 | Board write fails | Nothing changed (`WriteError::NotPublished`), or the board adopts the published file (`PublishedNotDurable`) and the reply says so. R2 is one write, so its feedback and the Queue move land together or not at all. |
 | PR status refresh during the correction | G1: state recorded, Task and run untouched. |
-| PR merged during the correction run | The poll records it and does not complete the Task (it is not in the PR lifecycle). At R5 the merged pull request is found and the push is refused ("not open"). The person moves the Task to Done or opens a follow-up Task. No second pull request is opened. |
-| PR merged while the correction waits in Human Review | New guard G2: `in_pr_lifecycle` completes a Human Review Task on merge only when its current arrival is approved. Otherwise the merge is recorded with an error message saying the correction is not in the merge, and the Task stays. |
+| PR merged during the correction run | Nothing is recorded while the Task is outside the PR lifecycle, as today. When the run reaches Human Review, D holds it (no current approval). At R5 the merged pull request is found and the push is refused ("not open"). No second pull request is opened. |
+| PR merged while the correction waits in Human Review | D holds it: no current approval, or H ≠ the approved commit. |
+| PR merged after the correction was approved but before R5 | D holds it: H is the old head, not the approved commit. |
+| PR merged at a head past the approval (commits pushed outside SlashIt) | D holds it: H ≠ A. |
+| PR squash- or rebase-merged at the approved commit | D completes it. The merge commit's ancestry is not checked. |
+| Merge answer without a full head or merge commit, or the poll fails | D finds the evidence unavailable. Nothing is written, and the poll asks again. |
+| Merged with `pr_publication` Pending or Unknown | D holds it as ambiguous, and Publish again reconciles the record. |
 | PR closed | R5 refused with the existing "not open" message, and the approval stays. |
 | Remote has commits the correction lacks | R5 push refused as non-fast-forward, nothing forced, approval kept, `pr_error` recorded. The person integrates locally, then uses R1, then R4 and R5. |
 | Branch moved after the commit was shown | R4 refused (`shown_tip_is_current`). |
@@ -204,7 +325,7 @@ Coverage then reports the approval as not covering the pull request head.
 
 ## Implementation Tasks
 
-G1 and G2 are safe alone and must land before R1 and R2. Otherwise a
+G1 and D are safe alone and must land before R1 and R2. Otherwise a
 reopened review could be pulled back to PR Created with no approval of its
 head.
 
@@ -212,15 +333,22 @@ head.
    `refresh_task_pr_state` and `link_pr_to_task`, `commands/pr.rs`. Tests:
    `a_refresh_during_a_correction_run_records_the_state_and_keeps_the_run`,
    `a_refresh_of_a_reopened_review_does_not_move_it_to_pr_created`.
-2. **Complete a merged Human Review Task only when it is approved (G2).**
-   `in_pr_lifecycle` and `complete_merged_task`, `queue/executor.rs`. Test:
-   `a_merge_heard_while_a_correction_awaits_review_does_not_complete_the_task`.
+2. **Complete a merged Task only on delivery evidence (D).**
+   `merged_delivery` in `domain/publication.rs`, the head passed through
+   `apply_polled_pr_state`, and the Held verdict added to the stable-blocker
+   latch in `complete_merged_task`, `queue/executor.rs`. Tests from D. This
+   changes behavior for Tasks without corrections too: a pull request merged
+   at a head nobody approved in SlashIt is held, not completed. Say so in
+   `product-model.md`.
 3. **Reopen review (R1).** `reopen_task_review`, the shared refusal predicate,
    the `record_move` rule for a move from PR Created to Human Review, and the
    R6 message. Tests from R1 and R6. Update the Approval coverage section of
    `product-model.md`.
-4. **Request changes on a published Task (R2).** Widen `request_changes` in a
-   single write. Tests from R2, R3's prompt test, R4, and R5's backend tests.
+4. **Request changes on a published Task (R2), and record R5's publication.**
+   Widen `request_changes` in a single write, and have
+   `publish_approved_to_existing_pr` write `pr_publication` through the
+   existing record functions. Tests from R2, R3's prompt test, R4, and R5's
+   backend tests.
 5. **Human Review UI and acceptance.** Review again and Request changes in the
    drawer of a PR Created Task, the Approve & Update PR label, and earlier
    approvals shown as history. A desktop acceptance journey covers approve,

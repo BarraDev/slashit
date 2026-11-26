@@ -335,7 +335,9 @@ pull request exists, the approval is not renewed; the pull request's review and
 merge decide later changes. A Task without a recorded GitHub pull request is
 judged by its branch alone. The proposed path for reviewing a correction made
 after the pull request exists, in a new Human Review arrival, is in
-[post-pr-corrections.md](post-pr-corrections.md).
+[post-pr-corrections.md](post-pr-corrections.md). That document also proposes
+completing a merged Task only when GitHub reports that the pull request merged
+at the approved commit.
 
 ### Local delivery
 
