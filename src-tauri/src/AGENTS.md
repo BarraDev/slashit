@@ -50,6 +50,7 @@ Commands are registered in `lib.rs` using `tauri::generate_handler!`. All comman
 
 ## Tauri Commands Exposed
 
+- `list_agent_requests`, `decide_agent_request` - What external agents asked a person to approve or authorize, and the person's decision, in `commands/agent_requests.rs`. Deciding has no IPC verb; see `docs/architecture/agent-review-delivery.md`
 - `get_task_diff` - The patch of a Task's Git worktree against its base commit, in `commands/jj.rs`
 - `get_task_diff_stat` - The diffstat of the same range, in `commands/jj.rs`. In Human Review both answer with the branch tip's content (the commit an approval records), not the checkout's
 - `get_task_review_changes` - In Human Review: that tip, its diff, and the checkout's uncommitted edits as a separate diff against it, in `commands/jj.rs`. Answers nothing outside Human Review

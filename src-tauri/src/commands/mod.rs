@@ -11,6 +11,7 @@ pub mod jj;
 pub mod queue;
 pub mod qa;
 pub mod human_review;
+pub mod agent_requests;
 pub mod worker_recovery;
 pub mod integration;
 #[cfg(test)]
@@ -57,6 +58,7 @@ pub use jj::*;
 pub use queue::*;
 pub use qa::*;
 pub use human_review::*;
+pub use agent_requests::*;
 pub use worker_recovery::{accept_worker_result, get_worker_recovery_evidence};
 pub mod worker_new_attempt;
 pub use worker_new_attempt::{authorize_new_attempt, get_new_attempt_evidence, start_new_attempt};

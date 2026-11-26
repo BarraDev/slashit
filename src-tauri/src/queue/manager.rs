@@ -259,6 +259,7 @@ mod tests {
                 new_attempt_confirmed: false,
                 approved_execution: None,
                 executed_approvals: Vec::new(),
+                agent_requests: Vec::new(),
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             };

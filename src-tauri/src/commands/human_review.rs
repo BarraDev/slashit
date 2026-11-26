@@ -14,7 +14,9 @@ use std::sync::{Arc, Mutex};
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::commands::pr::{create_pr_for_approved_task, pr_availability, PrAvailability};
+use crate::commands::pr::{
+    create_pr_for_approved_task, create_pr_for_authorized_commit, pr_availability, PrAvailability,
+};
 use crate::commands::task::renumber_column;
 use crate::domain::task::HumanReviewDecision;
 use crate::domain::{Task, TaskStatus};
@@ -204,7 +206,7 @@ const PUBLISHED_HEAD_FRESH_SECONDS: i64 = 2 * crate::pr_status::POLL_INTERVAL.as
 /// The published head as the cache holds it at `now`. Only the latest attempt
 /// counts: a failed attempt makes the head unknown even when an earlier one
 /// read it, and so does an answer older than [`PUBLISHED_HEAD_FRESH_SECONDS`].
-fn published_head(entry: Option<&crate::pr_status::PrStatusEntry>, now: chrono::DateTime<chrono::Utc>) -> PublishedHead {
+pub(crate) fn published_head(entry: Option<&crate::pr_status::PrStatusEntry>, now: chrono::DateTime<chrono::Utc>) -> PublishedHead {
     let unknown = |why: String| PublishedHead { head: None, observed_at: None, unverified: Some(why) };
     let Some(entry) = entry else {
         return unknown("GitHub has not answered about this pull request yet.".to_string());
@@ -233,7 +235,7 @@ fn published_head(entry: Option<&crate::pr_status::PrStatusEntry>, now: chrono::
 /// address whose reference is missing is read from the URL itself, so a Task
 /// linked by `pr_url` alone is still checked. An address that cannot be read
 /// is an error, which the panel reports as unverified.
-fn published_key(task: &Task) -> Option<Result<crate::pr_status::PrKey, String>> {
+pub(crate) fn published_key(task: &Task) -> Option<Result<crate::pr_status::PrKey, String>> {
     let address = task.authoritative_pr_url()?;
     let referenced = task.external_refs.iter().find_map(|r| match r {
         crate::domain::ExternalRef::GithubPr { url, repo, number, .. } if url == address => {
@@ -570,7 +572,7 @@ pub(crate) async fn approve(
     if !create_pr {
         return Ok(ApprovalOutcome { task, pr: None });
     }
-    let pr = deliver(state, task_id).await;
+    let pr = deliver(state, task_id, None).await;
     Ok(ApprovalOutcome { task: current(state, task_id).await.unwrap_or(task), pr: Some(pr) })
 }
 
@@ -603,7 +605,7 @@ pub(crate) async fn retry_delivery(
                 .to_string(),
         );
     }
-    let pr = deliver(state, task_id).await;
+    let pr = deliver(state, task_id, None).await;
     Ok(ApprovalOutcome { task: current(state, task_id).await.unwrap_or(task), pr: Some(pr) })
 }
 
@@ -857,14 +859,21 @@ async fn request_changes(
 /// The task counts as being delivered from the first check until its
 /// outcome is recorded, so it never reads as needing the user while this
 /// runs, nor as settled before the outcome is on the record.
-async fn deliver(state: &crate::AppState, task_id: Uuid) -> PrDelivery {
+///
+/// `exact` limits the delivery to that commit, for an authorization that names
+/// one.
+pub(crate) async fn deliver(state: &crate::AppState, task_id: Uuid, exact: Option<&str>) -> PrDelivery {
     let _in_flight = state.task.deliveries.start(task_id);
     match pr_availability(state, task_id).await {
         Ok(PrAvailability::Available) => {}
         Ok(PrAvailability::Unavailable { reason }) => return PrDelivery::Unavailable { reason },
         Err(reason) => return record_pr_failure(state, task_id, reason).await,
     }
-    match create_pr_for_approved_task(state, task_id).await {
+    let opened = match exact {
+        Some(commit) => create_pr_for_authorized_commit(state, task_id, commit).await,
+        None => create_pr_for_approved_task(state, task_id).await,
+    };
+    match opened {
         Ok(url) => {
             // Best effort: the pull request is linked either way, and a stale
             // failure next to it is only shown while no PR is recorded.

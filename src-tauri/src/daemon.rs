@@ -27,6 +27,20 @@ pub struct DaemonOptions {
     pub feature_overrides: Vec<String>,
 }
 
+/// The daemon's state, for the control channel's review and delivery verbs. It
+/// has no window, so nobody can be asked to decide a request here.
+struct DaemonApp(Arc<crate::AppState>);
+
+impl crate::ipc::AppAccess for DaemonApp {
+    fn state(&self) -> &crate::AppState {
+        &self.0
+    }
+
+    fn shows_requests_to_a_person(&self) -> bool {
+        false
+    }
+}
+
 /// Lets the IPC layer ask the daemon to stop without knowing what a daemon is.
 struct DaemonControl {
     shutdown: tokio::sync::watch::Sender<bool>,
@@ -98,6 +112,7 @@ pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
     let bound = crate::ipc::BoundIpc::bind(&paths, &ipc_config).await?;
 
     let (state, report) = build_state().await?;
+    let state = Arc::new(state);
     let cleanup_failures = report
         .project_conversation_cleanup_failures
         .iter()
@@ -237,6 +252,7 @@ pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
         feature_diagnostics,
         paths: state.paths.clone(),
         start_guard: state.start_guard.clone(),
+        app: Some(Arc::new(DaemonApp(state.clone()))),
     });
 
     // Serving the endpoints claimed at the top of this function. Nothing is

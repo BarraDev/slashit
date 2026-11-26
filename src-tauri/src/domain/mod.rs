@@ -3,6 +3,7 @@ pub mod repository;
 pub mod project;
 pub mod workspace;
 pub mod task;
+pub mod agent_request;
 pub mod task_dependencies;
 pub mod github_issue_link;
 pub mod conversation;

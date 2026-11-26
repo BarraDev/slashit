@@ -60,6 +60,25 @@ pub async fn dispatch(req: IpcRequest, ctx: &IpcContext, peer: &PeerContext) -> 
         IpcRequest::GetTaskEvidence { task_id } => {
             Dispatch::reply(handle_get_task_evidence(ctx, task_id).await)
         }
+        IpcRequest::GetReviewState { task_id } => {
+            Dispatch::reply(handle_get_review_state(ctx, task_id).await)
+        }
+        IpcRequest::GetDeliveryState { task_id } => {
+            Dispatch::reply(handle_get_delivery_state(ctx, task_id).await)
+        }
+        IpcRequest::RequestOperation {
+            task_id,
+            operation,
+            commit,
+            actor,
+        } => Dispatch::reply(
+            handle_request_operation(ctx, task_id, operation, commit, actor).await,
+        ),
+        IpcRequest::OpenPr {
+            task_id,
+            request_id,
+            actor,
+        } => Dispatch::reply(handle_open_pr(ctx, task_id, request_id, actor).await),
         IpcRequest::CreateTask {
             project_id,
             title,
@@ -291,6 +310,103 @@ async fn handle_get_task(ctx: &IpcContext, task_id: String) -> IpcResponse {
             Err(e) => IpcResponse::error(format!("Could not encode task {task_id}: {e}")),
         },
         None => IpcResponse::error(format!("Task {task_id} not found")),
+    }
+}
+
+// --- Agent review and delivery -----------------------------------------------
+//
+// These answer and act through `commands::agent_requests`. There is no handler
+// that decides a request: a person does that in the desktop app.
+
+/// The application state and the parsed Task ID these verbs start from.
+fn review_target<'a>(
+    ctx: &'a IpcContext,
+    task_id: &str,
+) -> Result<(&'a crate::AppState, Uuid), IpcResponse> {
+    let task_id = Uuid::parse_str(task_id)
+        .map_err(|_| IpcResponse::error("Invalid task_id: expected a UUID"))?;
+    let app = ctx
+        .app
+        .as_deref()
+        .ok_or_else(|| IpcResponse::error("This instance cannot serve review and delivery."))?;
+    Ok((app.state(), task_id))
+}
+
+fn json_reply<T: serde::Serialize>(result: Result<T, String>) -> IpcResponse {
+    match result.and_then(|value| serde_json::to_value(value).map_err(|e| e.to_string())) {
+        Ok(value) => IpcResponse::success(value),
+        Err(e) => IpcResponse::error(e),
+    }
+}
+
+async fn handle_get_review_state(ctx: &IpcContext, task_id: String) -> IpcResponse {
+    match review_target(ctx, &task_id) {
+        Ok((state, id)) => {
+            json_reply(crate::commands::agent_requests::review_state(state, id).await)
+        }
+        Err(refusal) => refusal,
+    }
+}
+
+async fn handle_get_delivery_state(ctx: &IpcContext, task_id: String) -> IpcResponse {
+    match review_target(ctx, &task_id) {
+        Ok((state, id)) => {
+            json_reply(crate::commands::agent_requests::delivery_state(state, id).await)
+        }
+        Err(refusal) => refusal,
+    }
+}
+
+async fn handle_request_operation(
+    ctx: &IpcContext,
+    task_id: String,
+    operation: String,
+    commit: String,
+    actor: String,
+) -> IpcResponse {
+    let (state, id) = match review_target(ctx, &task_id) {
+        Ok(target) => target,
+        Err(refusal) => return refusal,
+    };
+    if !ctx.app.as_deref().is_some_and(|app| app.shows_requests_to_a_person()) {
+        return IpcResponse::error(
+            "Only the desktop app can show a request to a person, and this instance is not it.",
+        );
+    }
+    let Some(operation) = crate::domain::agent_request::RequestedOperation::parse(&operation) else {
+        return IpcResponse::error("Unknown operation: expected approve or open_pr");
+    };
+    json_reply(
+        crate::commands::agent_requests::create_request(state, id, operation, &commit, &actor)
+            .await,
+    )
+}
+
+async fn handle_open_pr(
+    ctx: &IpcContext,
+    task_id: String,
+    request_id: String,
+    actor: String,
+) -> IpcResponse {
+    let (state, id) = match review_target(ctx, &task_id) {
+        Ok(target) => target,
+        Err(refusal) => return refusal,
+    };
+    let Ok(request_id) = Uuid::parse_str(&request_id) else {
+        return IpcResponse::error("Invalid request_id: expected a UUID");
+    };
+    match crate::commands::agent_requests::open_authorized_pr(state, id, request_id, &actor).await {
+        // A delivery that ran and failed is a failure to the caller, who must
+        // not read an `ok` reply as a pull request.
+        Ok(view) => match view.request.used.as_ref().and_then(|u| u.outcome.as_ref()) {
+            Some(crate::domain::agent_request::UseOutcome::Failed { reason }) => {
+                IpcResponse::error(format!(
+                    "The pull request was not opened, and this authorization is used up: {reason}"
+                ))
+            }
+            _ => json_reply(Ok(view)),
+        },
+        Err(e) => IpcResponse::error(e),
     }
 }
 

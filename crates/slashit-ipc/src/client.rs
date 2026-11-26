@@ -25,6 +25,11 @@ use crate::transport;
 /// symmetric.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Opening a pull request pushes to a remote and waits for GitHub, so its
+/// answer is given longer. Running out of it does not stop the delivery: its
+/// outcome is then unknown to this client and is read from the delivery state.
+const DELIVERY_RESPONSE_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Everything that can go wrong on the client side.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -108,7 +113,11 @@ pub async fn send(
     // newline. The response arrives on the read half, which stays open.
     writer.shutdown().await?;
 
-    let frame = tokio::time::timeout(RESPONSE_TIMEOUT, read_frame(reader, MAX_REQUEST_BYTES))
+    let patience = match request {
+        IpcRequest::OpenPr { .. } => DELIVERY_RESPONSE_TIMEOUT,
+        _ => RESPONSE_TIMEOUT,
+    };
+    let frame = tokio::time::timeout(patience, read_frame(reader, MAX_REQUEST_BYTES))
         .await
         .map_err(|_| ClientError::NoResponse(options.endpoint.clone()))??;
     match frame {

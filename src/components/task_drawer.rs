@@ -616,6 +616,9 @@ pub fn TaskDrawer(
                         <HumanReviewPanel task_id=task_id task=task apply_task=apply_task viewed_tip=viewed_tip on_stale=reload_changes />
                     </Show>
 
+                    // What an external agent asked a person to decide.
+                    <crate::components::agent_requests::AgentRequestsPanel task_id=task_id apply_task=apply_task viewed_tip=viewed_tip />
+
                     // A request to open the pull request that was never answered, and
                     // what the person did about it.
                     <crate::components::unconfirmed_pr::UnconfirmedPrPanel task_id=task_id task=task apply_task=apply_task />

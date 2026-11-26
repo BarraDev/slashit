@@ -403,6 +403,7 @@ pub async fn create_task_from_issue(
         new_attempt_confirmed: false,
         approved_execution: None,
         executed_approvals: Vec::new(),
+        agent_requests: Vec::new(),
         created_at: now,
         updated_at: now,
     };

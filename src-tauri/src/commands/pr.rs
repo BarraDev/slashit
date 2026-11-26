@@ -560,6 +560,25 @@ pub(crate) async fn create_pr_for_approved_task(
     state: &crate::AppState,
     task_id: Uuid,
 ) -> Result<String, String> {
+    create_pr_for_approval(state, task_id, None).await
+}
+
+/// [`create_pr_for_approved_task`] for an authorization that names one commit:
+/// refused unless the approval covers exactly `commit`, and refused rather than
+/// restacking, which would publish a rewritten commit.
+pub(crate) async fn create_pr_for_authorized_commit(
+    state: &crate::AppState,
+    task_id: Uuid,
+    commit: &str,
+) -> Result<String, String> {
+    create_pr_for_approval(state, task_id, Some(commit)).await
+}
+
+async fn create_pr_for_approval(
+    state: &crate::AppState,
+    task_id: Uuid,
+    exact: Option<&str>,
+) -> Result<String, String> {
     let reservation = {
         let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
         let approved = state
@@ -579,7 +598,10 @@ pub(crate) async fn create_pr_for_approved_task(
         refuse_while_republish_pending(state, task_id).await?;
         // The approval covers one commit. Refused here, before reserving ends
         // whatever owns the task, when the branch is no longer at it.
-        approved_commit_for_delivery(state, task_id).await?;
+        let covered = approved_commit_for_delivery(state, task_id).await?;
+        if exact.is_some() && covered.as_deref() != exact {
+            return Err(NOT_THE_AUTHORIZED_COMMIT.to_string());
+        }
         // One delivery per task: work being integrated into a local branch,
         // or already integrated there, is not also opened as a pull request.
         let integrating = state
@@ -601,8 +623,13 @@ pub(crate) async fn create_pr_for_approved_task(
             None => None,
         }
     };
-    create_pr_reserved(state, task_id, reservation, None).await
+    create_pr_reserved(state, task_id, reservation, None, exact).await
 }
+
+/// The refusal for a delivery that would publish another commit than the one a
+/// person authorized.
+const NOT_THE_AUTHORIZED_COMMIT: &str =
+    "The approval no longer covers the commit that was authorized, so nothing was pushed.";
 
 /// Whether SlashIt can open a pull request for a task's project at all.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -1028,7 +1055,7 @@ pub async fn recover_private_email_and_create_pr(
         Some(approved) => Some(reauthored_tip(&working_dir, &branch, &approved).await?),
         None => None,
     };
-    create_pr_reserved(&state, task_uuid, reservation, reauthored).await
+    create_pr_reserved(&state, task_uuid, reservation, reauthored, None).await
 }
 
 /// The branch tip after an author rewrite, once it is shown to be the
@@ -6754,7 +6781,7 @@ async fn create_pr_inner(state: &crate::AppState, task_id: &str) -> Result<Strin
     // `PrCreated`, and none of that may race an owner that can still mutate
     // the same checkout/branch. See `reserve_task_for_pr_side_effect`.
     let reservation = reserve_task_for_pr_side_effect(state, task_uuid).await?;
-    create_pr_reserved(state, task_uuid, reservation, None).await
+    create_pr_reserved(state, task_uuid, reservation, None, None).await
 }
 
 /// [`create_pr_inner`]'s body, for a caller that already holds the task's PR
@@ -6788,6 +6815,7 @@ async fn create_pr_reserved(
     task_uuid: Uuid,
     reservation: Option<crate::queue::PrHelperLease>,
     reauthored_tip: Option<String>,
+    exact: Option<&str>,
 ) -> Result<String, String> {
     // Repository-level, not task-workspace: every command below names its
     // branch explicitly (the task's recorded `branch_name`, never the
@@ -6858,6 +6886,9 @@ async fn create_pr_reserved(
     // restack below replays it and publishes a rewritten tip, but the approval
     // keeps naming this one, and it is what the later re-check compares.
     let admitted_tip = publish_tip.clone();
+    if exact.is_some() && publish_tip.as_deref() != exact {
+        return Err(NOT_THE_AUTHORIZED_COMMIT.to_string());
+    }
 
     if let Some(existing_pr_url) =
         find_existing_pr_for_branch(&working_dir, &task_branch_name).await?
@@ -6911,6 +6942,15 @@ async fn create_pr_reserved(
         has_dependencies,
     )
     .await?;
+
+    if exact.is_some() && base.landed_parent.is_some() {
+        return Err(
+            "This task's parent branch has landed, so opening its pull request may rewrite the \
+             branch. That publishes another commit than the one authorized: open it from the \
+             desktop app instead."
+                .to_string(),
+        );
+    }
 
     // A stacked branch whose parent was merged into the default branch is
     // replayed onto it here, before its first push, when that is proven
@@ -10050,7 +10090,7 @@ mod after_slug_hook {
 /// window between a push's preparation and its gate. A test uses it to move
 /// approval or cancellation into that window deterministically.
 #[cfg(test)]
-mod before_gate_hook {
+pub(crate) mod before_gate_hook {
     use std::sync::Mutex;
 
     static HOOK: Mutex<Option<(String, Box<dyn FnOnce() + Send>)>> = Mutex::new(None);
@@ -15518,6 +15558,421 @@ mod tests {
             };
 
             const PR_URL: &str = "https://github.com/testorg/testrepo/pull/7";
+
+            /// An agent's side of review and delivery, driven through the
+            /// control channel's dispatcher, against the person's side, which
+            /// only the desktop command reaches.
+            mod agent_delivery {
+                use super::*;
+                use crate::commands::agent_requests::{decide, AgentRequestView};
+                use crate::domain::agent_request::{RequestState, RequestUse, UseOutcome};
+                use crate::ipc::{AppAccess, IpcContext, PeerContext};
+                use slashit_ipc::{IpcRequest, IpcResponse};
+                use std::sync::Arc;
+
+                const BRANCH: &str = "task-agent";
+
+                struct TestApp {
+                    state: Arc<crate::AppState>,
+                    desktop: bool,
+                }
+
+                impl AppAccess for TestApp {
+                    fn state(&self) -> &crate::AppState {
+                        &self.state
+                    }
+
+                    fn shows_requests_to_a_person(&self) -> bool {
+                        self.desktop
+                    }
+                }
+
+                struct Fx {
+                    _guard: tokio::sync::MutexGuard<'static, ()>,
+                    repo: RepoFixture,
+                    mock: MockGh,
+                    state: Arc<crate::AppState>,
+                    _tmp: tempfile::TempDir,
+                    ctx: IpcContext,
+                    task_id: Uuid,
+                    commit: String,
+                }
+
+                fn context(state: &Arc<crate::AppState>, desktop: bool) -> IpcContext {
+                    let mut ctx = crate::test_helpers::ipc_test_context(state.paths.clone());
+                    ctx.app = Some(Arc::new(TestApp {
+                        state: state.clone(),
+                        desktop,
+                    }));
+                    ctx
+                }
+
+                async fn fixture() -> Fx {
+                    let guard = PATH_LOCK.lock().await;
+                    let repo = RepoFixture::new();
+                    point_origin_at_github(&repo);
+                    let commit = create_branch(&repo, BRANCH);
+                    let mock = MockGh::setup(PR_URL, r#"{"state":"OPEN"}"#);
+                    let (state, _tmp) = build_test_state().await;
+                    let state = Arc::new(state);
+                    let task_id = seed_task(
+                        &state,
+                        repo.checkout.to_str().unwrap(),
+                        Some(BRANCH),
+                        TaskStatus::HumanReview,
+                    )
+                    .await;
+                    let ctx = context(&state, true);
+                    Fx {
+                        _guard: guard,
+                        repo,
+                        mock,
+                        state,
+                        _tmp,
+                        ctx,
+                        task_id,
+                        commit,
+                    }
+                }
+
+                impl Fx {
+                    async fn send(&self, request: IpcRequest) -> IpcResponse {
+                        let peer = PeerContext {
+                            endpoint: slashit_ipc::Endpoint::Unix {
+                                path: "/unused".into(),
+                            },
+                            os_verified: true,
+                        };
+                        crate::ipc::handlers::dispatch(request, &self.ctx, &peer)
+                            .await
+                            .response
+                    }
+
+                    async fn ask(&self, operation: &str) -> IpcResponse {
+                        self.send(IpcRequest::RequestOperation {
+                            task_id: self.task_id.to_string(),
+                            operation: operation.to_string(),
+                            commit: self.commit.clone(),
+                            actor: "asking-agent".to_string(),
+                        })
+                        .await
+                    }
+
+                    async fn asked(&self, operation: &str) -> Uuid {
+                        let reply = self.ask(operation).await;
+                        assert!(reply.ok, "{:?}", reply.error);
+                        Uuid::parse_str(reply.data["id"].as_str().expect("an id")).unwrap()
+                    }
+
+                    async fn open(&self, task_id: Uuid, request_id: Uuid) -> IpcResponse {
+                        self.send(IpcRequest::OpenPr {
+                            task_id: task_id.to_string(),
+                            request_id: request_id.to_string(),
+                            actor: "executing-agent".to_string(),
+                        })
+                        .await
+                    }
+
+                    async fn refused(&self, request_id: Uuid, why: &str) {
+                        let reply = self.open(self.task_id, request_id).await;
+                        assert!(!reply.ok, "expected a refusal: {:?}", reply.data);
+                        let error = reply.error.unwrap_or_default();
+                        assert!(error.contains(why), "{error}");
+                    }
+
+                    async fn person(&self, id: Uuid, yes: bool) -> Result<AgentRequestView, String> {
+                        decide(&self.state, self.task_id, id, &self.commit, yes)
+                            .await
+                            .map(|outcome| outcome.request)
+                    }
+
+                    async fn approve_in_panel(&self) {
+                        approve_shown(&self.state, self.task_id, false)
+                            .await
+                            .expect("approved");
+                    }
+
+                    /// A person approves in the panel, then authorizes the
+                    /// agent's request to open the pull request.
+                    async fn authorized(&self) -> Uuid {
+                        self.approve_in_panel().await;
+                        let id = self.asked("open_pr").await;
+                        self.person(id, true).await.expect("authorized");
+                        id
+                    }
+
+                    async fn task(&self) -> Task {
+                        self.state.task.tasks.read().await[&self.task_id].clone()
+                    }
+
+                    async fn saved(&self) -> Task {
+                        let project_id = self.task().await.project_id;
+                        on_disk(&self.state, project_id, self.task_id)
+                    }
+
+                    async fn amend(&self, change: impl Fn(&mut Task) + Send + Sync) {
+                        let id = self.task_id;
+                        crate::lifecycle::record(
+                            &self.state.task.tasks,
+                            &self.state.storage,
+                            id,
+                            &|staged| change(staged.get_mut(&id).unwrap()),
+                        )
+                        .await
+                        .expect("saved");
+                    }
+
+                    fn move_branch(&self, to: &str) {
+                        let name = format!("refs/heads/{BRANCH}");
+                        git(&self.repo.checkout, &["update-ref", &name, to]);
+                    }
+
+                    fn commit_on_branch(&self) {
+                        let tree = format!("{}^{{tree}}", self.commit);
+                        let later = git(
+                            &self.repo.checkout,
+                            &["commit-tree", "-m", "late", "-p", &self.commit, &tree],
+                        );
+                        self.move_branch(&later);
+                    }
+
+                    fn pr_creates(&self) -> usize {
+                        self.mock.read_log().matches("pr\ncreate\n").count()
+                    }
+
+                    fn nothing_was_published(&self) {
+                        assert_eq!(self.repo.remote_has_branch(BRANCH), None);
+                        assert_eq!(self.pr_creates(), 0);
+                    }
+                }
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn an_unconfirmed_agent_request_publishes_and_approves_nothing() {
+                    let fx = fixture().await;
+
+                    // No approved commit: the request to open a PR is refused.
+                    let reply = fx.ask("open_pr").await;
+                    assert!(!reply.ok);
+                    let error = reply.error.unwrap_or_default();
+                    assert!(error.contains("not approved exactly this commit"), "{error}");
+
+                    // Asking for approval records a question, never an approval.
+                    let approval = fx.asked("approve").await;
+                    assert!(fx.saved().await.human_review.entries.is_empty());
+                    fx.refused(approval, "does not authorize opening").await;
+                    fx.refused(Uuid::new_v4(), "no such request").await;
+
+                    fx.person(approval, true).await.expect("approved by a person");
+                    let id = fx.asked("open_pr").await;
+                    fx.refused(id, "has not authorized").await;
+                    fx.person(id, false).await.expect("refused by a person");
+                    fx.refused(id, "refused this request").await;
+                    assert!(!fx.ask("open_pr").await.ok, "a refusal is not asked again");
+                    fx.nothing_was_published();
+                }
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn an_approval_request_is_recorded_only_by_the_persons_decision() {
+                    let fx = fixture().await;
+                    let id = fx.asked("approve").await;
+                    assert_eq!(fx.asked("approve").await, id, "a lost reply is retried");
+
+                    let first = fx.person(id, true).await.expect("approved");
+                    assert_eq!(first.state, RequestState::Approved);
+                    let again = fx.person(id, true).await.expect("a retried click");
+                    assert_eq!(again.request.decision, first.request.decision);
+                    assert!(fx.person(id, false).await.is_err());
+
+                    let saved = fx.saved().await;
+                    assert_eq!(saved.human_review.approved_tip(), Some(fx.commit.as_str()));
+                    assert_eq!(saved.human_review.entries.len(), 1);
+                    assert_eq!(saved.agent_requests.len(), 1);
+                    assert_eq!(saved.agent_requests[0].requested_by, "asking-agent");
+                    assert!(saved.agent_requests[0].used.is_none());
+                    fx.nothing_was_published();
+                }
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn an_authorization_opens_one_pull_request_and_cannot_be_replayed() {
+                    let fx = fixture().await;
+                    let id = fx.authorized().await;
+                    // The authorization must be consumed on disk before the push.
+                    let at_push = Arc::new(std::sync::Mutex::new(None::<RequestUse>));
+                    {
+                        let (seen, storage) = (at_push.clone(), fx.state.storage.clone());
+                        let (project_id, task_id) = (fx.task().await.project_id, fx.task_id);
+                        crate::commands::pr::before_gate_hook::arm(
+                            fx.repo.checkout.to_str().unwrap(),
+                            move || {
+                                let tasks = storage.load_project_tasks(project_id).unwrap();
+                                let task = tasks.into_iter().find(|t| t.id == task_id).unwrap();
+                                *seen.lock().unwrap() = task.agent_requests[0].used.clone();
+                            },
+                        );
+                    }
+
+                    let reply = fx.open(fx.task_id, id).await;
+                    assert!(reply.ok, "{:?}", reply.error);
+                    let consumed = at_push.lock().unwrap().clone().expect("consumed first");
+                    assert_eq!(consumed.outcome, None);
+                    assert_eq!(
+                        fx.repo.remote_has_branch(BRANCH).as_deref(),
+                        Some(fx.commit.as_str())
+                    );
+
+                    fx.refused(id, "already used").await;
+                    assert_eq!(fx.pr_creates(), 1);
+
+                    // The person's decision and the executing agent are told apart.
+                    let request = fx.saved().await.agent_requests[0].clone();
+                    assert!(request.decision.expect("the person").authorized);
+                    assert_eq!(request.requested_by, "asking-agent");
+                    let used = request.used.expect("the use");
+                    assert_eq!(used.executed_by, "executing-agent");
+                    assert_eq!(
+                        used.outcome,
+                        Some(UseOutcome::PrOpened {
+                            url: PR_URL.to_string()
+                        })
+                    );
+                }
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn two_executions_of_one_authorization_publish_once() {
+                    let fx = fixture().await;
+                    let id = fx.authorized().await;
+                    let (a, b) = tokio::join!(fx.open(fx.task_id, id), fx.open(fx.task_id, id));
+                    assert_ne!(a.ok, b.ok, "{:?} {:?}", a.error, b.error);
+                    assert_eq!(fx.pr_creates(), 1);
+                }
+
+                /// The process ended after consuming the authorization and
+                /// before recording an outcome. What the board holds is what a
+                /// restart loads.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_crash_after_consumption_leaves_nothing_to_use_again() {
+                    let fx = fixture().await;
+                    let id = fx.authorized().await;
+                    fx.amend(|t| {
+                        t.agent_requests[0].used = Some(RequestUse {
+                            executed_by: "executing-agent".to_string(),
+                            started_at: chrono::Utc::now(),
+                            outcome: None,
+                        });
+                    })
+                    .await;
+                    let loaded = fx.saved().await;
+                    fx.state.task.tasks.write().await.insert(fx.task_id, loaded);
+
+                    fx.refused(id, "already used").await;
+                    fx.person(id, true).await.expect("repeating a click is harmless");
+                    fx.refused(id, "already used").await;
+                    fx.nothing_was_published();
+                }
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_branch_that_moves_after_authorization_invalidates_it_for_good() {
+                    let fx = fixture().await;
+                    let id = fx.authorized().await;
+                    fx.commit_on_branch();
+
+                    fx.refused(id, "no longer at the commit").await;
+                    assert!(fx.saved().await.agent_requests[0].invalidated_at.is_some());
+
+                    fx.move_branch(&fx.commit);
+                    fx.refused(id, "no longer valid").await;
+                    fx.nothing_was_published();
+                }
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_branch_that_moves_before_the_decision_cannot_be_approved_by_it() {
+                    let fx = fixture().await;
+                    let id = fx.asked("approve").await;
+                    fx.commit_on_branch();
+
+                    let refusal = fx.person(id, true).await.expect_err("moved");
+                    assert!(refusal.contains("no longer at the commit"), "{refusal}");
+                    let saved = fx.saved().await;
+                    assert!(saved.human_review.entries.is_empty());
+                    assert!(saved.agent_requests[0].decision.is_none());
+                    assert!(saved.agent_requests[0].invalidated_at.is_some());
+                }
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn an_expired_request_or_authorization_is_refused() {
+                    let fx = fixture().await;
+                    let past = chrono::Utc::now() - chrono::Duration::seconds(1);
+                    let id = fx.authorized().await;
+                    fx.amend(move |t| {
+                        t.agent_requests[0].decision.as_mut().unwrap().expires_at = Some(past);
+                    })
+                    .await;
+                    fx.refused(id, "expired").await;
+
+                    // A request nobody decided in time cannot be decided.
+                    let next = fx.asked("open_pr").await;
+                    fx.amend(move |t| t.agent_requests[1].expires_at = past).await;
+                    assert!(fx.person(next, true).await.is_err());
+                    fx.refused(next, "expired").await;
+                    fx.nothing_was_published();
+                }
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn an_authorization_does_not_transfer() {
+                    let fx = fixture().await;
+                    fx.approve_in_panel().await;
+                    let id = fx.asked("open_pr").await;
+                    let other = "89abcdef0123456789abcdef0123456789abcdef";
+                    assert!(
+                        decide(&fx.state, fx.task_id, id, other, true).await.is_err(),
+                        "a decision names the commit that was shown"
+                    );
+                    fx.person(id, true).await.expect("authorized");
+
+                    // Another Task, even one on the same branch and commit.
+                    let mut twin = fx.task().await;
+                    twin.id = Uuid::new_v4();
+                    twin.agent_requests.clear();
+                    let twin_id = twin.id;
+                    fx.state.task.tasks.write().await.insert(twin_id, twin);
+                    let reply = fx.open(twin_id, id).await;
+                    let error = reply.error.unwrap_or_default();
+                    assert!(error.contains("no such request"), "{error}");
+
+                    // The same commit approved again after the Task went back to work.
+                    let commit = fx.commit.clone();
+                    fx.amend(move |t| {
+                        t.human_review.record_arrival();
+                        t.human_review
+                            .approve(Some(commit.clone()), chrono::Utc::now());
+                    })
+                    .await;
+                    fx.refused(id, "no longer valid").await;
+                    fx.nothing_was_published();
+                }
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_headless_instance_files_no_request_and_reads_still_answer() {
+                    let mut fx = fixture().await;
+                    fx.ctx = context(&fx.state, false);
+                    let reply = fx.ask("approve").await;
+                    let error = reply.error.unwrap_or_default();
+                    assert!(error.contains("desktop app"), "{error}");
+
+                    let task_id = fx.task_id.to_string();
+                    let review = fx
+                        .send(IpcRequest::GetReviewState {
+                            task_id: task_id.clone(),
+                        })
+                        .await;
+                    assert!(review.ok, "{:?}", review.error);
+                    assert_eq!(review.data["approval"]["branch_tip"], fx.commit.as_str());
+                    let delivery = fx.send(IpcRequest::GetDeliveryState { task_id }).await;
+                    assert!(delivery.ok, "{:?}", delivery.error);
+                    assert_eq!(delivery.data["pull_request"], serde_json::Value::Null);
+                    assert!(fx.task().await.agent_requests.is_empty());
+                }
+            }
 
             /// `origin` reads as GitHub, as `gh` and the availability check
             /// see it, while pushes still land in the fixture's local bare
@@ -32792,7 +33247,7 @@ esac"#
                     "the lifecycle transition never cancelled the operation"
                 );
 
-                let error = create_pr_reserved(&state, task_id, reservation, None)
+                let error = create_pr_reserved(&state, task_id, reservation, None, None)
                     .await
                     .expect_err("a cancelled operation stops before the push");
                 ender
@@ -32852,7 +33307,7 @@ esac"#
                     });
                 }
 
-                let error = create_pr_reserved(&state, task_id, reservation, None)
+                let error = create_pr_reserved(&state, task_id, reservation, None, None)
                     .await
                     .expect_err("a cancelled operation does not open the pull request");
                 let joined = ender.lock().unwrap().take().expect("the hook ran");
@@ -32916,7 +33371,7 @@ esac"#
                     });
                 }
 
-                let error = create_pr_reserved(&state, task_id, reservation, None)
+                let error = create_pr_reserved(&state, task_id, reservation, None, None)
                     .await
                     .expect_err("a cancelled operation does not open the pull request");
                 let joined = ender.lock().unwrap().take().expect("the hook ran");

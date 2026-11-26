@@ -144,6 +144,19 @@ pub struct IpcContext {
     /// The live queue, when this process runs one, so a terminalization can
     /// tell whether an agent currently owns the task.
     pub executor: Arc<tokio::sync::OnceCell<Arc<crate::queue::TaskExecutor>>>,
+
+    /// The whole application state, which the review and delivery verbs need:
+    /// they answer and act through the same code as the desktop commands.
+    pub app: Option<Arc<dyn AppAccess>>,
+}
+
+/// How the control channel reaches the running instance's application state.
+pub trait AppAccess: Send + Sync {
+    fn state(&self) -> &crate::AppState;
+
+    /// Whether a person can be shown a request here, which only the desktop
+    /// app can do.
+    fn shows_requests_to_a_person(&self) -> bool;
 }
 
 /// The current process's effective user id.

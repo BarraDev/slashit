@@ -54,6 +54,29 @@ pub enum IpcRequest {
     /// inferred from the configured alias. The number of runs described and
     /// the bytes of the answer are bounded by the instance.
     GetTaskEvidence { task_id: String },
+    /// Read one Task's review: decisions, whether the approval still covers the
+    /// branch, and agent requests. Never writes.
+    GetReviewState { task_id: String },
+    /// Read one Task's delivery: its pull request, failures and agent requests
+    /// to open one. Never writes.
+    GetDeliveryState { task_id: String },
+    /// File a request for a person to decide in the desktop app. `operation` is
+    /// `approve` or `open_pr`, `commit` the full object ID it is about, and
+    /// `actor` the name the agent gives itself. Approves, authorizes and
+    /// publishes nothing. There is deliberately no verb that decides one.
+    RequestOperation {
+        task_id: String,
+        operation: String,
+        commit: String,
+        actor: String,
+    },
+    /// Open the pull request a person authorized with request `request_id`.
+    /// The authorization names the commit and is used at most once.
+    OpenPr {
+        task_id: String,
+        request_id: String,
+        actor: String,
+    },
     /// Create a new task
     CreateTask {
         project_id: String,
@@ -154,6 +177,8 @@ impl IpcRequest {
                 | Self::ListTasks { .. }
                 | Self::GetTask { .. }
                 | Self::GetTaskEvidence { .. }
+                | Self::GetReviewState { .. }
+                | Self::GetDeliveryState { .. }
                 | Self::QueueStatus
                 | Self::ListTerminals
                 | Self::Features
@@ -175,8 +200,9 @@ impl IpcRequest {
     /// Verbs that create work a person can run (the agent verbs above, and an
     /// import, whose Tasks can be queued the same way), a preview, which reads
     /// a file at a path the client chooses, and an export, which writes a new
-    /// file at a path the client chooses. Denied to any peer the operating
-    /// system has not identified.
+    /// file at a path the client chooses, a request that puts a decision in
+    /// front of a person, and opening a pull request, which publishes. Denied
+    /// to any peer the operating system has not identified.
     pub fn needs_verified_peer(&self) -> bool {
         self.spawns_agent()
             || matches!(
@@ -186,6 +212,8 @@ impl IpcRequest {
                     | Self::ExportProject { .. }
                     | Self::Quiesce { .. }
                     | Self::Resume { .. }
+                    | Self::RequestOperation { .. }
+                    | Self::OpenPr { .. }
             )
     }
 
@@ -207,6 +235,10 @@ impl IpcRequest {
             Self::ListTasks { .. } => "list_tasks",
             Self::GetTask { .. } => "get_task",
             Self::GetTaskEvidence { .. } => "get_task_evidence",
+            Self::GetReviewState { .. } => "get_review_state",
+            Self::GetDeliveryState { .. } => "get_delivery_state",
+            Self::RequestOperation { .. } => "request_operation",
+            Self::OpenPr { .. } => "open_pr",
             Self::CreateTask { .. } => "create_task",
             Self::MoveTask { .. } => "move_task",
             Self::EditTask { .. } => "edit_task",
@@ -590,6 +622,39 @@ mod tests {
         assert!(!req.is_mutating(), "{} changes nothing", req.verb());
         assert!(!req.spawns_agent());
         assert!(!req.needs_verified_peer());
+    }
+
+    #[test]
+    fn review_and_delivery_verbs_are_classified() {
+        let task_id = String::new();
+        for read in [
+            IpcRequest::GetReviewState { task_id: task_id.clone() },
+            IpcRequest::GetDeliveryState { task_id: task_id.clone() },
+        ] {
+            assert!(!read.is_mutating(), "{} changes nothing", read.verb());
+            assert!(!read.needs_verified_peer());
+        }
+        for write in [
+            IpcRequest::RequestOperation {
+                task_id: task_id.clone(),
+                operation: "open_pr".into(),
+                commit: String::new(),
+                actor: String::new(),
+            },
+            IpcRequest::OpenPr {
+                task_id: task_id.clone(),
+                request_id: String::new(),
+                actor: String::new(),
+            },
+        ] {
+            assert!(write.is_mutating(), "{}", write.verb());
+            assert!(write.needs_verified_peer(), "{}", write.verb());
+        }
+        // No verb records a decision.
+        for cmd in ["approve_task", "approve", "decide_agent_request", "authorize_request"] {
+            let line = format!(r#"{{"cmd":"{cmd}","task_id":"t"}}"#);
+            assert!(serde_json::from_str::<IpcRequest>(&line).is_err(), "{cmd}");
+        }
     }
 
     #[test]
