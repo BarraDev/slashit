@@ -16,12 +16,16 @@ use uuid::Uuid;
 
 use crate::commands::gui_admission::GuiMutation;
 use crate::commands::human_review::{self, PrDelivery};
-use crate::commands::pr::{task_branch_tip, task_branch_tip_read_only, COVERAGE_READ_BOUND};
+use crate::commands::pr::{
+    task_branch_tip, task_branch_tip_read_only, AuthorizedDelivery, PublicationReach,
+    COVERAGE_READ_BOUND,
+};
 use crate::domain::agent_request::{
     check_actor, AgentRequest, HumanDecision, RequestState, RequestUse, RequestedOperation,
     UseOutcome, AUTHORIZATION_LIFETIME_MINUTES, MAX_REQUESTS_PER_TASK,
 };
 use crate::domain::Task;
+use crate::lifecycle::RecordWriteError;
 
 const MOVED: &str = "The branch is no longer at the commit this request names, so nothing was done \
                      and the request is no longer valid. Review the branch and ask again.";
@@ -42,6 +46,18 @@ pub struct AgentRequestView {
 pub struct DecisionOutcome {
     pub task: Task,
     pub request: AgentRequestView,
+}
+
+/// What a board write that returned `error` is told to have done: `unchanged`
+/// when nothing was written, `in_place` when the change is there but could not
+/// be confirmed durable.
+fn write_refusal(error: &str, unchanged: &str, in_place: &str) -> String {
+    let what = if crate::config::says_in_place_but_unconfirmed(error) {
+        in_place
+    } else {
+        unchanged
+    };
+    format!("{what}: {error}")
 }
 
 fn view(task: &Task, request: &AgentRequest, tip: Option<&str>) -> AgentRequestView {
@@ -110,7 +126,14 @@ async fn invalidate(state: &crate::AppState, task_id: Uuid, request_id: Uuid) ->
     .await;
     match saved {
         Ok(_) => MOVED.to_string(),
-        Err(e) => format!("{MOVED} That could not be recorded: {e}"),
+        Err(e) => {
+            let what = write_refusal(
+                &e,
+                "That could not be recorded",
+                "The request is recorded as invalid, but that is not confirmed durable",
+            );
+            format!("{MOVED} {what}")
+        }
     }
 }
 
@@ -199,7 +222,13 @@ pub(crate) async fn create_request(
     let task =
         crate::lifecycle::commit_task_checked(&state.task.tasks, &state.storage, task_id, &revise)
             .await
-            .map_err(|e| format!("The request was not filed: {e}"))?
+            .map_err(|e| {
+                write_refusal(
+                    &e,
+                    "The request was not filed",
+                    "The request is filed, but not confirmed durable. Ask again to get its ID",
+                )
+            })?
             .ok_or("Task not found")?;
     let id = chosen
         .into_inner()
@@ -271,9 +300,25 @@ pub(crate) async fn decide(
         Ok(())
     })
     .await
-    .map_err(|e| format!("The decision was not saved: {e}"))?;
+    .map_err(|e| {
+        write_refusal(
+            &e,
+            "The decision was not saved",
+            "The decision is recorded and in effect, but not confirmed durable",
+        )
+    })?;
     let request = view(&task, find(&task, request_id)?, None);
     Ok(DecisionOutcome { task, request })
+}
+
+/// What spending an authorization did.
+#[derive(Debug)]
+pub(crate) struct Spent {
+    pub outcome: UseOutcome,
+    /// Why the outcome above is not durably on the request, when it is not.
+    pub unrecorded: Option<String>,
+    /// The request afterwards. Absent when the Task could no longer be read.
+    pub request: Option<AgentRequestView>,
 }
 
 /// Spend a person's authorization on opening the pull request it names.
@@ -284,13 +329,13 @@ pub(crate) async fn decide(
 /// means the outcome is unknown; the delivery state says what is on record.
 ///
 /// `Err` means nothing was published by this call. A delivery that was started
-/// and failed is `Ok`, with the failure as the request's outcome.
+/// is `Ok`, whatever became of it and of the record of it.
 pub(crate) async fn open_authorized_pr(
     state: &crate::AppState,
     task_id: Uuid,
     request_id: Uuid,
     actor: &str,
-) -> Result<AgentRequestView, String> {
+) -> Result<Spent, String> {
     check_actor(actor)?;
     // Taken before the checks, as a desktop delivery does: an approval is not
     // renewed, and the Project is not deleted, under a delivery.
@@ -319,14 +364,26 @@ pub(crate) async fn open_authorized_pr(
             Ok(())
         })
         .await
-        .map_err(|e| format!("Nothing was published: {e}"))?;
+        .map_err(|e| {
+            write_refusal(
+                &e,
+                "Nothing was published",
+                "Nothing was published. The authorization is marked used, but that is not \
+                 confirmed durable, so it was not acted on; ask for a new one",
+            )
+        })?;
         commit
     };
 
-    let outcome = match human_review::deliver(state, task_id, Some(&commit)).await {
+    let authorized = AuthorizedDelivery::new(commit);
+    let outcome = match human_review::deliver(state, task_id, Some(&authorized)).await {
         PrDelivery::Created { url } => UseOutcome::PrOpened { url },
         PrDelivery::Failed { reason } | PrDelivery::Unavailable { reason } => {
-            UseOutcome::Failed { reason }
+            match authorized.reach() {
+                PublicationReach::Nothing => UseOutcome::Failed { reason },
+                PublicationReach::PushStarted => UseOutcome::Unconfirmed { reason },
+                PublicationReach::PullRequest(url) => UseOutcome::PrUnsettled { url, reason },
+            }
         }
     };
     let amend = |staged: &mut HashMap<Uuid, Task>| {
@@ -338,11 +395,23 @@ pub(crate) async fn open_authorized_pr(
             used.outcome = Some(outcome.clone());
         }
     };
-    crate::lifecycle::record(&state.task.tasks, &state.storage, task_id, &amend)
+    let unrecorded =
+        crate::lifecycle::record_typed(&state.task.tasks, &state.storage, task_id, &amend)
+            .await
+            .err()
+            .map(|error| match error {
+                RecordWriteError::NotPublished(e) => {
+                    format!("SlashIt could not save this outcome on the request: {e}")
+                }
+                RecordWriteError::PublishedNotDurable(e) => format!(
+                    "The outcome is saved on the request, but not confirmed durable: {e}"
+                ),
+            });
+    let request = current(state, task_id)
         .await
-        .map_err(|e| format!("The delivery ended with {outcome:?}, but that was not saved: {e}"))?;
-    let task = current(state, task_id).await?;
-    Ok(view(&task, find(&task, request_id)?, None))
+        .ok()
+        .and_then(|task| find(&task, request_id).ok().map(|r| view(&task, r, None)));
+    Ok(Spent { outcome, unrecorded, request })
 }
 
 /// Refuses an authorization that cannot be spent, saying why.

@@ -314,7 +314,6 @@ pub fn TaskDrawer(
                     Ok(review) => review,
                     Err(e) => {
                         if current() {
-                            viewed_tip.try_set(None);
                             changes.try_set(Some(Err(e)));
                         }
                         return;
@@ -340,28 +339,37 @@ pub fn TaskDrawer(
                 },
             };
             if current() {
-                viewed_tip.try_set(loaded.as_ref().ok().and_then(|v| v.review.as_ref().map(|r| r.tip.clone())));
                 changes.try_set(Some(loaded));
             }
         });
     };
-    // Drops the picture. While the Changes tab is open it is read again and the
-    // old tip stays the guard until the new picture arrives, so the panel keeps
-    // refusing a commit the person has not seen. With another tab open nothing
-    // is on screen, so there is nothing to guard.
+    // A commit counts as seen only once its diff is on the open Changes tab.
+    Effect::new(move |_| {
+        let on_screen = tab.get() == Tab::Changes;
+        let seen = changes.with(|c| {
+            let loaded = c.as_ref().and_then(|c| c.as_ref().ok());
+            let tip = loaded.and_then(|v| v.review.as_ref().map(|r| r.tip.as_str()));
+            seen_tip(viewed_tip.get_untracked(), on_screen, tip)
+        });
+        if viewed_tip.with_untracked(|v| *v != seen) {
+            viewed_tip.set(seen);
+        }
+    });
+    // Drops the picture, and with it what was seen. While the Changes tab is open
+    // it is read again.
     let invalidate_changes = move || {
+        viewed_tip.set(None);
         changes.set(None);
         if tab.get_untracked() == Tab::Changes {
             load_changes();
         } else {
             generation.update_value(|n| *n += 1);
-            viewed_tip.set(None);
         }
     };
     // The decision panel found the tab out of date. Open the Changes tab on the
-    // branch's current commit. The old commit stays the guard until it loads, so
-    // nothing can be approved on a picture the person has not seen.
+    // branch's current commit. Nothing can be approved until it is on screen.
     let reload_changes = Callback::new(move |()| {
+        viewed_tip.set(None);
         changes.set(None);
         tab.set(Tab::Changes);
         load_changes();
@@ -884,6 +892,18 @@ struct ChangesView {
     review: Option<ReviewChanges>,
 }
 
+/// The commit a person has been shown, given the one seen before, whether the
+/// Changes tab is open, and the commit of the diff that is loaded. A diff that
+/// is still loading, failed, or arrived behind another tab shows nothing.
+fn seen_tip(previous: Option<String>, on_screen: bool, loaded: Option<&str>) -> Option<String> {
+    let loaded = loaded?;
+    if on_screen {
+        Some(loaded.to_string())
+    } else {
+        previous.filter(|seen| seen == loaded)
+    }
+}
+
 /// Names the commit the diff below is, and lists edits the checkout holds that
 /// it does not contain. The person approves the commit, not those edits.
 #[component]
@@ -963,6 +983,19 @@ mod tests {
         .expect("a failed task");
         task.worktree_path = worktree.map(str::to_string);
         task
+    }
+
+    #[test]
+    fn a_commit_is_seen_only_once_its_diff_is_on_the_changes_tab() {
+        let seen = || Some("abc".to_string());
+        // Loading or failed: nothing, whatever was seen before.
+        assert_eq!(seen_tip(seen(), true, None), None);
+        // Loaded behind another tab: not seen until the tab is opened.
+        assert_eq!(seen_tip(None, false, Some("abc")), None);
+        assert_eq!(seen_tip(seen(), false, Some("def")), None);
+        assert_eq!(seen_tip(None, true, Some("abc")), seen());
+        // Switching away afterwards does not unsee it.
+        assert_eq!(seen_tip(seen(), false, Some("abc")), seen());
     }
 
     #[test]

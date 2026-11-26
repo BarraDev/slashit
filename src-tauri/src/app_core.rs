@@ -907,6 +907,9 @@ fn migrate_task(task: &mut Task) -> bool {
         changed = true;
     }
 
+    // Startup recovery above can take a Task out of Human Review.
+    changed |= task.retire_agent_requests_outside_review();
+
     changed
 }
 

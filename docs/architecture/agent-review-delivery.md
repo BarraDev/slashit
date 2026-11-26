@@ -26,7 +26,8 @@ Operation-specific authorization, confirmed by a person, held by the instance.
    the agent gave itself. The person approves or refuses.
 3. For `approve`, the person's decision records the Human Review approval of
    that commit, in the same board write. The agent executes nothing. The
-   Changes tab must be showing that commit before the drawer offers approval.
+   Changes tab must have shown that commit's diff before the drawer offers
+   approval; a diff still loading, or loaded behind another tab, does not count.
 4. For `open-pr`, a person must already have approved exactly that commit. The
    decision authorizes one use within 10 minutes and publishes nothing.
 5. `OpenPr` rechecks the binding and the branch, durably marks the request used,
@@ -42,7 +43,10 @@ replay or move to another Task, commit or operation.
 | Expiry | a request waits 30 minutes; an authorization lasts 10. Repeating a decision does not extend it |
 | Single use | `used` is written before any effect. A failed or interrupted delivery needs a new request and a new decision |
 | Moved branch | refused at decision and at use, and recorded; the branch returning to the commit does not revive the request |
-| Changed Task | leaving the arrival, a different approved commit, or an existing pull request invalidates it |
+| Changed Task | a different approved commit or an existing pull request invalidates it |
+| Left Human Review | the write that moves the Task out retires every undecided request and unused authorization for good; coming back revives none |
+| Outcome | `pr_opened`; `pr_unsettled` (the pull request exists, recording it failed); `unconfirmed` (a push was started, no pull request confirmed); `failed` (nothing was pushed). Only the first is an `ok` reply |
+| Durability | a write that is in place but not confirmed durable says so. A consumption in that state publishes nothing |
 | Restack | a delivery that would restack the branch (a landed parent) is refused, because it publishes another commit; a person opens that one |
 | Retry | asking again for the same operation and commit under the same name returns the open request; one request per operation is open at a time; a refused one is not asked again |
 | Restart | requests, decisions and uses are stored on the Task. A use with no outcome means the outcome is unknown |

@@ -15,7 +15,8 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::commands::pr::{
-    create_pr_for_approved_task, create_pr_for_authorized_commit, pr_availability, PrAvailability,
+    create_pr_for_approved_task, create_pr_for_authorized_commit, pr_availability,
+    AuthorizedDelivery, PrAvailability,
 };
 use crate::commands::task::renumber_column;
 use crate::domain::task::HumanReviewDecision;
@@ -860,9 +861,13 @@ async fn request_changes(
 /// outcome is recorded, so it never reads as needing the user while this
 /// runs, nor as settled before the outcome is on the record.
 ///
-/// `exact` limits the delivery to that commit, for an authorization that names
-/// one.
-pub(crate) async fn deliver(state: &crate::AppState, task_id: Uuid, exact: Option<&str>) -> PrDelivery {
+/// `exact` limits the delivery to the commit an authorization names, and is
+/// told how far the delivery got.
+pub(crate) async fn deliver(
+    state: &crate::AppState,
+    task_id: Uuid,
+    exact: Option<&AuthorizedDelivery>,
+) -> PrDelivery {
     let _in_flight = state.task.deliveries.start(task_id);
     match pr_availability(state, task_id).await {
         Ok(PrAvailability::Available) => {}
@@ -870,7 +875,7 @@ pub(crate) async fn deliver(state: &crate::AppState, task_id: Uuid, exact: Optio
         Err(reason) => return record_pr_failure(state, task_id, reason).await,
     }
     let opened = match exact {
-        Some(commit) => create_pr_for_authorized_commit(state, task_id, commit).await,
+        Some(authorized) => create_pr_for_authorized_commit(state, task_id, authorized).await,
         None => create_pr_for_approved_task(state, task_id).await,
     };
     match opened {

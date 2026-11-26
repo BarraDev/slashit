@@ -564,20 +564,54 @@ pub(crate) async fn create_pr_for_approved_task(
 }
 
 /// [`create_pr_for_approved_task`] for an authorization that names one commit:
-/// refused unless the approval covers exactly `commit`, and refused rather than
-/// restacking, which would publish a rewritten commit.
+/// refused unless the approval covers exactly that commit, and refused rather
+/// than restacking, which would publish a rewritten commit.
 pub(crate) async fn create_pr_for_authorized_commit(
     state: &crate::AppState,
     task_id: Uuid,
-    commit: &str,
+    authorized: &AuthorizedDelivery,
 ) -> Result<String, String> {
-    create_pr_for_approval(state, task_id, Some(commit)).await
+    create_pr_for_approval(state, task_id, Some(authorized)).await
+}
+
+/// A delivery limited to the commit a person authorized, and how far it got,
+/// so that a failure is not mistaken for one that published nothing.
+pub(crate) struct AuthorizedDelivery {
+    pub commit: String,
+    reach: std::sync::Mutex<PublicationReach>,
+}
+
+/// What a delivery may have left on the remote.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum PublicationReach {
+    /// Nothing was sent.
+    #[default]
+    Nothing,
+    /// Git was about to be spawned to push, or later.
+    PushStarted,
+    /// The pull request at this URL carries the delivery; what may still fail
+    /// is recording it.
+    PullRequest(String),
+}
+
+impl AuthorizedDelivery {
+    pub fn new(commit: String) -> Self {
+        Self { commit, reach: Default::default() }
+    }
+
+    pub fn reach(&self) -> PublicationReach {
+        self.reach.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    fn reached(&self, reach: PublicationReach) {
+        *self.reach.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = reach;
+    }
 }
 
 async fn create_pr_for_approval(
     state: &crate::AppState,
     task_id: Uuid,
-    exact: Option<&str>,
+    exact: Option<&AuthorizedDelivery>,
 ) -> Result<String, String> {
     let reservation = {
         let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
@@ -599,7 +633,7 @@ async fn create_pr_for_approval(
         // The approval covers one commit. Refused here, before reserving ends
         // whatever owns the task, when the branch is no longer at it.
         let covered = approved_commit_for_delivery(state, task_id).await?;
-        if exact.is_some() && covered.as_deref() != exact {
+        if exact.is_some_and(|a| covered.as_deref() != Some(a.commit.as_str())) {
             return Err(NOT_THE_AUTHORIZED_COMMIT.to_string());
         }
         // One delivery per task: work being integrated into a local branch,
@@ -6561,6 +6595,7 @@ async fn remote_branch_relation(
 /// - The push is pinned to `tip` by object ID, and [`push_branch_pinned`]
 ///   refuses a branch that moved. A remote branch with commits this task does
 ///   not have is refused by git and reported with [`explain_refused_publication`].
+#[allow(clippy::too_many_arguments)]
 async fn publish_approved_to_existing_pr(
     state: &crate::AppState,
     task_id: Uuid,
@@ -6569,6 +6604,7 @@ async fn publish_approved_to_existing_pr(
     tip: &str,
     pr_url: &str,
     reservation: &Option<crate::queue::PrHelperLease>,
+    exact: Option<&AuthorizedDelivery>,
 ) -> Result<(), String> {
     refuse_if_pr_operation_cancelled(reservation, "pushing the branch")?;
     refuse_unless_still_approved(state, task_id).await?;
@@ -6592,7 +6628,11 @@ async fn publish_approved_to_existing_pr(
     // again by the gate, just before git is spawned.
     push_branch_pinned_gated(working_dir, branch, Some(tip), &|| {
         refuse_unless_still_approved_now(state, task_id)?;
-        refuse_if_pr_operation_cancelled(reservation, "pushing the branch")
+        refuse_if_pr_operation_cancelled(reservation, "pushing the branch")?;
+        if let Some(authorized) = exact {
+            authorized.reached(PublicationReach::PushStarted);
+        }
+        Ok(())
     })
     .await
     .map(|_| ())
@@ -6815,7 +6855,7 @@ async fn create_pr_reserved(
     task_uuid: Uuid,
     reservation: Option<crate::queue::PrHelperLease>,
     reauthored_tip: Option<String>,
-    exact: Option<&str>,
+    exact: Option<&AuthorizedDelivery>,
 ) -> Result<String, String> {
     // Repository-level, not task-workspace: every command below names its
     // branch explicitly (the task's recorded `branch_name`, never the
@@ -6886,7 +6926,7 @@ async fn create_pr_reserved(
     // restack below replays it and publishes a rewritten tip, but the approval
     // keeps naming this one, and it is what the later re-check compares.
     let admitted_tip = publish_tip.clone();
-    if exact.is_some() && publish_tip.as_deref() != exact {
+    if exact.is_some_and(|a| publish_tip.as_deref() != Some(a.commit.as_str())) {
         return Err(NOT_THE_AUTHORIZED_COMMIT.to_string());
     }
 
@@ -6906,8 +6946,12 @@ async fn create_pr_reserved(
                 tip,
                 &existing_pr_url,
                 &reservation,
+                exact,
             )
             .await?;
+        }
+        if let Some(authorized) = exact {
+            authorized.reached(PublicationReach::PullRequest(existing_pr_url.clone()));
         }
         // Classified rather than flattened. A cleanup this refused is a task that
         // is simply not finished, and the refusal is already persisted onto its
@@ -7017,6 +7061,9 @@ async fn create_pr_reserved(
             }
             refuse_if_pr_operation_cancelled(&reservation, "pushing the branch")?;
             push_started.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(authorized) = exact {
+                authorized.reached(PublicationReach::PushStarted);
+            }
             Ok(())
         },
     )
@@ -7033,6 +7080,9 @@ async fn create_pr_reserved(
         .await
         .map_err(|e| format!("{branch} is on the remote at {commit}, but {e}"))?;
     if let Some(existing_pr_url) = existing {
+        if let Some(authorized) = exact {
+            authorized.reached(PublicationReach::PullRequest(existing_pr_url.clone()));
+        }
         // Classified rather than flattened. A cleanup this refused is a task that
         // is simply not finished, and the refusal is already persisted onto its
         // card as `error_message`; the pull request is real either way and the
@@ -7112,6 +7162,9 @@ async fn create_pr_reserved(
         }
     };
 
+    if let Some(authorized) = exact {
+        authorized.reached(PublicationReach::PullRequest(pr_url.clone()));
+    }
     // Classified rather than flattened. A cleanup this refused is a task that
     // is simply not finished, and the refusal is already persisted onto its
     // card as `error_message`; the pull request is real either way and the
@@ -9188,6 +9241,16 @@ fn classify_terminalization(refusal: &crate::lifecycle::TerminalizeRefusal) -> P
 /// rather than open a second one.
 fn pr_link_error(failure: &PrLinkFailure, pr_url: &str) -> Option<String> {
     match failure {
+        // A write that replaced the board and could not be confirmed durable
+        // is recorded: saying it was not would be false.
+        PrLinkFailure::NotRecorded(reason) | PrLinkFailure::TerminalStateNotRecorded(reason)
+            if crate::config::says_in_place_but_unconfirmed(reason) =>
+        {
+            Some(format!(
+                "Pull request is at {pr_url}. SlashIt's record of it is saved but not confirmed \
+                 durable: {reason}"
+            ))
+        }
         PrLinkFailure::NotRecorded(reason) => Some(format!(
             "Pull request is at {pr_url}, but SlashIt could not record it on the task: {reason}"
         )),
@@ -15588,7 +15651,6 @@ mod tests {
                 }
 
                 struct Fx {
-                    _guard: tokio::sync::MutexGuard<'static, ()>,
                     repo: RepoFixture,
                     mock: MockGh,
                     state: Arc<crate::AppState>,
@@ -15596,6 +15658,9 @@ mod tests {
                     ctx: IpcContext,
                     task_id: Uuid,
                     commit: String,
+                    // Last, so it is dropped last: `mock` restores `PATH`
+                    // while the lock is still held.
+                    _guard: tokio::sync::MutexGuard<'static, ()>,
                 }
 
                 fn context(state: &Arc<crate::AppState>, desktop: bool) -> IpcContext {
@@ -15948,6 +16013,174 @@ mod tests {
                     })
                     .await;
                     fx.refused(id, "no longer valid").await;
+                    fx.nothing_was_published();
+                }
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn leaving_human_review_retires_requests_a_return_cannot_revive() {
+                    let fx = fixture().await;
+                    // Undecided: an approval nobody answered.
+                    let undecided = fx.asked("approve").await;
+                    fx.amend(|t| t.status = TaskStatus::Backlog).await;
+                    assert!(fx.saved().await.agent_requests[0].invalidated_at.is_some());
+                    fx.amend(|t| t.status = TaskStatus::HumanReview).await;
+                    assert!(fx.person(undecided, true).await.is_err());
+                    assert!(fx.saved().await.human_review.entries.is_empty());
+
+                    // Authorized and unused.
+                    let authorized = fx.authorized().await;
+                    fx.amend(|t| t.status = TaskStatus::Backlog).await;
+                    fx.amend(|t| t.status = TaskStatus::HumanReview).await;
+                    fx.refused(authorized, "no longer valid").await;
+                    fx.nothing_was_published();
+                }
+
+                /// Makes one later board write of this thread fail at `stage`,
+                /// counting from the first write after `gh` is asked to open
+                /// the pull request: `skip` writes are let through.
+                fn fail_after_pr_create(fx: &Fx, stage: slashit_durable_fs::Stage, skip: u32) {
+                    crate::commands::pr::after_slug_hook::arm(
+                        fx.repo.checkout.to_str().unwrap(),
+                        move || {
+                            // Fires once; dropping the guard would disarm it.
+                            std::mem::forget(slashit_durable_fs::fault::fail_after(
+                                stage,
+                                std::io::ErrorKind::Other,
+                                skip,
+                            ));
+                        },
+                    );
+                }
+
+                async fn used_outcome(fx: &Fx) -> UseOutcome {
+                    let request = fx.task().await.agent_requests[0].clone();
+                    request.used.expect("used").outcome.expect("an outcome")
+                }
+
+                // The fault injection is per thread, so these run on one.
+                #[tokio::test]
+                async fn a_pull_request_that_could_not_be_recorded_is_reported_as_open() {
+                    let fx = fixture().await;
+                    let id = fx.authorized().await;
+                    fail_after_pr_create(&fx, slashit_durable_fs::Stage::Replace, 0);
+
+                    let reply = fx.open(fx.task_id, id).await;
+                    let error = reply.error.unwrap_or_default();
+                    assert!(!reply.ok);
+                    assert!(error.contains("The pull request is at"), "{error}");
+                    assert!(error.contains("could not record it"), "{error}");
+                    assert!(!error.contains("nothing was pushed"), "{error}");
+                    assert!(matches!(
+                        used_outcome(&fx).await,
+                        UseOutcome::PrUnsettled { url, .. } if url == PR_URL
+                    ));
+                    fx.refused(id, "already used").await;
+
+                    // A new authorization does not open a second pull request:
+                    // the request left unconfirmed on the Task blocks it.
+                    let next = fx.asked("open_pr").await;
+                    fx.person(next, true).await.expect("authorized");
+                    assert!(!fx.open(fx.task_id, next).await.ok);
+                    assert_eq!(fx.pr_creates(), 1);
+                }
+
+                #[tokio::test]
+                async fn a_pull_request_link_not_confirmed_durable_says_it_is_saved() {
+                    let fx = fixture().await;
+                    let id = fx.authorized().await;
+                    fail_after_pr_create(&fx, slashit_durable_fs::Stage::SyncDirectory, 0);
+
+                    let reply = fx.open(fx.task_id, id).await;
+                    let error = reply.error.unwrap_or_default();
+                    assert!(error.contains("saved but not confirmed durable"), "{error}");
+                    assert!(!error.contains("could not record it"), "{error}");
+                    assert_eq!(fx.saved().await.authoritative_pr_url(), Some(PR_URL));
+                    assert!(matches!(used_outcome(&fx).await, UseOutcome::PrUnsettled { .. }));
+                    fx.refused(id, "already used").await;
+                }
+
+                #[tokio::test]
+                async fn an_outcome_that_cannot_be_saved_still_reports_the_pull_request() {
+                    for (stage, says) in [
+                        (slashit_durable_fs::Stage::Replace, "could not save this outcome"),
+                        (
+                            slashit_durable_fs::Stage::SyncDirectory,
+                            "saved on the request, but not confirmed durable",
+                        ),
+                    ] {
+                        let fx = fixture().await;
+                        let id = fx.authorized().await;
+                        // After the link and the cleared delivery error.
+                        fail_after_pr_create(&fx, stage, 2);
+
+                        let reply = fx.open(fx.task_id, id).await;
+                        let error = reply.error.unwrap_or_default();
+                        assert!(error.contains("was opened at"), "{error}");
+                        assert!(error.contains(says), "{error}");
+                        fx.refused(id, "").await;
+                        assert_eq!(fx.pr_creates(), 1);
+                    }
+                }
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_failure_says_whether_a_push_was_started() {
+                    // The approval is withdrawn before git is spawned.
+                    let fx = fixture().await;
+                    let id = fx.authorized().await;
+                    let (state, task_id) = (fx.state.clone(), fx.task_id);
+                    crate::commands::pr::before_gate_hook::arm(
+                        fx.repo.checkout.to_str().unwrap(),
+                        move || {
+                            let mut tasks = state.task.tasks.try_write().expect("unlocked");
+                            tasks.get_mut(&task_id).unwrap().human_review.record_arrival();
+                        },
+                    );
+                    let error = fx.open(fx.task_id, id).await.error.unwrap_or_default();
+                    assert!(error.contains("nothing was pushed"), "{error}");
+                    assert!(matches!(used_outcome(&fx).await, UseOutcome::Failed { .. }));
+                    fx.nothing_was_published();
+                    drop(fx);
+
+                    // Git is spawned and the push fails.
+                    let fx = fixture().await;
+                    let id = fx.authorized().await;
+                    let checkout = fx.repo.checkout.clone();
+                    crate::commands::pr::before_gate_hook::arm(
+                        fx.repo.checkout.to_str().unwrap(),
+                        move || {
+                            git(&checkout, &["remote", "set-url", "--push", "origin", "/nowhere"]);
+                        },
+                    );
+                    let error = fx.open(fx.task_id, id).await.error.unwrap_or_default();
+                    assert!(error.contains("a push was started"), "{error}");
+                    assert!(matches!(used_outcome(&fx).await, UseOutcome::Unconfirmed { .. }));
+                }
+
+                #[tokio::test]
+                async fn writes_not_confirmed_durable_say_the_change_is_in_place() {
+                    use slashit_durable_fs::{fault, Stage};
+                    let fx = fixture().await;
+                    fx.approve_in_panel().await;
+                    let unsynced = || fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
+
+                    let guard = unsynced();
+                    let error = fx.ask("open_pr").await.error.unwrap_or_default();
+                    drop(guard);
+                    assert!(error.contains("is filed, but not confirmed durable"), "{error}");
+                    let id = fx.asked("open_pr").await;
+                    assert_eq!(fx.task().await.agent_requests.len(), 1);
+
+                    let guard = unsynced();
+                    let error = fx.person(id, true).await.expect_err("unconfirmed");
+                    drop(guard);
+                    assert!(error.contains("recorded and in effect"), "{error}");
+
+                    // A consumption that may not survive publishes nothing.
+                    let guard = unsynced();
+                    let error = fx.open(fx.task_id, id).await.error.unwrap_or_default();
+                    drop(guard);
+                    assert!(error.contains("marked used"), "{error}");
+                    fx.refused(id, "already used").await;
                     fx.nothing_was_published();
                 }
 
@@ -16621,6 +16854,7 @@ mod tests {
                     &sha,
                     PR_URL,
                     &None,
+                    None,
                 )
                 .await
                 .err()

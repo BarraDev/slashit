@@ -396,18 +396,38 @@ async fn handle_open_pr(
         return IpcResponse::error("Invalid request_id: expected a UUID");
     };
     match crate::commands::agent_requests::open_authorized_pr(state, id, request_id, &actor).await {
-        // A delivery that ran and failed is a failure to the caller, who must
-        // not read an `ok` reply as a pull request.
-        Ok(view) => match view.request.used.as_ref().and_then(|u| u.outcome.as_ref()) {
-            Some(crate::domain::agent_request::UseOutcome::Failed { reason }) => {
-                IpcResponse::error(format!(
-                    "The pull request was not opened, and this authorization is used up: {reason}"
-                ))
-            }
-            _ => json_reply(Ok(view)),
-        },
+        Ok(spent) => open_pr_reply(spent),
         Err(e) => IpcResponse::error(e),
     }
+}
+
+/// `ok` only for a pull request that is open and on record. Every other answer
+/// is an error that says how far publication got, so that a caller does not
+/// read a lost record as nothing published.
+fn open_pr_reply(spent: crate::commands::agent_requests::Spent) -> IpcResponse {
+    use crate::domain::agent_request::UseOutcome;
+    let message = match &spent.outcome {
+        UseOutcome::PrOpened { url } => match (&spent.unrecorded, spent.request) {
+            (None, Some(view)) => return json_reply(Ok(view)),
+            _ => format!("The pull request was opened at {url}. Do not open it again."),
+        },
+        UseOutcome::PrUnsettled { url, reason } => format!(
+            "The pull request is at {url}, but SlashIt could not finish recording it. Do not \
+             open it again: {reason}"
+        ),
+        UseOutcome::Unconfirmed { reason } => format!(
+            "No pull request is confirmed, but a push was started, so the branch or a pull \
+             request may be on GitHub. Check there and the delivery state before asking again: \
+             {reason}"
+        ),
+        UseOutcome::Failed { reason } => format!(
+            "The pull request was not opened, and nothing was pushed by this request: {reason}"
+        ),
+    };
+    let unrecorded = spent.unrecorded.map(|why| format!(" {why}")).unwrap_or_default();
+    IpcResponse::error(format!(
+        "{message} This authorization is used up.{unrecorded}"
+    ))
 }
 
 // --- Task execution evidence -------------------------------------------------

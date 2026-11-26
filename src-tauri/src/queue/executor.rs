@@ -7257,6 +7257,7 @@ impl TaskExecutor {
         let stopped = {
             let mut stopped = task.clone();
             stopped.status = TaskStatus::Backlog;
+            stopped.retire_agent_requests_outside_review();
             stopped.reset_execution_state();
             if let Some(tools) = tools {
                 tools.apply_to(&mut stopped);

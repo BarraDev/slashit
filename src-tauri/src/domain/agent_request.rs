@@ -63,6 +63,13 @@ pub struct HumanDecision {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum UseOutcome {
     PrOpened { url: String },
+    /// The pull request is at `url`, but the delivery could not finish
+    /// recording that on the Task. `reason` says what is and is not on record.
+    PrUnsettled { url: String, reason: String },
+    /// A push was started and no pull request is confirmed: the branch, and
+    /// possibly a pull request, may be on GitHub.
+    Unconfirmed { reason: String },
+    /// Refused or failed before anything was sent to the remote by this use.
     Failed { reason: String },
 }
 
@@ -179,6 +186,16 @@ impl AgentRequest {
         }
     }
 
+    /// Whether a person could still decide it, or an authorization it holds
+    /// could still be spent, going by the record alone.
+    fn is_outstanding(&self) -> bool {
+        self.used.is_none()
+            && self.invalidated_at.is_none()
+            && self.decision.as_ref().is_none_or(|d| {
+                d.authorized && self.operation == RequestedOperation::OpenPr
+            })
+    }
+
     /// Where the request stands at `now`. `branch_tip` is the branch commit
     /// when the caller read it.
     pub fn state(&self, task: &Task, branch_tip: Option<&str>, now: DateTime<Utc>) -> RequestState {
@@ -212,6 +229,26 @@ impl AgentRequest {
         } else {
             RequestState::Pending
         }
+    }
+}
+
+impl Task {
+    /// Retire every outstanding request of a Task that is not in Human Review,
+    /// answering whether it had any. It is recorded, not derived, so a return
+    /// to Human Review (a manual move records no new arrival) revives none.
+    ///
+    /// Applied by the write that persists the departure.
+    pub fn retire_agent_requests_outside_review(&mut self) -> bool {
+        if self.status == TaskStatus::HumanReview {
+            return false;
+        }
+        let now = Utc::now();
+        let mut retired = false;
+        for request in self.agent_requests.iter_mut().filter(|r| r.is_outstanding()) {
+            request.invalidated_at = Some(now);
+            retired = true;
+        }
+        retired
     }
 }
 
@@ -302,6 +339,48 @@ mod tests {
         // Seen moved once, it stays invalid even when the branch comes back.
         request.invalidated_at = Some(now);
         assert_eq!(request.state(&task, Some(COMMIT), now), RequestState::Invalidated);
+    }
+
+    #[test]
+    fn leaving_human_review_retires_outstanding_requests_for_good() {
+        let mut task = approved_task();
+        let now = Utc::now();
+        let pending = open_pr_request(&task, now);
+        let mut authorized = open_pr_request(&task, now);
+        authorize(&mut authorized, now);
+        let mut spent = authorized.clone();
+        spent.used = Some(RequestUse {
+            executed_by: "agent".to_string(),
+            started_at: now,
+            outcome: None,
+        });
+        let mut refused = pending.clone();
+        refused.decision = Some(HumanDecision {
+            authorized: false,
+            decided_at: now,
+            expires_at: None,
+        });
+        task.agent_requests = vec![pending, authorized, spent, refused];
+        assert!(!task.retire_agent_requests_outside_review(), "still in review");
+
+        task.status = TaskStatus::Backlog;
+        assert!(task.retire_agent_requests_outside_review());
+        task.status = TaskStatus::HumanReview;
+
+        let states: Vec<_> = task
+            .agent_requests
+            .iter()
+            .map(|r| r.state(&task, Some(COMMIT), now))
+            .collect();
+        assert_eq!(
+            states,
+            [
+                RequestState::Invalidated,
+                RequestState::Invalidated,
+                RequestState::Used,
+                RequestState::Refused
+            ]
+        );
     }
 
     #[test]
