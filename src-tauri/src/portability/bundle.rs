@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::domain::{
-    AgentType, CodingProvider, ExternalRef, HumanReviewDecision, HumanReviewEntry, ProjectBase,
+    AgentType, BaseSync, CodingProvider, ExternalRef, HumanReviewDecision, HumanReviewEntry, ProjectBase,
     QaSignoff, RemoteType, ReviewMode, SecuritySeverity, Subtask, TaskCategory, TaskComplexity,
     TaskImpact, TaskPriority, TaskStatus,
 };
@@ -137,6 +137,14 @@ pub struct PortableProject {
     /// The local branch new Tasks start from, as a name. Not a commit and not
     /// a path: the importing repository must have a branch of this name.
     pub base: Option<ProjectBase>,
+    /// Whether new Tasks start from origin's default branch fetched just
+    /// before, or from the local base revision. Written only when it is not
+    /// the local base revision, so a bundle of a Project that never chose it
+    /// is the same bytes as before the field existed, and a bundle written
+    /// before it imports as the local base revision, as such a Project
+    /// behaved.
+    #[serde(default, skip_serializing_if = "BaseSync::is_local")]
+    pub base_sync: BaseSync,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

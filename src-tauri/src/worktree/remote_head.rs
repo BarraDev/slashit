@@ -156,16 +156,48 @@ fn explain_failure(stderr: &str) -> String {
 ///
 /// Run for a project whose new Task Checkouts start from the latest remote
 /// base (`domain::BaseSync::FetchRemote`), just before the base is resolved.
-/// The refspec is spelled out, so no other remote-tracking ref, no tag and
-/// no local branch is touched, and nothing is pushed. Bounded like
+/// The refspec is spelled out and `--refmap=` is empty, so the fetch
+/// mappings configured for origin (`remote.origin.fetch`, which may map
+/// origin's branches onto local ones) play no part: no other ref, no tag and
+/// no local branch is touched, nothing is pruned, and nothing is pushed. The
+/// caller has already checked that the destination is not a symbolic ref,
+/// which git would follow to wherever it points. Bounded like
 /// [`detect_default_branch`], and never waits on a credential prompt.
 /// `branch` must already have passed [`super::checked_task_branch`].
+///
+/// Two task starts of one project may fetch the same branch at once. Git
+/// then refuses whichever loses the race for the ref's lock, which is not a
+/// failure to reach origin, so that fetch is run again, a bounded number of
+/// times.
 pub(super) async fn fetch_origin_branch(repo: &Path, branch: &str) -> Result<String, String> {
     let tracking = format!("refs/remotes/origin/{branch}");
     let refspec = format!("+refs/heads/{branch}:{tracking}");
+    let mut attempt = 1;
+    loop {
+        match fetch_once(repo, &refspec).await? {
+            Ok(()) => break,
+            Err(stderr) if attempt < FETCH_ATTEMPTS && lost_a_ref_lock(&stderr) => attempt += 1,
+            Err(stderr) => return Err(format!("git fetch origin {branch} failed: {stderr}")),
+        }
+    }
+    super::restack::exact_ref(repo, &tracking)
+        .await?
+        .ok_or_else(|| format!("{tracking} does not exist after fetching {branch} from origin"))
+}
+
+/// How many times [`fetch_origin_branch`] runs a fetch that lost a ref lock.
+const FETCH_ATTEMPTS: u32 = 3;
+
+/// The arguments of the one fetch [`fetch_origin_branch`] runs.
+fn fetch_args(refspec: &str) -> [&str; 7] {
+    ["fetch", "--no-tags", "--no-prune", "--refmap=", "--quiet", "origin", refspec]
+}
+
+/// One `git fetch` of `refspec`: `Ok(Err(stderr))` when git ran and failed.
+async fn fetch_once(repo: &Path, refspec: &str) -> Result<Result<(), String>, String> {
     let mut command = crate::host_process::tokio_command("git");
     command
-        .args(["fetch", "--no-tags", "--quiet", "origin", &refspec])
+        .args(fetch_args(refspec))
         .current_dir(repo)
         .stdin(std::process::Stdio::null())
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -176,15 +208,17 @@ pub(super) async fn fetch_origin_branch(repo: &Path, branch: &str) -> Result<Str
         .await
         .map_err(|_| format!("origin did not answer within {} seconds", REMOTE_DEADLINE.as_secs()))?
         .map_err(|e| format!("Failed to run git fetch: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "git fetch origin {branch} failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    super::restack::exact_ref(repo, &tracking)
-        .await?
-        .ok_or_else(|| format!("{tracking} does not exist after fetching {branch} from origin"))
+    Ok(if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    })
+}
+
+/// Whether a failed fetch failed only because another `git` held, or had
+/// just moved, the ref it was updating.
+fn lost_a_ref_lock(stderr: &str) -> bool {
+    stderr.contains("cannot lock ref")
 }
 
 #[cfg(test)]

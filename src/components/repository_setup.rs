@@ -96,12 +96,18 @@ pub fn RepositorySetup(project_id: String) -> impl IntoView {
             let answer = set_project_base_sync(id, fetch_remote).await;
             if answer.is_ok() {
                 toast::success(if fetch_remote {
-                    "Each new task will fetch origin's default branch first and start from it. If the fetch fails, the task is not started.".to_string()
+                    "Each new task will fetch origin's default branch first and start from origin's revision; unpushed local commits are not included. If the fetch fails, the task is not started.".to_string()
                 } else {
                     "New tasks will start from the repository's branches as they are, without fetching.".to_string()
                 });
             }
+            let refused = answer.is_err();
             apply(answer);
+            if refused {
+                // The checkbox already shows the click. Nothing was saved, so
+                // it is drawn again from the saved choice.
+                readiness.update(|_| {});
+            }
         });
     };
     let detect = move |_| {
@@ -138,6 +144,7 @@ pub fn RepositorySetup(project_id: String) -> impl IntoView {
             {move || readiness.get().map(|r| {
                 let ready = r.base.clone();
                 let blocked = r.blocked.clone();
+                let pending_fetch = r.pending_fetch.clone();
                 view! {
                     <div class="space-y-4">
                         <div class="p-4 rounded-xl bg-white/5 border border-white/10">
@@ -158,7 +165,7 @@ pub fn RepositorySetup(project_id: String) -> impl IntoView {
                                 (Some(base), _) => view! {
                                     <p class="text-sm text-green-400" data-testid="repository-ready">
                                         {match base.source {
-                                            BaseSource::Remote if r.base_sync == BaseSync::FetchRemote => format!("Ready. Each new task fetches origin's default branch {} first and starts from the commit that fetch brings (last fetched: {}).", base.branch, short(&base.commit)),
+                                            BaseSource::Remote if r.base_sync == BaseSync::FetchRemote => format!("Ready. Each new task fetches origin's default branch {} first and starts from the commit that fetch brings (last fetched: {}), not from unpushed local commits.", base.branch, short(&base.commit)),
                                             BaseSource::Remote => format!("Ready. New tasks start from origin's default branch {} ({}).", base.branch, short(&base.commit)),
                                             BaseSource::Local if r.prefers_local => format!("Ready. New tasks start from the local branch {} ({}), as you chose. Origin is not consulted.", base.branch, short(&base.commit)),
                                             BaseSource::Local => format!("Ready. New tasks start from the local branch {} ({}).", base.branch, short(&base.commit)),
@@ -168,7 +175,14 @@ pub fn RepositorySetup(project_id: String) -> impl IntoView {
                                 (None, Some(why)) => view! {
                                     <p class="text-sm text-amber-400" data-testid="repository-blocked">{why}</p>
                                 }.into_any(),
-                                (None, None) => ().into_any(),
+                                (None, None) => match pending_fetch {
+                                    Some(branch) => view! {
+                                        <p class="text-sm text-sky-400" data-testid="repository-pending-fetch">
+                                            {format!("Ready, pending synchronization. Origin's default branch {branch} has not been fetched here yet; the next new task fetches it first and starts from the commit that fetch brings. If the fetch fails, the task is not started.")}
+                                        </p>
+                                    }.into_any(),
+                                    None => ().into_any(),
+                                },
                             }}
                         </div>
 
@@ -252,7 +266,7 @@ pub fn RepositorySetup(project_id: String) -> impl IntoView {
                                                             prop:checked=fetches
                                                             disabled=move || busy.get()
                                                             on:change=move |_| choose_sync(!fetches) />
-                                                        <span>"Fetch origin's default branch before each new task and start from the latest remote base. A failed fetch stops the task instead of starting it elsewhere. Existing task checkouts are never moved."</span>
+                                                        <span>"Fetch origin's default branch before each new task and start from the latest remote base. The task starts from origin's revision as fetched, so commits on your local branches that you have not pushed are not in it. A failed fetch stops the task instead of starting it elsewhere. Your local branches and existing task checkouts are never moved."</span>
                                                     </label>
                                                 }
                                             })}

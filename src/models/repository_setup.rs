@@ -127,6 +127,10 @@ pub struct Readiness {
     /// just before, or from the refs as they are.
     #[serde(default)]
     pub base_sync: BaseSync,
+    /// Under the latest remote base: origin's default branch, not fetched
+    /// yet. Pending synchronization, not blocked: the next task fetches it.
+    #[serde(default)]
+    pub pending_fetch: Option<String>,
     #[serde(default)]
     pub standing: Option<BaseStanding>,
     pub base: Option<ResolvedBase>,

@@ -200,7 +200,8 @@ async fn resolve_latest_remote_base(repo_path: &str, fetch: bool) -> Result<Reso
         return Err(refused);
     }
     let branch = configured_origin_branch(repo, repo_path).await?;
-    let fetched = if fetch {
+    let found = if fetch {
+        refuse_a_symbolic_tracking_ref(repo, repo_path, &branch).await?;
         let fetched = super::remote_head::fetch_origin_branch(repo, &branch).await.map_err(|e| {
             format!(
                 "This project starts new tasks from the latest {branch}@origin, but fetching \
@@ -210,11 +211,21 @@ async fn resolve_latest_remote_base(repo_path: &str, fetch: bool) -> Result<Reso
                  then start the task again."
             )
         })?;
-        Some(fetched)
+        // The commit this fetch left in the ref is checked as it is, not
+        // read from the ref again: another start of the same project may
+        // fetch and move the ref meanwhile, and either commit is one origin
+        // had, but the task must start at the one checked here.
+        match checked_commit(repo, &fetched).await? {
+            Found::Commit(commit) => {
+                OriginBranch::Found(ResolvedBase { branch: branch.clone(), commit, source: BaseSource::Remote })
+            }
+            Found::Missing => OriginBranch::Missing,
+            Found::Unusable(why) => OriginBranch::Unusable(why),
+        }
     } else {
-        None
+        at_origin_branch(repo, &branch).await?
     };
-    let base = match at_origin_branch(repo, &branch).await? {
+    let base = match found {
         OriginBranch::Found(base) => base,
         OriginBranch::Missing => {
             return Err(format!(
@@ -229,17 +240,49 @@ async fn resolve_latest_remote_base(repo_path: &str, fetch: bool) -> Result<Reso
             ))
         }
     };
-    if let Some(fetched) = fetched {
-        if base.commit != fetched {
-            return Err(format!(
-                "{ORIGIN_BRANCHES}{branch} in {repo_path} moved while it was being read after \
-                 the fetch, so SlashIt cannot tell which commit the task would start from. \
-                 Start the task again."
-            ));
-        }
-    }
     refuse_if_local_integration_is_ahead(repo, repo_path, &base).await?;
     Ok(base)
+}
+
+/// Refuse to fetch into `refs/remotes/origin/<branch>` when it is a symbolic
+/// ref: git would follow it and move the ref it points at, which may be a
+/// local branch holding unpublished work. An absent ref is created by the
+/// fetch; a ref naming an object directly is moved.
+async fn refuse_a_symbolic_tracking_ref(repo: &Path, repo_path: &str, branch: &str) -> Result<(), String> {
+    let tracking = format!("{ORIGIN_BRANCHES}{branch}");
+    // `symbolic-ref` answers for a symbolic ref whether or not its target
+    // exists, and fails for a ref that is absent or names an object.
+    let target = vcs::git_stdout(repo, &["symbolic-ref", "--quiet", &tracking]).await.ok();
+    match target {
+        None => Ok(()),
+        Some(target) => Err(format!(
+            "This project starts new tasks from the latest {branch}@origin, but {tracking} in \
+             {repo_path} is a symbolic ref to {target}, and fetching into it would move \
+             {target} instead. Nothing was fetched, the task was not started and no other base \
+             was used in its place. Delete the symbolic ref (`git symbolic-ref --delete \
+             {tracking}`), then start the task again."
+        )),
+    }
+}
+
+/// Whether the project's latest remote base is only waiting for its first
+/// fetch: origin names its default branch, but `refs/remotes/origin/<D>`
+/// has not been fetched yet. Returns `D` then. A task can still start: its
+/// start fetches the branch. Reads local configuration and refs only.
+pub async fn remote_base_awaiting_fetch(repo_path: &str) -> Result<Option<String>, String> {
+    let repo = Path::new(repo_path);
+    if vcs::detect(repo).await?.refusal(repo_path).is_some() {
+        return Ok(None);
+    }
+    let Ok(branch) = configured_origin_branch(repo, repo_path).await else {
+        return Ok(None);
+    };
+    let tracking = format!("{ORIGIN_BRANCHES}{branch}");
+    if vcs::git_stdout(repo, &["symbolic-ref", "--quiet", &tracking]).await.is_ok() {
+        // A symbolic destination refuses the fetch: that is not pending.
+        return Ok(None);
+    }
+    Ok(matches!(at_origin_branch(repo, &branch).await?, OriginBranch::Missing).then_some(branch))
 }
 
 /// Whether a project can use the latest remote base at all: the folder holds
@@ -520,6 +563,13 @@ async fn at_branch(repo: &Path, prefix: &str, branch: &str) -> Result<Found, Str
     let Some(commit) = exact_ref(repo, &refname).await? else {
         return Ok(Found::Missing);
     };
+    checked_commit(repo, &commit).await
+}
+
+/// Whether the object ID `commit` a ref held is a base: a commit object the
+/// repository has.
+async fn checked_commit(repo: &Path, commit: &str) -> Result<Found, String> {
+    let commit = commit.to_string();
     if !has_commit(repo, &commit).await? {
         return Ok(Found::Unusable("names a commit this repository does not have"));
     }
@@ -1253,6 +1303,86 @@ mod tests {
         let base = resolve_new_task_base(path, Some(&preferring("trunk")), BaseSync::Local).await.unwrap();
         assert_eq!((base.commit.as_str(), base.source), (local_tip.as_str(), BaseSource::Local));
         assert_ne!(base.commit, newer);
+    }
+
+    /// A remote-tracking destination that is a symbolic ref to a local
+    /// branch would make the fetch move that branch. The fetch is refused
+    /// before it runs, so unpublished local commits stay where they are,
+    /// and no other base is used.
+    #[tokio::test]
+    async fn a_symbolic_tracking_destination_is_refused_and_the_local_branch_is_kept() {
+        let (temp, repo, _) = cloned_repo();
+        let path = repo.to_str().unwrap();
+        advance_origin(temp.path(), "remote only");
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "unpublished"]);
+        let unpublished = git(&repo, &["rev-parse", "refs/heads/trunk"]);
+        git(&repo, &["checkout", "-q", "--detach"]);
+        git(&repo, &["symbolic-ref", "refs/remotes/origin/trunk", "refs/heads/trunk"]);
+
+        // `origin/HEAD` resolves through the chain to the local branch, which
+        // already refuses; the destination is checked on its own too, for
+        // a default branch named by JJ's `trunk()` instead.
+        let refused = resolve_new_task_base(path, None, BaseSync::FetchRemote).await.unwrap_err();
+        assert!(refused.contains("not at a branch of origin"), "{refused}");
+        let refused = refuse_a_symbolic_tracking_ref(&repo, path, "trunk").await.unwrap_err();
+        assert!(refused.contains("symbolic ref to refs/heads/trunk"), "{refused}");
+        assert!(refused.contains("no other base was used"), "{refused}");
+        assert_eq!(git(&repo, &["rev-parse", "refs/heads/trunk"]), unpublished, "the local branch is not moved");
+        assert!(remote_base_awaiting_fetch(path).await.unwrap().is_none(), "refused, not pending");
+    }
+
+    /// A fetch mapping configured for origin that writes origin's branches
+    /// onto local ones plays no part: only `refs/remotes/origin/<D>` is
+    /// updated and an unpublished local commit stays on the local branch.
+    #[tokio::test]
+    async fn a_configured_fetch_mapping_onto_local_branches_moves_no_local_branch() {
+        let (temp, repo, _) = cloned_repo();
+        let path = repo.to_str().unwrap();
+        let newer = advance_origin(temp.path(), "remote only");
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "unpublished"]);
+        let unpublished = git(&repo, &["rev-parse", "refs/heads/trunk"]);
+        git(&repo, &["checkout", "-q", "--detach"]);
+        git(&repo, &["config", "--add", "remote.origin.fetch", "+refs/heads/*:refs/heads/*"]);
+
+        let base = resolve_new_task_base(path, None, BaseSync::FetchRemote).await.unwrap();
+        assert_eq!(base.commit, newer);
+        assert_eq!(git(&repo, &["rev-parse", "refs/remotes/origin/trunk"]), newer);
+        assert_eq!(git(&repo, &["rev-parse", "refs/heads/trunk"]), unpublished, "the local branch is not moved");
+    }
+
+    /// Several new tasks of one project starting together each fetch the
+    /// same branch. None is refused for the others' fetches, and each
+    /// starts at the commit origin has.
+    #[tokio::test]
+    async fn concurrent_starts_under_the_latest_remote_base_all_resolve() {
+        let (temp, repo, _) = cloned_repo();
+        let path = repo.to_str().unwrap().to_string();
+        let newer = advance_origin(temp.path(), "remote only");
+        let starts = (0..6).map(|_| {
+            let path = path.clone();
+            tokio::spawn(async move { resolve_new_task_base(&path, None, BaseSync::FetchRemote).await })
+        });
+        for start in futures::future::join_all(starts).await {
+            assert_eq!(start.unwrap().unwrap().commit, newer);
+        }
+    }
+
+    /// Origin's default branch named but never fetched is pending, not a
+    /// refusal: the start fetches it.
+    #[tokio::test]
+    async fn a_remote_base_never_fetched_is_pending() {
+        let (_temp, repo, _) = cloned_repo();
+        let path = repo.to_str().unwrap();
+        assert_eq!(remote_base_awaiting_fetch(path).await.unwrap(), None, "fetched already");
+        git(&repo, &["update-ref", "-d", "refs/remotes/origin/trunk"]);
+        assert_eq!(remote_base_awaiting_fetch(path).await.unwrap().as_deref(), Some("trunk"));
+        // `readiness` runs `jj --version` to answer `jj_available`. A fake
+        // `jj` another test installed would record that call in its own log,
+        // so hold `PATH_LOCK` while it runs: no fixture can be on `PATH`,
+        // and no fixture's invocation count changes because of this test.
+        let _path = crate::test_helpers::PATH_LOCK.lock().await;
+        let ready = super::super::readiness::readiness(path, None, BaseSync::FetchRemote).await.unwrap();
+        assert_eq!((ready.base, ready.blocked, ready.pending_fetch.as_deref()), (None, None, Some("trunk")));
     }
 
     /// The policy is stored only when it is not the default, so a project
