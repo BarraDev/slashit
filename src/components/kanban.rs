@@ -1809,7 +1809,7 @@ fn PrReviewModal(
                     </div>
 
                     <Show when=move || !owed_replies().is_empty()>
-                        <section class="px-5 py-3 border-t border-white/10 space-y-3 max-h-72 overflow-y-auto" aria-label="Replies waiting for approval">
+                        <section class="px-5 py-3 border-t border-white/10 space-y-3 max-h-72 overflow-y-auto shrink-0" aria-label="Replies waiting for approval">
                             <div class="text-xs text-white/70 space-y-1">
                                 <p class="font-semibold text-white/80">"Replies waiting for your approval"</p>
                                 <p>"A reply is posted on GitHub only if you select it and press Post. Approving a fix does not approve its reply."</p>
