@@ -9,6 +9,9 @@
 //! pull request and CI state SlashIt heard for it (`inspect_task_pull_request`).
 //! `inspect_project` reports the Conversation's own Project: its name, Workspace,
 //! default base branch and Task counts per status, never a filesystem path.
+//! `inspect_conversation_history` pages back through the Conversation's own
+//! earlier messages from the in-memory copy the turn was built from, so it
+//! never opens, writes or locks the Conversation file.
 //! The pull request read answers from the status cache only; it never asks
 //! GitHub, so it is fast, cannot hang a turn, and says when data is stale or
 //! absent.
@@ -29,7 +32,8 @@ use std::future::Future;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::domain::conversation::CoordinatorOutput;
+use crate::conversation_context::{render_message, PAST_CONVERSATION_SEMANTICS};
+use crate::domain::conversation::{Conversation, CoordinatorOutput};
 use crate::domain::{ExternalRef, Task, TaskStatus};
 use crate::pr_status::{PrKey, PrStatuses};
 
@@ -53,6 +57,8 @@ pub const PULL_REQUESTS_SHOWN: usize = 5;
 pub const CHECK_NAME_CHARS: usize = 120;
 pub const PROJECT_NAME_CHARS: usize = 200;
 pub const BRANCH_NAME_CHARS: usize = 200;
+pub const HISTORY_DEFAULT_LIMIT: usize = 10;
+pub const HISTORY_MAX_LIMIT: usize = 20;
 /// The most logical characters one read result may take once serialized. A
 /// result above it is shrunk and says so (`result_truncated`). Experimental,
 /// like the context budget it is reserved from.
@@ -348,6 +354,43 @@ fn inspect_project(tasks: &HashMap<Uuid, Task>, project_id: Uuid, facts: &Projec
     })
 }
 
+/// A page of the Conversation's messages that come before the entry
+/// `before`, newest first. Only Human messages and Coordinator replies are
+/// returned, each with the Context Builder's message ceiling and cut marker.
+/// `next_before_entry_id` is the cursor of the following page.
+fn inspect_conversation_history(conversation: &Conversation, before: Option<Uuid>, limit: Option<usize>) -> Value {
+    let Some(before) = before else {
+        return json!({
+            "outcome": "cursor_required",
+            "message": "inspect_conversation_history needs before_entry_id: the entry_id of an entry in recent_history or the next_before_entry_id of an earlier page. Nothing was read.",
+        });
+    };
+    let Some(position) = conversation.entries.iter().position(|entry| entry.id == before) else {
+        return json!({
+            "outcome": "unknown_cursor",
+            "message": "No entry in this Conversation has that entry_id. Use an entry_id from recent_history or the next_before_entry_id of an earlier page. Nothing was read.",
+        });
+    };
+    let limit = limit.unwrap_or(HISTORY_DEFAULT_LIMIT).clamp(1, HISTORY_MAX_LIMIT);
+    let mut earlier = conversation.entries[..position]
+        .iter()
+        .rev()
+        .filter_map(|entry| render_message(conversation, entry));
+    let messages: Vec<Value> = earlier.by_ref().take(limit).collect();
+    let has_more = earlier.next().is_some();
+    let next = if has_more { messages.last().map(|message| message["entry_id"].clone()) } else { None };
+    json!({
+        "outcome": "history_page",
+        "content_semantics": PAST_CONVERSATION_SEMANTICS,
+        "before_entry_id": before,
+        "order": "newest_first",
+        "returned": messages.len(),
+        "has_more": has_more,
+        "next_before_entry_id": next,
+        "messages": messages,
+    })
+}
+
 fn value_chars(value: &Value) -> usize {
     value.to_string().chars().count()
 }
@@ -377,6 +420,24 @@ pub fn cap_read(mut result: Value, cap: usize) -> Value {
             result["returned"] = json!(returned);
             result["truncated"] = json!(true);
             result["next_offset"] = json!(offset + returned as u64);
+        }
+    }
+    // History: drop the oldest messages and point the next page at them. A
+    // newest message too large to show alone is named and stepped past.
+    if result["outcome"] == "history_page" {
+        while !fits(&result) && result["messages"].as_array().is_some_and(|messages| !messages.is_empty()) {
+            let dropped = result["messages"].as_array_mut().unwrap().pop();
+            let returned = result["messages"].as_array().unwrap().len();
+            result["returned"] = json!(returned);
+            result["has_more"] = json!(true);
+            result["next_before_entry_id"] = match result["messages"].as_array().unwrap().last() {
+                Some(oldest) => oldest["entry_id"].clone(),
+                None => {
+                    let skipped = dropped.as_ref().map_or(Value::Null, |message| message["entry_id"].clone());
+                    result["skipped_too_large_entry_id"] = skipped.clone();
+                    skipped
+                }
+            };
         }
     }
     // Activity: drop the oldest events and count them as omitted.
@@ -439,8 +500,9 @@ pub fn read(
     tasks: &HashMap<Uuid, Task>,
     pr_statuses: &PrStatuses,
     project: &ProjectFacts,
+    conversation: &Conversation,
 ) -> Option<Value> {
-    read_uncapped(output, project_id, tasks, pr_statuses, project)
+    read_uncapped(output, project_id, tasks, pr_statuses, project, conversation)
         .map(|result| cap_read(result, PER_READ_CAP_CHARS))
 }
 
@@ -450,6 +512,7 @@ fn read_uncapped(
     tasks: &HashMap<Uuid, Task>,
     pr_statuses: &PrStatuses,
     project: &ProjectFacts,
+    conversation: &Conversation,
 ) -> Option<Value> {
     match output {
         CoordinatorOutput::InspectTask { target_task_id } => {
@@ -472,6 +535,9 @@ fn read_uncapped(
             inspect_task_pull_request(tasks, project_id, *target_task_id, pr_statuses),
         ),
         CoordinatorOutput::InspectProject {} => Some(inspect_project(tasks, project_id, project)),
+        CoordinatorOutput::InspectConversationHistory { before_entry_id, limit } => Some(
+            inspect_conversation_history(conversation, *before_entry_id, limit.map(usize::from)),
+        ),
         _ => None,
     }
 }
@@ -694,7 +760,7 @@ mod tests {
 
     /// [`super::read`] with no GitHub to ask and an empty status cache.
     fn read(output: &CoordinatorOutput, project_id: Uuid, tasks: &HashMap<Uuid, Task>) -> Option<Value> {
-        super::read(output, project_id, tasks, &no_github(), &facts())
+        super::read(output, project_id, tasks, &no_github(), &facts(), &Conversation::new(project_id))
     }
 
     fn facts() -> ProjectFacts {
@@ -1124,7 +1190,7 @@ mod tests {
             },
         );
         let result =
-            super::read(&pull_request(id), project, &store(vec![subject]), &statuses, &facts()).unwrap();
+            super::read(&pull_request(id), project, &store(vec![subject]), &statuses, &facts(), &Conversation::new(project)).unwrap();
         let live = &result["pull_requests"][0]["live"];
         assert_eq!(live["checks"], "failing");
         assert_eq!(live["review_decision"], "changes_requested");
@@ -1191,6 +1257,7 @@ mod tests {
             &HashMap::new(),
             &no_github(),
             &facts,
+            &Conversation::new(Uuid::new_v4()),
         )
         .unwrap();
         assert_eq!(result["name"], "Alpha");
@@ -1213,6 +1280,7 @@ mod tests {
             &HashMap::new(),
             &no_github(),
             &facts,
+            &Conversation::new(Uuid::new_v4()),
         )
         .unwrap();
         let chars = |value: &Value| value.as_str().unwrap().chars().count();
@@ -1608,5 +1676,204 @@ mod tests {
                 refusal_notice_included: false,
             })]
         );
+    }
+
+    use crate::conversation_context::MESSAGE_CEILING;
+    use crate::domain::conversation::{EntryKind, Role};
+
+    fn history_read(conversation: &Conversation, before: Option<Uuid>, limit: Option<u8>) -> Value {
+        let output = CoordinatorOutput::InspectConversationHistory { before_entry_id: before, limit };
+        super::read(&output, conversation.project_id, &HashMap::new(), &no_github(), &facts(), conversation).unwrap()
+    }
+
+    /// `pairs` exchanges of a Human message and a Coordinator reply, numbered
+    /// from 1, with a failure and a Worker result after every exchange, and a
+    /// final Human message to page back from.
+    fn long_conversation(pairs: usize) -> Conversation {
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        for n in 1..=pairs {
+            conversation.push(Role::Human, EntryKind::HumanMessage { text: format!("question {n}") });
+            conversation.push(Role::Coordinator, EntryKind::CoordinatorReply { text: format!("answer {n}") });
+            conversation.push(Role::Coordinator, EntryKind::RunFailed { role: Role::Coordinator, message: "failed".into(), retryable: false });
+            conversation.push(Role::Worker, EntryKind::WorkerResult { action_id: Uuid::new_v4(), result: "worker said".into() });
+        }
+        conversation.push(Role::Human, EntryKind::HumanMessage { text: "latest".into() });
+        conversation
+    }
+
+    fn texts(page: &Value) -> Vec<String> {
+        page["messages"].as_array().unwrap().iter().map(|m| m["text"].as_str().unwrap().to_owned()).collect()
+    }
+
+    #[test]
+    fn history_first_page_is_the_newest_earlier_messages_only_marked_as_past_conversation() {
+        let conversation = long_conversation(8);
+        let cursor = conversation.entries.last().unwrap().id;
+        let page = history_read(&conversation, Some(cursor), Some(4));
+        assert_eq!(page["outcome"], "history_page");
+        assert_eq!(page["content_semantics"], crate::conversation_context::PAST_CONVERSATION_SEMANTICS);
+        assert_eq!(page["order"], "newest_first");
+        assert_eq!(texts(&page), ["answer 8", "question 8", "answer 7", "question 7"]);
+        assert_eq!(page["returned"], 4);
+        assert_eq!(page["has_more"], true);
+        for message in page["messages"].as_array().unwrap() {
+            assert_eq!(message["kind"], "message", "no Worker results, failures or records: {message}");
+            assert!(message["entry_id"].is_string() && message["created_at"].is_string() && message["role"].is_string());
+        }
+        let default_page = history_read(&conversation, Some(cursor), None);
+        assert_eq!(default_page["returned"], HISTORY_DEFAULT_LIMIT);
+        let over = history_read(&conversation, Some(cursor), Some(200));
+        assert_eq!(over["returned"], 16, "all 16 earlier messages fit under the maximum");
+        assert_eq!(over["has_more"], false);
+        assert!(over["next_before_entry_id"].is_null());
+    }
+
+    #[test]
+    fn history_next_page_by_cursor_continues_without_overlap_to_the_start() {
+        let conversation = long_conversation(8);
+        let mut cursor = conversation.entries.last().unwrap().id;
+        let mut seen = Vec::new();
+        loop {
+            let page = history_read(&conversation, Some(cursor), Some(3));
+            seen.extend(texts(&page));
+            if page["has_more"] == false {
+                assert!(page["next_before_entry_id"].is_null());
+                break;
+            }
+            let next = page["next_before_entry_id"].as_str().unwrap().parse().unwrap();
+            assert_eq!(page["messages"].as_array().unwrap().last().unwrap()["entry_id"], json!(next));
+            cursor = next;
+        }
+        let expected: Vec<String> = (1..=8).rev().flat_map(|n| [format!("answer {n}"), format!("question {n}")]).collect();
+        assert_eq!(seen, expected);
+        // A cursor on a non-message entry is accepted: it is a point in the history.
+        let failure = conversation.entries.iter().find(|e| matches!(e.kind, EntryKind::RunFailed { .. })).unwrap().id;
+        assert_eq!(texts(&history_read(&conversation, Some(failure), None)), ["answer 1", "question 1"]);
+    }
+
+    #[test]
+    fn history_messages_use_the_context_builder_ceiling_and_marker_and_the_page_fits_the_read_cap() {
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        for _ in 0..5 {
+            conversation.push(Role::Human, EntryKind::HumanMessage { text: "h".repeat(MESSAGE_CEILING * 2) });
+        }
+        conversation.push(Role::Human, EntryKind::HumanMessage { text: "latest".into() });
+        let cursor = conversation.entries.last().unwrap().id;
+        let page = history_read(&conversation, Some(cursor), Some(5));
+        let first = &page["messages"][0];
+        let mut shortened = 0;
+        let expected = crate::conversation_context::cut_field(
+            &"h".repeat(MESSAGE_CEILING * 2),
+            MESSAGE_CEILING,
+            first["entry_id"].as_str().unwrap().parse().unwrap(),
+            &mut shortened,
+        );
+        assert_eq!(first["text"], expected);
+        assert!(expected.contains("omitted by SlashIt"));
+        assert!(page.to_string().chars().count() <= PER_READ_CAP_CHARS);
+        assert!(page["result_truncated"].is_object());
+        assert_eq!(page["returned"], 1, "one ceiling-sized message fits the read cap");
+        assert_eq!(page["has_more"], true);
+        assert_eq!(page["next_before_entry_id"], first["entry_id"], "the next page starts with what was dropped");
+    }
+
+    #[test]
+    fn a_message_too_large_to_show_alone_is_named_and_stepped_past() {
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        conversation.push(Role::Human, EntryKind::HumanMessage { text: "older".into() });
+        // Every control character escapes to six characters in JSON.
+        conversation.push(Role::Human, EntryKind::HumanMessage { text: "\u{1}".repeat(MESSAGE_CEILING) });
+        conversation.push(Role::Human, EntryKind::HumanMessage { text: "latest".into() });
+        let big = conversation.entries[1].id;
+        let page = history_read(&conversation, Some(conversation.entries[2].id), None);
+        assert_eq!(page["outcome"], "history_page");
+        assert_eq!(page["returned"], 0);
+        assert_eq!(page["skipped_too_large_entry_id"], json!(big));
+        assert_eq!(page["next_before_entry_id"], json!(big));
+        assert_eq!(texts(&history_read(&conversation, Some(big), None)), ["older"]);
+    }
+
+    #[test]
+    fn history_refuses_a_missing_or_unknown_cursor() {
+        let conversation = long_conversation(2);
+        let unknown = history_read(&conversation, Some(Uuid::new_v4()), None);
+        assert_eq!(unknown["outcome"], "unknown_cursor");
+        assert!(unknown["message"].as_str().unwrap().contains("No entry in this Conversation"));
+        assert!(unknown.get("messages").is_none());
+        let missing = history_read(&conversation, None, None);
+        assert_eq!(missing["outcome"], "cursor_required");
+        assert!(missing["message"].as_str().unwrap().contains("needs before_entry_id"));
+        // An entry of another Conversation is unknown here.
+        let other = long_conversation(1);
+        assert_eq!(history_read(&conversation, Some(other.entries[0].id), None)["outcome"], "unknown_cursor");
+    }
+
+    #[test]
+    fn history_before_the_first_entry_or_of_an_empty_conversation_is_an_empty_last_page() {
+        let conversation = long_conversation(2);
+        let page = history_read(&conversation, Some(conversation.entries[0].id), None);
+        assert_eq!(page["outcome"], "history_page");
+        assert_eq!(page["returned"], 0);
+        assert_eq!(page["has_more"], false);
+        assert!(page["next_before_entry_id"].is_null());
+        let empty = Conversation::new(Uuid::new_v4());
+        assert_eq!(history_read(&empty, Some(Uuid::new_v4()), None)["outcome"], "unknown_cursor");
+        assert_eq!(history_read(&empty, None, None)["outcome"], "cursor_required");
+    }
+
+    #[test]
+    fn history_lookups_leave_the_saved_conversation_file_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        );
+        let storage = crate::config::Storage::with_paths(paths.clone());
+        let project_id = Uuid::new_v4();
+        let mut conversation = storage.create_primary_conversation(project_id).unwrap();
+        for n in 0..6 {
+            conversation.push(Role::Human, EntryKind::HumanMessage { text: format!("q{n}") });
+            conversation.push(Role::Coordinator, EntryKind::CoordinatorReply { text: format!("a{n}") });
+        }
+        storage.save_conversation(&conversation).unwrap();
+        let path = paths.conversation_file(conversation.id);
+        let bytes = std::fs::read(&path).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let listing = |dir: &std::path::Path| {
+            let mut names: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+            names.sort();
+            names
+        };
+        let dir = path.parent().unwrap().to_owned();
+        let before_listing = listing(&dir);
+
+        let loaded = storage.load_primary_conversation(project_id).unwrap().unwrap();
+        let mut cursor = Some(loaded.entries.last().unwrap().id);
+        while let Some(before) = cursor {
+            let page = history_read(&loaded, Some(before), Some(2));
+            cursor = page["next_before_entry_id"].as_str().map(|id| id.parse().unwrap());
+        }
+        history_read(&loaded, Some(Uuid::new_v4()), None);
+        history_read(&loaded, None, None);
+
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "the Conversation file is byte-identical");
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        assert_eq!(listing(&dir), before_listing, "no file was created beside it");
+        let reloaded = storage.load_primary_conversation(project_id).unwrap().unwrap();
+        assert_eq!(reloaded.revision, loaded.revision);
+        assert_eq!(serde_json::to_value(&reloaded).unwrap(), serde_json::to_value(&loaded).unwrap());
+        assert!(loaded.actions.is_empty() && loaded.project_actions.is_empty(), "nothing was proposed or approved");
+    }
+
+    #[test]
+    fn history_read_requests_are_strictly_parsed() {
+        let id = Uuid::new_v4();
+        let parsed = Conversation::parse_output(&format!(r#"{{"type":"inspect_conversation_history","before_entry_id":"{id}","limit":5}}"#));
+        assert!(matches!(parsed, Ok(CoordinatorOutput::InspectConversationHistory { before_entry_id: Some(b), limit: Some(5) }) if b == id));
+        assert!(Conversation::parse_output(&format!(r#"{{"type":"inspect_conversation_history","before_entry_id":"{id}","limit":0}}"#)).is_err());
+        assert!(Conversation::parse_output(&format!(r#"{{"type":"inspect_conversation_history","before_entry_id":"{id}","path":"/etc"}}"#)).is_err());
+        assert!(Conversation::parse_output(r#"{"type":"inspect_conversation_history","before_entry_id":"not-a-uuid"}"#).is_err());
     }
 }

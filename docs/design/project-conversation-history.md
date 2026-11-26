@@ -2,7 +2,8 @@
 
 Status: direction recorded. The deterministic, budgeted Context Builder (roadmap
 step 1) is implemented and described in
-[context-management.md](context-management.md); the sections "Layers", "Minimal roadmap", "Small UX
+[context-management.md](context-management.md), and so is explicit history
+retrieval (step 2, the `inspect_conversation_history` lookup described there); the sections "Layers", "Minimal roadmap", "Small UX
 improvements" and "Open decisions" are proposals, and nothing here is implemented beyond what
 [agent-runtime-and-conversations.md](agent-runtime-and-conversations.md)
 already describes. Vocabulary follows
