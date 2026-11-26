@@ -922,11 +922,15 @@ pub async fn update_task(
                 task.planning_mode = p;
             }
         }
-        // Only a write that changes the review configuration is judged, so
-        // re-saving an unchanged Task that already has no reviewer still works.
+        // An explicit Automatic request is judged even when it matches the
+        // stored configuration. A write that names no review mode, or that
+        // changes nothing in the review configuration, is not judged, so an
+        // unrelated edit still saves a legacy Task with no reviewer.
+        let explicit_automatic = params.review_mode == Some(crate::domain::task::ReviewMode::Automatic);
         if let Some(task) = staged.get(&task_id) {
             let review_after = (task.review_mode, task.reviewer_model.clone());
-            if review_before.is_some_and(|before| before != review_after) {
+            let changed = review_before.is_some_and(|before| before != review_after);
+            if explicit_automatic || changed {
                 crate::domain::task::check_automatic_has_reviewer(
                     task.review_mode,
                     task.reviewer_model.as_deref(),
@@ -3767,14 +3771,29 @@ mod task_dependency_contract {
         assert_eq!(memory["title"], "manual", "a refused save writes nothing");
         assert_eq!(disk["title"], "manual");
 
+        // An unrelated update that names no review settings still saves a
+        // legacy Automatic Task that has no reviewer.
         update_task(
             GuiMutation::untracked(),
             app.state(),
-            edit(legacy_id, "legacy renamed", Some(ReviewMode::Automatic), Some("")),
+            edit(legacy_id, "legacy renamed", None, None),
         )
         .await
-        .expect("an unchanged Automatic Task without a reviewer still saves")
+        .expect("an update that omits review settings still saves")
         .expect("the task exists");
+        // Re-sending the stored Automatic configuration is an explicit request,
+        // so it is refused without a reviewer.
+        let error = update_task(
+            GuiMutation::untracked(),
+            app.state(),
+            edit(legacy_id, "legacy again", Some(ReviewMode::Automatic), None),
+        )
+        .await
+        .expect_err("an explicit Automatic matching the stored one still needs a reviewer");
+        assert!(error.contains("AI Reviewer"), "{error}");
+        let (memory, disk) = both_copies(&app, project_id, legacy_id).await;
+        assert_eq!(memory["title"], "legacy renamed");
+        assert_eq!(disk["title"], "legacy renamed");
 
         let error = update_task(
             GuiMutation::untracked(),
