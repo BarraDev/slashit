@@ -508,7 +508,7 @@ pub fn Kanban(
         move |task: Task| {
             // The Project's saved default, read as of this opening so a change
             // made in the Project settings applies at once. A failed read
-            // falls back to the safe default: both off.
+            // falls back to the safe default: off.
             let defaults = pr_review_defaults.get_untracked();
             if !pr_review_dialog.open(task.clone(), defaults) {
                 return;
@@ -3679,7 +3679,7 @@ mod tests {
     fn the_dialog_initial_auto_push_reads_the_project_default() {
         let owner = Owner::new();
         let dialog = dialog(&owner);
-        let on = crate::models::PrReviewDefaults { auto_push: true, auto_reply: false };
+        let on = crate::models::PrReviewDefaults { auto_push: true };
 
         assert!(dialog.open(column_task(1, "a"), on));
         assert!(dialog.auto_push.get_untracked(), "the Project turned Auto-push on");

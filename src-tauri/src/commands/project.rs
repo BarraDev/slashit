@@ -1246,7 +1246,6 @@ pub async fn set_project_pr_review_defaults(
     state: tauri::State<'_, crate::AppState>,
     id: String,
     auto_push: bool,
-    auto_reply: bool,
 ) -> Result<Option<Project>, String> {
     let id = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
     let _gate = state.task.project_gate.read(id).await;
@@ -1254,7 +1253,7 @@ pub async fn set_project_pr_review_defaults(
         &state.project.projects,
         &state.storage,
         id,
-        crate::domain::PrReviewDefaults { auto_push, auto_reply },
+        crate::domain::PrReviewDefaults { auto_push },
     )
     .await
 }
@@ -2422,7 +2421,7 @@ pub(crate) mod tests {
         let before = existing.clone();
         let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::from([(id, existing)]));
 
-        let defaults = crate::domain::PrReviewDefaults { auto_push: true, auto_reply: true };
+        let defaults = crate::domain::PrReviewDefaults { auto_push: true };
         let updated = set_project_pr_review_defaults_committed(&projects, &storage, id, defaults)
             .await
             .unwrap()

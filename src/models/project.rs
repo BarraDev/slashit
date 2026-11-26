@@ -22,13 +22,11 @@ impl ProjectScope {
 }
 
 /// A Project's defaults for the PR Comment Review toggles. Mirrors
-/// `src-tauri/src/domain/project.rs`'s `PrReviewDefaults`; both are off unless set.
+/// `src-tauri/src/domain/project.rs`'s `PrReviewDefaults`; off unless set.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrReviewDefaults {
     #[serde(default)]
     pub auto_push: bool,
-    #[serde(default)]
-    pub auto_reply: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

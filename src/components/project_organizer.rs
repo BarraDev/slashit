@@ -341,7 +341,7 @@ fn ProjectRow(
         }
         next
     });
-    // The PR review defaults as the list reports them now; a toggle saves at once.
+    // The PR review defaults as the list reports them now; the toggle saves at once.
     let defaults = Memo::new(move |_| {
         projects.with(|ps| {
             ps.iter()
@@ -554,7 +554,7 @@ fn ProjectRow(
             </form>
 
             <div class="mt-3 flex flex-wrap items-center gap-4 text-xs text-white/70">
-                <span class="text-white/50">"PR review defaults (off unless set):"</span>
+                <span class="text-white/50">"PR review default (off unless set):"</span>
                 <label class="flex items-center gap-1.5 cursor-pointer">
                     <input
                         type="checkbox"
@@ -563,27 +563,12 @@ fn ProjectRow(
                         prop:checked=move || defaults.get().auto_push
                         disabled=move || saving_defaults.get() || removing.get()
                         on:change=move |ev| {
-                            let mut next = defaults.get_untracked();
-                            next.auto_push = event_target_checked(&ev);
-                            save_defaults(next);
+                            save_defaults(crate::models::PrReviewDefaults {
+                                auto_push: event_target_checked(&ev),
+                            });
                         }
                     />
                     "Auto-push branch"
-                </label>
-                <label class="flex items-center gap-1.5 cursor-pointer">
-                    <input
-                        type="checkbox"
-                        data-testid="project-organizer-auto-reply"
-                        class="accent-yellow-500"
-                        prop:checked=move || defaults.get().auto_reply
-                        disabled=move || saving_defaults.get() || removing.get()
-                        on:change=move |ev| {
-                            let mut next = defaults.get_untracked();
-                            next.auto_reply = event_target_checked(&ev);
-                            save_defaults(next);
-                        }
-                    />
-                    "Auto-reply to comments"
                 </label>
             </div>
 

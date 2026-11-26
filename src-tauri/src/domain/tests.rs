@@ -118,8 +118,8 @@ env = {}
         assert_eq!(read.base, project.base);
     }
 
-    /// A Project stored before the PR review defaults existed loads with both
-    /// off; saved defaults survive a round trip.
+    /// A Project stored before the PR review defaults existed loads with
+    /// auto-push off; a saved default survives a round trip.
     #[test]
     fn pr_review_defaults_load_off_for_legacy_records_and_round_trip() {
         let legacy = r#"
@@ -137,9 +137,8 @@ env = {}
 "#;
         let mut project: Project = toml::from_str(legacy).expect("a legacy project loads");
         assert!(!project.pr_review_defaults.auto_push);
-        assert!(!project.pr_review_defaults.auto_reply);
 
-        project.pr_review_defaults = crate::domain::PrReviewDefaults { auto_push: false, auto_reply: true };
+        project.pr_review_defaults = crate::domain::PrReviewDefaults { auto_push: true };
         let read: Project = toml::from_str(&toml::to_string(&project).unwrap()).unwrap();
         assert_eq!(read.pr_review_defaults, project.pr_review_defaults);
         let read: Project = serde_json::from_str(&serde_json::to_string(&project).unwrap()).unwrap();

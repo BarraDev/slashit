@@ -117,7 +117,6 @@ pub async fn set_project_pr_review_defaults(
     let args = serde_wasm_bindgen::to_value(&serde_json::json!({
         "id": project_id,
         "autoPush": defaults.auto_push,
-        "autoReply": defaults.auto_reply,
     })).unwrap();
 
     let response = invoke_checked("set_project_pr_review_defaults", args).await?;
