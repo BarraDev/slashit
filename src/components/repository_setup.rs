@@ -8,7 +8,8 @@
 
 use crate::components::toast;
 use crate::models::repository_setup::{
-    BaseSource, BaseSync, Head, InitPreview, Readiness, RemoteState, Vcs, VcsInitKind,
+    sync_refusal_message, BaseSource, BaseSync, Head, InitPreview, Readiness, RemoteState, Vcs,
+    VcsInitKind,
 };
 use crate::services::repository_setup_service::{
     detect_remote_default_branch, get_project_readiness, initialize_project_vcs,
@@ -93,20 +94,33 @@ pub fn RepositorySetup(project_id: String) -> impl IntoView {
         busy.set(true);
         let id = pid.get_value();
         spawn_local(async move {
-            let answer = set_project_base_sync(id, fetch_remote).await;
-            if answer.is_ok() {
-                toast::success(if fetch_remote {
-                    "Each new task will fetch origin's default branch first and start from origin's revision; unpushed local commits are not included. If the fetch fails, the task is not started.".to_string()
-                } else {
-                    "New tasks will start from the repository's branches as they are, without fetching.".to_string()
-                });
-            }
-            let refused = answer.is_err();
-            apply(answer);
-            if refused {
-                // The checkbox already shows the click. Nothing was saved, so
-                // it is drawn again from the saved choice.
-                readiness.update(|_| {});
+            match set_project_base_sync(id.clone(), fetch_remote).await {
+                Ok(report) => {
+                    toast::success(if fetch_remote {
+                        "Each new task will fetch origin's default branch first and start from origin's revision; unpushed local commits are not included. If the fetch fails, the task is not started.".to_string()
+                    } else {
+                        "New tasks will start from the repository's branches as they are, without fetching.".to_string()
+                    });
+                    apply(Ok(report));
+                }
+                Err(refusal) => {
+                    // A refusal can come after the save. What is shown is read
+                    // back from the project, never the value that was clicked.
+                    match get_project_readiness(id).await {
+                        Ok(report) => {
+                            let message = sync_refusal_message(&refusal, Ok(&report));
+                            apply(Ok(report));
+                            error.set(Some(message));
+                        }
+                        Err(reload) => {
+                            // Unknown until it can be read again: no stale checkbox.
+                            readiness.set(None);
+                            preview.set(None);
+                            error.set(Some(sync_refusal_message(&refusal, Err(&reload))));
+                            busy.set(false);
+                        }
+                    }
+                }
             }
         });
     };
@@ -139,7 +153,13 @@ pub fn RepositorySetup(project_id: String) -> impl IntoView {
                 <p class="text-sm text-white/50">"Select a project to see its repository setup."</p>
             })}
             {move || error.get().map(|e| view! {
-                <div class="p-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-sm" data-testid="repository-setup-error">{e}</div>
+                <div class="p-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-sm whitespace-pre-line" data-testid="repository-setup-error">{e}</div>
+            })}
+            // Nothing authoritative is shown until the saved state is read again.
+            {move || (readiness.get().is_none() && error.get().is_some() && !pid.get_value().is_empty()).then(|| view! {
+                <button type="button" data-testid="repository-reload"
+                    class="px-3 py-1.5 rounded-lg text-sm bg-white/10 text-white/80 hover:bg-white/20"
+                    on:click=move |_| refresh()>"Read the saved setting again"</button>
             })}
             {move || readiness.get().map(|r| {
                 let ready = r.base.clone();
