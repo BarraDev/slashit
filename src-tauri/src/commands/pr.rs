@@ -1115,7 +1115,12 @@ pub async fn analyze_pr_comments(
     let generated_at = chrono::Utc::now();
     if comments.is_empty() {
         // Don't cache empty plans — reviewers can still leave comments later
-        // and the user shouldn't have to remember to hit Re-analyze.
+        // and the user shouldn't have to remember to hit Re-analyze. A pending
+        // override has no comment left to follow, so it refuses as it would
+        // beside other comments.
+        if let Some(prev) = prior_plan.as_ref() {
+            refuse_unassociable_overrides(&[], prev, &comments)?;
+        }
         let human_edit_revision = prior_plan.as_ref().map_or(0, |p| p.human_edit_revision);
         return Ok(PrReviewPlan {
             generated_at,
@@ -1382,8 +1387,8 @@ fn refuse_unassociable_overrides(
         if let Some(reason) = reason {
             return Err(format!(
                 "Re-analysis refused: a Human instruction override on \"{}\" cannot be \
-                 matched to exactly one new review item ({reason}). Clear the override \
-                 first if it should be discarded.",
+                 matched to exactly one new review item ({reason}). To discard it, clear \
+                 the instruction, choose Save instructions, then re-analyze.",
                 prev.summary
             ));
         }
@@ -1587,6 +1592,53 @@ pub async fn discuss_pr_review_questions(
     let merged = discuss_pr_review_questions_inner(task, working_dir, plan, cancel_rx).await?;
     save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, merged.clone()).await?;
     Ok(merged)
+}
+
+/// Saves the Human's fix-instruction overrides, and nothing else, without
+/// running an agent or reading the PR. It does not check the PR head or the
+/// checkout: nothing is executed, and Apply checks both before any fix runs.
+/// This is how a Human clears an override that blocks re-analysis.
+#[tauri::command]
+pub async fn save_pr_review_instructions(
+    _gui: GuiMutation,
+    state: tauri::State<'_, crate::AppState>,
+    task_id: String,
+    plan: PrReviewPlan,
+) -> Result<PrReviewPlan, String> {
+    let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    // Held across the read and the write, so no analysis, Apply or Sync
+    // saves in between.
+    let (_lease, _) = begin_pr_helper(&state, task_uuid, PrHelperPurpose::Inspection).await?;
+    let task = {
+        let tasks = state.task.tasks.read().await;
+        tasks.get(&task_uuid).cloned().ok_or("Task not found")?
+    };
+    crate::commands::project::refuse_if_project_removed(&state.project.projects, task.project_id)
+        .await?;
+    let stored = task
+        .pr_review_plan
+        .as_ref()
+        .ok_or("This Task has no stored review plan. Nothing was changed.")?;
+    let saved = with_saved_instructions(stored, &plan)?;
+    save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, saved.clone()).await?;
+    Ok(saved)
+}
+
+/// The stored plan with only the sent copy's overrides taken from it. The
+/// copy must be the stored analysis at the stored revision, and a delivered
+/// fix's override cannot change ([`refuse_stale_analysis`]). A changed
+/// override clears that item's approval, which was given for the old one.
+fn with_saved_instructions(stored: &PrReviewPlan, sent: &PrReviewPlan) -> Result<PrReviewPlan, String> {
+    refuse_stale_analysis(stored, sent)?;
+    let mut saved = stored.clone();
+    for (item, sent_item) in saved.items.iter_mut().zip(&sent.items) {
+        if item.proposed_change_override != sent_item.proposed_change_override {
+            item.proposed_change_override = sent_item.proposed_change_override.clone();
+            item.approved = false;
+        }
+    }
+    stamp_human_edit_revision(stored, &mut saved);
+    Ok(saved)
 }
 
 /// Core logic of `discuss_pr_review_questions` extracted for testability. Owns
@@ -12220,6 +12272,89 @@ mod tests {
         assert!(refuse_stale_human_edits(&pending, &sent).is_ok());
     }
 
+    fn overriding(plan: &PrReviewPlan, text: Option<&str>) -> PrReviewPlan {
+        let mut sent = plan.clone();
+        sent.items[0].proposed_change_override = text.map(str::to_string);
+        sent
+    }
+
+    /// The recovery a refused re-analysis names: the Human clears the
+    /// override, saves it on its own, and the next analysis runs. The refusal
+    /// occurs both beside other comments and when no comment is left.
+    #[test]
+    fn a_cleared_and_saved_override_lets_reanalysis_run_again() {
+        let text = comment_text(42, "same", Some("2024-05-30T00:00:00Z"));
+        let other = comment_text(7, "other", Some("2024-05-30T00:00:00Z"));
+        let base = prior_plan(vec![fresh_item(42)], vec![text], None, vec![]);
+        let stored = with_saved_instructions(&base, &overriding(&base, Some("mine"))).unwrap();
+        assert_eq!(stored.human_edit_revision, 1);
+        assert_eq!(stored.items[0].proposed_change_override.as_deref(), Some("mine"));
+
+        for (items, comments) in [(vec![fresh_item(7)], vec![other.clone()]), (vec![], vec![])] {
+            let err = refuse_unassociable_overrides(&items, &stored, &comments).unwrap_err();
+            assert!(err.contains("Save instructions"), "names the action that recovers: {err}");
+        }
+
+        let cleared = with_saved_instructions(&stored, &overriding(&stored, None)).unwrap();
+        assert_eq!(cleared.human_edit_revision, 2);
+        assert_eq!(cleared.items[0].proposed_change_override, None);
+        assert_eq!(review_content(&cleared), review_content(&stored), "the analysis is untouched");
+        assert!(refuse_unassociable_overrides(&[fresh_item(7)], &cleared, &[other]).is_ok());
+        assert!(refuse_unassociable_overrides(&[], &cleared, &[]).is_ok());
+    }
+
+    /// Only the overrides are saved: drafts, delivery records and the original
+    /// proposal come from the stored plan, and a changed override clears its
+    /// item's approval while an unchanged item keeps its own.
+    #[test]
+    fn saving_instructions_takes_only_the_overrides() {
+        let stored = prior_plan(
+            vec![fresh_item(1), fresh_item(2)],
+            vec![comment_text(1, "a", None), comment_text(2, "b", None)],
+            None,
+            vec![],
+        );
+        let mut sent = overriding(&stored, Some("mine"));
+        sent.items[1].user_note = "draft".to_string();
+        sent.items[1].approved = false;
+        let saved = with_saved_instructions(&stored, &sent).unwrap();
+        assert!(!saved.items[0].approved, "the approval was for the old instruction");
+        assert!(saved.items[1].approved && saved.items[1].user_note.is_empty());
+
+        let mut tampered = sent.clone();
+        tampered.items[0].proposed_change = "rewrite the module".to_string();
+        assert!(with_saved_instructions(&stored, &tampered).is_err());
+        let mut stale_record = sent;
+        stale_record.items[1].fix_done = true;
+        assert!(!with_saved_instructions(&stored, &stale_record).unwrap().items[1].fix_done);
+    }
+
+    #[test]
+    fn a_stale_copy_cannot_save_or_clear_an_override() {
+        let base = prior_plan(vec![fresh_item(42)], vec![comment_text(42, "a", None)], None, vec![]);
+        let stored = with_saved_instructions(&base, &overriding(&base, Some("mine"))).unwrap();
+        for text in [None, Some("other")] {
+            let err = with_saved_instructions(&stored, &overriding(&base, text)).unwrap_err();
+            assert!(err.contains("Reload the review"), "{err}");
+        }
+    }
+
+    /// A delivered fix's override is frozen, including a fix recorded only in
+    /// `last_apply`.
+    #[test]
+    fn a_delivered_fix_instruction_cannot_be_saved() {
+        let mut item = fresh_item(42);
+        item.fix_done = true;
+        let text = comment_text(42, "a", None);
+        let delivered = prior_plan(vec![item], vec![text], Some("2024-06-01T00:00:00Z"), vec![]);
+        let mut backfilled_only = delivered.clone();
+        backfilled_only.items[0].fix_done = false;
+        for stored in [&delivered, &backfilled_only] {
+            let err = with_saved_instructions(stored, &overriding(stored, Some("again"))).unwrap_err();
+            assert!(err.contains("already made"), "{err}");
+        }
+    }
+
     #[test]
     fn carry_forward_reanalysis_lifecycle_preserves_reply_text_and_id() {
         let text = comment_text(42, "same", Some("2024-05-30T00:00:00Z"));
@@ -15767,6 +15902,62 @@ mod tests {
                     serde_json::to_value(&before).unwrap(),
                     "a refused discussion changes no Task state"
                 );
+            }
+
+            /// Saving instructions works when the PR head moved after the
+            /// analysis: it reads no head and runs no agent, so the fake `gh`
+            /// records no call. The save persists; a copy from before it is
+            /// refused and changes nothing.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn saving_instructions_on_a_moved_head_makes_no_github_call() {
+                use tauri::Manager;
+
+                let _guard = PATH_LOCK.lock().await;
+                let moved = format!(r#"{{"headRefOid":"{}"}}"#, "b".repeat(40));
+                let mock = MockGh::setup("unused", &moved);
+                let (state, _tmp) = build_test_state().await;
+                let task_id =
+                    seed_task(&state, "/tmp", Some("task-save-instructions"), TaskStatus::HumanReview)
+                        .await;
+                let (_, mut plan) = crate::test_helpers::create_test_pr_review_setup();
+                plan.analyzed_head_oid = Some("a".repeat(40));
+                plan.analyzed_at = Some(chrono::Utc::now());
+                state.task.tasks.write().await.get_mut(&task_id).unwrap().pr_review_plan =
+                    Some(plan.clone());
+                let app = tauri::test::mock_app();
+                app.manage(state);
+                let stored_plan = || async {
+                    app.state::<crate::AppState>().task.tasks.read().await[&task_id]
+                        .pr_review_plan
+                        .clone()
+                        .unwrap()
+                };
+
+                let mut sent = plan.clone();
+                sent.items[0].proposed_change_override = Some("mine".to_string());
+                let saved = save_pr_review_instructions(
+                    GuiMutation::untracked(),
+                    app.state(),
+                    task_id.to_string(),
+                    sent,
+                )
+                .await
+                .expect("the override is saved without any agent or head read");
+                assert_eq!(saved.human_edit_revision, 1);
+                assert_eq!(stored_plan().await, saved, "the save is the stored plan");
+
+                let err = save_pr_review_instructions(
+                    GuiMutation::untracked(),
+                    app.state(),
+                    task_id.to_string(),
+                    plan,
+                )
+                .await
+                .expect_err("a copy from before the save cannot clear it");
+                assert!(err.contains("Reload the review"), "{err}");
+                assert_eq!(stored_plan().await, saved, "a refused save changes nothing");
+                assert_eq!(mock.read_log(), "", "no GitHub call was made");
             }
 
             /// Address needs the Editing helper lease, which a removed Project's Task

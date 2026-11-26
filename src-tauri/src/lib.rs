@@ -573,6 +573,7 @@ pub fn run() {
             review_fix::resolve_review_fix,
             sync_pr_review_replies,
             discuss_pr_review_questions,
+            save_pr_review_instructions,
             refresh_task_pr_state,
             create_roadmap_feature,
             update_roadmap_feature,

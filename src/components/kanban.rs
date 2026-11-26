@@ -16,7 +16,7 @@ use crate::components::task_live::{activity_from_event, changes_task_record, Act
 use crate::models::AgentEvent;
 use crate::services::task_run_service::{get_live_runs, listen_agent_events_with_ready};
 use crate::components::markdown::render_safe_markdown;
-use crate::services::{reorder_task, queue_service, promoted_message, run_queued_task, RunNowOutcome,get_task_diff, get_task_diff_stat, analyze_pr_comments, address_pr_review, sync_pr_review_replies, ApprovedPublicReply, discuss_pr_review_questions, find_pr_candidates, link_existing_pr, get_pr_push_recovery, recover_private_email_and_create_pr, refresh_task_pr_state, AddressPrReviewOptions, PrCandidate, PrPushRecoveryPlan};
+use crate::services::{reorder_task, queue_service, promoted_message, run_queued_task, RunNowOutcome,get_task_diff, get_task_diff_stat, analyze_pr_comments, address_pr_review, sync_pr_review_replies, ApprovedPublicReply, discuss_pr_review_questions, save_pr_review_instructions, find_pr_candidates, link_existing_pr, get_pr_push_recovery, recover_private_email_and_create_pr, refresh_task_pr_state, AddressPrReviewOptions, PrCandidate, PrPushRecoveryPlan};
 use uuid::Uuid;
 use std::collections::{HashMap, HashSet};
 
@@ -1249,6 +1249,9 @@ fn PrReviewModal(
                 return;
             }
         }
+        // Shown again if the analysis is refused, so the Human can still
+        // correct (and save) what the refusal names.
+        let shown = plan.get_untracked();
         plan.set(None);
         error.set(None);
         loading.set(true);
@@ -1264,7 +1267,7 @@ fn PrReviewModal(
                 }
                 Err(e) => {
                     if dialog.shows(opening) {
-                        plan.set(None);
+                        plan.set(shown);
                         error.set(Some(format!("Failed to analyze PR comments: {}", e)));
                     }
                 }
@@ -1377,6 +1380,39 @@ fn PrReviewModal(
                 }
             }
             discussing.set(false);
+        });
+    };
+
+    // Saves only the instructions, with no agent run and no PR-head check, so
+    // the Human can clear an override that blocks re-analysis. The drafts
+    // stay; the plan takes the saved revision.
+    let on_save_instructions = move |_| {
+        let Some(task_value) = task.get() else { return; };
+        let Some(opening) = dialog.opening() else { return; };
+        let Some(current_plan) = plan.get() else { return; };
+        error.set(None);
+        let task_id = task_value.id;
+        spawn_local(async move {
+            match save_pr_review_instructions(task_id.to_string(), current_plan).await {
+                Ok(saved) => {
+                    if dialog.shows(opening) {
+                        plan.update(|p| if let Some(p) = p.as_mut() {
+                            p.human_edit_revision = saved.human_edit_revision;
+                        });
+                    }
+                    set_tasks.update(|tasks| {
+                        if let Some(t) = tasks.iter_mut().find(|t| t.id == task_id) {
+                            t.pr_review_plan = Some(saved);
+                        }
+                    });
+                    toast::success("Instructions saved".to_string());
+                }
+                Err(e) => {
+                    let msg = format!("Failed to save instructions: {}", e);
+                    dialog.report_failure(opening, msg.clone());
+                    toast::error(msg);
+                }
+            }
         });
     };
 
@@ -1897,6 +1933,15 @@ fn PrReviewModal(
                                 } else {
                                     format!("Re-discuss {} questions", pending_discussion_count())
                                 }}
+                            </button>
+                            <button
+                                class="px-3 py-1.5 rounded-lg text-xs text-white/70 hover:bg-white/10 transition-colors disabled:opacity-40"
+                                data-testid="pr-review-save-instructions"
+                                on:click=on_save_instructions
+                                disabled=move || busy() || plan.with(|p| p.is_none())
+                                title="Save your fix instructions without running any agent"
+                            >
+                                "Save instructions"
                             </button>
                             <button
                                 class=move || {

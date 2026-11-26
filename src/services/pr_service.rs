@@ -251,6 +251,19 @@ pub async fn discuss_pr_review_questions(
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
 }
 
+/// Saves only the Human's fix-instruction overrides; no agent runs.
+pub async fn save_pr_review_instructions(
+    task_id: String,
+    plan: crate::models::task::PrReviewPlan,
+) -> Result<crate::models::task::PrReviewPlan, String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({
+        "taskId": task_id,
+        "plan": plan,
+    })).unwrap();
+    let response = invoke("save_pr_review_instructions", args).await?;
+    serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
+}
+
 /// Result of `sync_pr_review_replies` — mirrors `commands::pr::SyncPrRepliesResult`.
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct SyncPrRepliesResult {
