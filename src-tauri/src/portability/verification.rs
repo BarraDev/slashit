@@ -64,6 +64,7 @@ fn project(id: Uuid, repository_id: Option<Uuid>) -> Project {
         scope: ProjectScope::Standalone,
         state_location: Default::default(),
         base: None,
+        base_sync: Default::default(),
         agent_type: AgentType::ClaudeCode,
         agent_config: AgentConfig {
             agent_type: AgentType::ClaudeCode,

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 use super::checked_task_branch;
-use super::default_base::{resolve_default_base, ResolvedBase};
+use super::default_base::{resolve_new_task_base, ResolvedBase};
 use crate::config::paths::{AppPaths, ProjectKey};
-use crate::domain::ProjectBase;
+use crate::domain::{BaseSync, ProjectBase};
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1019,7 +1019,7 @@ impl WorktreeManager {
     /// Starts a new branch only at a remote default base: a project's local
     /// base is not known here.
     pub async fn create(&self, repo_path: &str, branch: &str) -> Result<WorktreeInfo, String> {
-        self.create_or_adopt(repo_path, branch, None).await.map(|(info, _)| info)
+        self.create_or_adopt(repo_path, branch, None, BaseSync::Local).await.map(|(info, _)| info)
     }
 
     /// [`Self::create`], also returning the default base the new branch was
@@ -1029,8 +1029,11 @@ impl WorktreeManager {
     /// created the branch, at `base.commit`, and the worktree: exactly what
     /// [`Self::undo_created_checkout`] may take back.
     ///
-    /// A new branch starts at exactly the commit [`resolve_default_base`]
-    /// resolves for a project whose local base is `project_base`, never at
+    /// A new branch starts at exactly the commit [`resolve_new_task_base`]
+    /// resolves for a project whose local base is `project_base` and whose
+    /// policy is `sync`. Under [`BaseSync::FetchRemote`] that fetches
+    /// origin's default branch, and only once no checkout is adopted: an
+    /// adopted checkout is used as it is and nothing is fetched. Never at
     /// the primary checkout's `HEAD`, and with no
     /// upstream: it is created with a create-only `git update-ref` at that
     /// object ID, which sets no tracking configuration whatever
@@ -1045,12 +1048,13 @@ impl WorktreeManager {
         repo_path: &str,
         branch: &str,
         project_base: Option<&ProjectBase>,
+        sync: BaseSync,
     ) -> Result<(WorktreeInfo, Option<ResolvedBase>), String> {
         let branch = checked_task_branch(branch)?;
         if let Some(info) = self.adoptable_task_checkout(repo_path, branch).await? {
             return Ok((info, None));
         }
-        let base = resolve_default_base(repo_path, project_base).await?;
+        let base = resolve_new_task_base(repo_path, project_base, sync).await?;
         self.create_at_base(repo_path, branch, base).await
     }
 
@@ -1089,6 +1093,7 @@ impl WorktreeManager {
         repo_path: &str,
         branch: &str,
         project_base: Option<&ProjectBase>,
+        sync: BaseSync,
         held: &[String],
     ) -> Result<(WorktreeInfo, Option<ResolvedBase>), String> {
         let branch = checked_task_branch(branch)?;
@@ -1096,7 +1101,7 @@ impl WorktreeManager {
             Self::require_branch_holds(repo_path, branch, held).await?;
             return Ok((info, None));
         }
-        let base = resolve_default_base(repo_path, project_base).await?;
+        let base = resolve_new_task_base(repo_path, project_base, sync).await?;
         Self::require_base_holds(repo_path, &base, held).await?;
         self.create_at_base(repo_path, branch, base).await
     }
@@ -2617,6 +2622,7 @@ mod test_git {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worktree::default_base::resolve_default_base;
     use std::path::PathBuf;
 
     // -------------------------------------------------------
@@ -7201,7 +7207,7 @@ branch refs/heads/some-other-branch
 
         let mgr = test_manager();
         let (info, created_from) = mgr
-            .create_or_adopt(repo_path, "task-c0ffee11", None)
+            .create_or_adopt(repo_path, "task-c0ffee11", None, BaseSync::Local)
             .await
             .expect("the registered worktree is adopted");
 
@@ -7223,7 +7229,7 @@ branch refs/heads/some-other-branch
         run_git(repo_path, &["checkout", "-q", "-b", "task-c0ffee11"]);
 
         let reattached = test_manager().reattach(repo_path, "task-c0ffee11").await;
-        let acquired = test_manager().create_or_adopt(repo_path, "task-c0ffee11", None).await;
+        let acquired = test_manager().create_or_adopt(repo_path, "task-c0ffee11", None, BaseSync::Local).await;
 
         assert!(reattached.is_err(), "{:?}", reattached.map(|i| i.path));
         assert!(acquired.is_err(), "{:?}", acquired.map(|(i, _)| i.path));
@@ -7243,7 +7249,7 @@ branch refs/heads/some-other-branch
 
         let mgr = test_manager();
         let (info, created_from) = mgr
-            .create_or_adopt(repo_path, "task-c0ffee11", None)
+            .create_or_adopt(repo_path, "task-c0ffee11", None, BaseSync::Local)
             .await
             .expect("a new worktree");
 
@@ -7290,7 +7296,7 @@ branch refs/heads/some-other-branch
         );
 
         let refused = test_manager()
-            .create_or_adopt(repo_path, "task-0a1b2c3d", None)
+            .create_or_adopt(repo_path, "task-0a1b2c3d", None, BaseSync::Local)
             .await
             .map(|(info, base)| (info.path, base))
             .expect_err("a moved checkout is not a default-base start");
@@ -7319,7 +7325,7 @@ branch refs/heads/some-other-branch
 
         let reattached = mgr.reattach(project, "task-c0ffee11").await.map(|info| info.path);
         let acquired = mgr
-            .create_or_adopt(project, "task-c0ffee11", None)
+            .create_or_adopt(project, "task-c0ffee11", None, BaseSync::Local)
             .await
             .map(|(info, _)| info.path);
 
@@ -7344,7 +7350,7 @@ branch refs/heads/some-other-branch
 
         let mgr = test_manager();
         let (info, created_from) = mgr
-            .create_or_adopt(repo_path, "task-c0ffee11", None)
+            .create_or_adopt(repo_path, "task-c0ffee11", None, BaseSync::Local)
             .await
             .expect("a new worktree");
 
@@ -7466,7 +7472,7 @@ branch refs/heads/some-other-branch
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         let mgr = test_manager();
-        let (leftover, _) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d", None).await.expect("create");
+        let (leftover, _) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d", None, BaseSync::Local).await.expect("create");
         let branch_before = run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]);
 
         std::fs::write(tmp.path().join("later.txt"), "later\n").unwrap();
@@ -7496,7 +7502,7 @@ branch refs/heads/some-other-branch
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         let mgr = test_manager();
-        let (leftover, _) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d", None).await.expect("create");
+        let (leftover, _) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d", None, BaseSync::Local).await.expect("create");
         let held_commit = run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]);
 
         std::fs::write(tmp.path().join("later.txt"), "later\n").unwrap();
@@ -7535,7 +7541,7 @@ branch refs/heads/some-other-branch
 
         let mgr = test_manager();
         let refused = match mgr
-            .create_or_adopt_holding(repo_path, "task-0a1b2c3d", None, std::slice::from_ref(&held_commit))
+            .create_or_adopt_holding(repo_path, "task-0a1b2c3d", None, BaseSync::Local, std::slice::from_ref(&held_commit))
             .await
         {
             Err(refused) => refused,
@@ -7554,7 +7560,7 @@ branch refs/heads/some-other-branch
         let repo_path = tmp.path().to_str().unwrap();
         let refs_before = all_refs(repo_path);
         let mgr = test_manager();
-        let (info, base) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d", None).await.expect("create");
+        let (info, base) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d", None, BaseSync::Local).await.expect("create");
         let created_at = base.expect("created, not adopted").commit;
 
         mgr.undo_created_checkout(repo_path, &info, &created_at).await.expect("taken back");
@@ -7571,7 +7577,7 @@ branch refs/heads/some-other-branch
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         let mgr = test_manager();
-        let (info, base) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d", None).await.expect("create");
+        let (info, base) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d", None, BaseSync::Local).await.expect("create");
         let created_at = base.expect("created").commit;
         std::fs::write(Path::new(&info.path).join("notes.txt"), "unsaved\n").unwrap();
 
@@ -7589,7 +7595,7 @@ branch refs/heads/some-other-branch
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         let mgr = test_manager();
-        let (info, base) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d", None).await.expect("create");
+        let (info, base) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d", None, BaseSync::Local).await.expect("create");
         let created_at = base.expect("created").commit;
         let work = commit_in(&info.path, "work nobody recorded");
 
@@ -7609,7 +7615,7 @@ branch refs/heads/some-other-branch
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         let mgr = test_manager();
-        let (info, base) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d", None).await.expect("create");
+        let (info, base) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d", None, BaseSync::Local).await.expect("create");
         let created_at = base.expect("created").commit;
         let hook = tmp.path().join(".git").join("hooks").join("reference-transaction");
         std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
@@ -7628,5 +7634,88 @@ branch refs/heads/some-other-branch
         assert!(kept.contains(&format!("the worktree at {} was removed", info.path)), "{kept}");
         assert!(kept.contains(&created_at), "{kept}");
         assert!(kept.contains("deleted or renamed"), "{kept}");
+    }
+
+    /// Origin gains a commit the repository has not fetched, pushed from
+    /// another clone. Returns that commit.
+    fn advance_origin(tmp: &TempRepo) -> String {
+        let clone = tmp.root().join("other-clone");
+        let clone_path = clone.to_str().unwrap();
+        run_git(tmp.root().to_str().unwrap(), &["clone", "-q", "-b", "main", tmp.origin().to_str().unwrap(), clone_path]);
+        run_git(clone_path, &["-c", "user.email=t@t", "-c", "user.name=T", "commit", "-q", "--allow-empty", "-m", "remote only"]);
+        run_git(clone_path, &["push", "-q", "origin", "HEAD:main"]);
+        run_git(clone_path, &["rev-parse", "HEAD"])
+    }
+
+    /// Under the latest remote base a new Task Checkout's branch is created
+    /// at the commit fetched from origin just before, and that commit is the
+    /// base it reports, which the Task records as its base commit.
+    #[tokio::test]
+    async fn a_new_checkout_under_the_latest_remote_base_starts_at_the_fetched_commit() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let local_main = run_git(repo_path, &["rev-parse", "refs/heads/main"]);
+        let newer = advance_origin(&tmp);
+
+        let mgr = test_manager();
+        let (info, base) = mgr
+            .create_or_adopt(repo_path, "task-0a1b2c3d", None, BaseSync::FetchRemote)
+            .await
+            .expect("created");
+
+        let base = base.expect("created, not adopted");
+        assert_eq!(base.commit, newer);
+        assert_eq!(run_git(&info.path, &["rev-parse", "HEAD"]), newer);
+        assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/main"]), local_main, "local main is not moved");
+    }
+
+    /// A fetch that fails creates nothing: no branch, no worktree, and no
+    /// checkout at the stale remote-tracking commit in its place.
+    #[tokio::test]
+    async fn a_failed_fetch_creates_no_checkout() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        run_git(repo_path, &["remote", "set-url", "origin", tmp.root().join("gone.git").to_str().unwrap()]);
+        let refs_before = all_refs(repo_path);
+
+        let refused = test_manager()
+            .create_or_adopt(repo_path, "task-0a1b2c3d", None, BaseSync::FetchRemote)
+            .await
+            .map(|(info, _)| info.path)
+            .expect_err("refused");
+
+        assert!(refused.contains("fetching it failed"), "{refused}");
+        assert_eq!(all_refs(repo_path), refs_before);
+        assert_eq!(registered_worktrees(repo_path).len(), 1, "only the primary checkout");
+    }
+
+    /// An existing Task Checkout is adopted exactly as it is under the latest
+    /// remote base: nothing is fetched for it, its branch and work are not
+    /// moved, and an unreachable origin does not stand in its way.
+    #[tokio::test]
+    async fn an_existing_checkout_is_left_untouched_by_the_latest_remote_base() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let mgr = test_manager();
+        let (info, _) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d", None, BaseSync::Local).await.expect("create");
+        let work = commit_in(&info.path, "task work");
+        std::fs::write(Path::new(&info.path).join("notes.txt"), "unsaved\n").unwrap();
+        let stale = run_git(repo_path, &["rev-parse", "refs/remotes/origin/main"]);
+        advance_origin(&tmp);
+
+        for sync_origin in [None, Some(tmp.root().join("gone.git"))] {
+            if let Some(url) = &sync_origin {
+                run_git(repo_path, &["remote", "set-url", "origin", url.to_str().unwrap()]);
+            }
+            let (adopted, base) = mgr
+                .create_or_adopt(repo_path, "task-0a1b2c3d", None, BaseSync::FetchRemote)
+                .await
+                .expect("adopted");
+            assert_eq!(base, None, "adopted, not created");
+            assert_eq!(adopted.path, info.path);
+            assert_eq!(run_git(&info.path, &["rev-parse", "HEAD"]), work);
+            assert_eq!(std::fs::read_to_string(Path::new(&info.path).join("notes.txt")).unwrap(), "unsaved\n");
+            assert_eq!(run_git(repo_path, &["rev-parse", "refs/remotes/origin/main"]), stale, "nothing was fetched");
+        }
     }
 }

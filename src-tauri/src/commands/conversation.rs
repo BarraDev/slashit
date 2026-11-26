@@ -1809,6 +1809,7 @@ mod tests {
                     scope: Default::default(),
                     state_location: crate::config::paths::StateLocation::External,
                     base: None,
+                    base_sync: Default::default(),
                     agent_type: crate::domain::project::AgentType::ClaudeCode,
                     agent_config: crate::domain::project::AgentConfig {
                         agent_type: crate::domain::project::AgentType::ClaudeCode,
@@ -1980,6 +1981,7 @@ mod tests {
                     scope: Default::default(),
                     state_location: crate::config::paths::StateLocation::External,
                     base: None,
+                    base_sync: Default::default(),
                     agent_type: crate::domain::project::AgentType::ClaudeCode,
                     agent_config: crate::domain::project::AgentConfig {
                         agent_type: crate::domain::project::AgentType::ClaudeCode,
@@ -2295,6 +2297,7 @@ mod tests {
                     scope: Default::default(),
                     state_location: crate::config::paths::StateLocation::External,
                     base: None,
+                    base_sync: Default::default(),
                     agent_type: crate::domain::project::AgentType::ClaudeCode,
                     agent_config: crate::domain::project::AgentConfig {
                         agent_type: crate::domain::project::AgentType::ClaudeCode,
@@ -2674,6 +2677,7 @@ mod tests {
                     scope: Default::default(),
                     state_location: crate::config::paths::StateLocation::External,
                     base: None,
+                    base_sync: Default::default(),
                     agent_type: crate::domain::project::AgentType::ClaudeCode,
                     agent_config: crate::domain::project::AgentConfig {
                         agent_type: crate::domain::project::AgentType::ClaudeCode,

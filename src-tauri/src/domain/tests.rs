@@ -69,6 +69,7 @@ mod project_tests {
             scope: crate::domain::ProjectScope::Standalone,
             state_location: crate::config::paths::StateLocation::External,
             base: None,
+            base_sync: Default::default(),
             agent_type: AgentType::ClaudeCode,
             agent_config: AgentConfig {
                 agent_type: AgentType::ClaudeCode,

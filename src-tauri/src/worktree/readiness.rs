@@ -7,12 +7,12 @@
 //! and is reported beside it, never as a condition of it. Everything here
 //! only reads.
 
-use super::default_base::{local_branch_commit, resolve_default_base, resolve_remote_base, ResolvedBase};
+use super::default_base::{local_branch_commit, resolve_base_as_fetched, resolve_remote_base, ResolvedBase};
 use super::restack::exact_ref;
 use super::project_base::{self, Proposal};
 use super::remote_head::{remote_state, RemoteState};
 use super::vcs::{self, Head, Vcs};
-use crate::domain::ProjectBase;
+use crate::domain::{BaseSync, ProjectBase};
 use serde::Serialize;
 use std::path::Path;
 
@@ -58,6 +58,9 @@ pub struct Readiness {
     /// branch. When false, origin's default branch is used wherever the
     /// repository names one, as it always was.
     pub prefers_local: bool,
+    /// Whether new Task Checkouts start from origin's default branch fetched
+    /// just before (`FetchRemote`), or from the refs as they are (`Local`).
+    pub base_sync: BaseSync,
     /// The local base branch against origin's, when both exist.
     pub standing: Option<BaseStanding>,
     /// Where a task started now would start. `None` exactly when
@@ -81,6 +84,7 @@ pub struct Readiness {
 pub async fn readiness(
     repo_path: &str,
     project_base: Option<&ProjectBase>,
+    base_sync: BaseSync,
 ) -> Result<Readiness, String> {
     let repo = Path::new(repo_path);
     let vcs = vcs::detect(repo).await?;
@@ -95,7 +99,9 @@ pub async fn readiness(
     } else {
         (false, Head::Unknown, RemoteState::NoOrigin, Vec::new())
     };
-    let (base, blocked) = match resolve_default_base(repo_path, project_base).await {
+    // Nothing is fetched to report this: under `FetchRemote` it is origin's
+    // default branch as last fetched.
+    let (base, blocked) = match resolve_base_as_fetched(repo_path, project_base, base_sync).await {
         Ok(base) => (Some(base), None),
         Err(why) => (None, Some(why)),
     };
@@ -115,6 +121,7 @@ pub async fn readiness(
         remote,
         project_base: project_base.map(|b| b.branch().to_string()),
         prefers_local: project_base.is_some_and(ProjectBase::prefers_local),
+        base_sync,
         standing: if supported { standing(repo, repo_path, project_base).await } else { None },
         base,
         blocked,

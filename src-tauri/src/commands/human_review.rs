@@ -1541,6 +1541,7 @@ mod tests {
                 scope: crate::domain::project::ProjectScope::Standalone,
                 state_location: crate::config::paths::StateLocation::External,
                 base: Some(base.clone()),
+                base_sync: Default::default(),
                 agent_type: crate::domain::AgentType::ClaudeCode,
                 agent_config: crate::domain::AgentConfig {
                     agent_type: crate::domain::AgentType::ClaudeCode,
@@ -1565,7 +1566,7 @@ mod tests {
         let branch = "task-local-done".to_string();
         let (info, _) = state
             .worktree_manager
-            .create_or_adopt(repo.to_str().unwrap(), &branch, Some(&base))
+            .create_or_adopt(repo.to_str().unwrap(), &branch, Some(&base), crate::domain::BaseSync::Local)
             .await
             .expect("a Task Checkout");
         let worktree = std::path::PathBuf::from(&info.path);
@@ -2486,6 +2487,7 @@ mod tests {
                 base: Some(crate::domain::project::ProjectBase::LocalBranch {
                     branch: "task-branch".to_string(),
                 }),
+                base_sync: Default::default(),
                 agent_type: crate::domain::AgentType::ClaudeCode,
                 agent_config: crate::domain::AgentConfig {
                     agent_type: crate::domain::AgentType::ClaudeCode,

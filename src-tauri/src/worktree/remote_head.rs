@@ -151,6 +151,42 @@ fn explain_failure(stderr: &str) -> String {
     format!("{what} Nothing was changed. (git: {stderr})")
 }
 
+/// Fetch origin's branch `branch` into `refs/remotes/origin/<branch>`, and
+/// only that ref, returning the object ID it then holds.
+///
+/// Run for a project whose new Task Checkouts start from the latest remote
+/// base (`domain::BaseSync::FetchRemote`), just before the base is resolved.
+/// The refspec is spelled out, so no other remote-tracking ref, no tag and
+/// no local branch is touched, and nothing is pushed. Bounded like
+/// [`detect_default_branch`], and never waits on a credential prompt.
+/// `branch` must already have passed [`super::checked_task_branch`].
+pub(super) async fn fetch_origin_branch(repo: &Path, branch: &str) -> Result<String, String> {
+    let tracking = format!("refs/remotes/origin/{branch}");
+    let refspec = format!("+refs/heads/{branch}:{tracking}");
+    let mut command = crate::host_process::tokio_command("git");
+    command
+        .args(["fetch", "--no-tags", "--quiet", "origin", &refspec])
+        .current_dir(repo)
+        .stdin(std::process::Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "")
+        .env("SSH_ASKPASS", "")
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(REMOTE_DEADLINE, command.output())
+        .await
+        .map_err(|_| format!("origin did not answer within {} seconds", REMOTE_DEADLINE.as_secs()))?
+        .map_err(|e| format!("Failed to run git fetch: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git fetch origin {branch} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    super::restack::exact_ref(repo, &tracking)
+        .await?
+        .ok_or_else(|| format!("{tracking} does not exist after fetching {branch} from origin"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

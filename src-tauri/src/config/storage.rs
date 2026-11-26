@@ -3558,6 +3558,7 @@ baz = 123
             scope: ProjectScope::Standalone,
             state_location: StateLocation::External,
             base: None,
+            base_sync: Default::default(),
             agent_type: AgentType::ClaudeCode,
             agent_config: AgentConfig {
                 agent_type: AgentType::ClaudeCode,
@@ -3611,6 +3612,7 @@ baz = 123
             scope: crate::domain::ProjectScope::Standalone,
             state_location: crate::config::paths::StateLocation::External,
             base: None,
+            base_sync: Default::default(),
             agent_type: AgentType::ClaudeCode,
             agent_config: AgentConfig {
                 agent_type: AgentType::ClaudeCode,
@@ -4111,6 +4113,7 @@ user_name = "Test"
                 scope: crate::domain::ProjectScope::Standalone,
                 state_location: crate::config::paths::StateLocation::External,
                 base: None,
+                base_sync: Default::default(),
                 agent_type: AgentType::ClaudeCode,
                 agent_config: AgentConfig {
                     agent_type: AgentType::ClaudeCode,
@@ -4208,6 +4211,7 @@ user_name = "Test"
             scope: crate::domain::ProjectScope::Standalone,
             state_location: crate::config::paths::StateLocation::External,
             base: None,
+            base_sync: Default::default(),
             agent_type: AgentType::ClaudeCode,
             agent_config: AgentConfig {
                 agent_type: AgentType::ClaudeCode,

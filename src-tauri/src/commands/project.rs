@@ -149,6 +149,7 @@ pub async fn create_project(
         // the project is a deliberate opt-in, never the default.
         state_location: crate::config::paths::StateLocation::External,
         base,
+        base_sync: Default::default(),
         agent_type,
         agent_config,
         created_at: now,
@@ -1553,6 +1554,7 @@ pub(crate) mod tests {
             scope: ProjectScope::Standalone,
             state_location: StateLocation::External,
             base: None,
+            base_sync: Default::default(),
             agent_type: AgentType::ClaudeCode,
             agent_config: get_default_agent_config(&AgentType::ClaudeCode),
             created_at: chrono::Utc::now(),

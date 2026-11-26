@@ -101,6 +101,18 @@ impl BaseStanding {
     }
 }
 
+/// Mirrors the backend's `domain::BaseSync`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaseSync {
+    /// The local base revision: the refs as they are; nothing is fetched.
+    #[default]
+    Local,
+    /// The latest remote base: origin's default branch, fetched when each new
+    /// Task Checkout is created.
+    FetchRemote,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Readiness {
     pub path: String,
@@ -111,6 +123,10 @@ pub struct Readiness {
     pub project_base: Option<String>,
     #[serde(default)]
     pub prefers_local: bool,
+    /// Whether new Task Checkouts start from origin's default branch fetched
+    /// just before, or from the refs as they are.
+    #[serde(default)]
+    pub base_sync: BaseSync,
     #[serde(default)]
     pub standing: Option<BaseStanding>,
     pub base: Option<ResolvedBase>,
