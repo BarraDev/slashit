@@ -3818,6 +3818,62 @@ mod task_dependency_contract {
         );
     }
 
+    /// The `update_task` request the desktop form sends for an Edit save: every
+    /// field present, and a review field null when the form did not change it.
+    /// The regression is the explicit `reviewMode`/`reviewerModel` the form used
+    /// to send on every save, which a legacy Task with no reviewer refuses.
+    #[tokio::test]
+    async fn the_desktop_edit_request_leaves_a_legacy_automatic_task_alone() {
+        use crate::domain::task::ReviewMode;
+        let project_id = Uuid::new_v4();
+        let mut legacy = task(project_id, "legacy", TaskStatus::Backlog, vec![]);
+        legacy.review_mode = ReviewMode::Automatic;
+        let legacy_id = legacy.id;
+        let (_tmp, _paths, app) = app_with(vec![legacy], &[project_id]).await;
+        let gui_edit = |review_mode: serde_json::Value, reviewer: serde_json::Value| {
+            serde_json::from_value::<UpdateTaskParams>(serde_json::json!({
+                "taskId": legacy_id.to_string(),
+                "title": "legacy renamed",
+                "description": null,
+                "category": "feature",
+                "priority": "medium",
+                "complexity": null,
+                "impact": null,
+                "securitySeverity": null,
+                "model": "default",
+                "reviewerModel": reviewer,
+                "provider": "claude",
+                "reviewMode": review_mode,
+                "planningMode": false,
+                "dependencies": null,
+            }))
+            .expect("the desktop request deserializes")
+        };
+
+        update_task(
+            GuiMutation::untracked(),
+            app.state(),
+            gui_edit(serde_json::Value::Null, serde_json::Value::Null),
+        )
+        .await
+        .expect("an unrelated Edit of a legacy Automatic Task without a reviewer saves")
+        .expect("the task exists");
+        let (memory, disk) = both_copies(&app, project_id, legacy_id).await;
+        assert_eq!(memory["title"], "legacy renamed");
+        assert_eq!(disk["title"], "legacy renamed");
+
+        // The request the form sent before the fix names the stored Automatic
+        // configuration as explicit, so the same Edit is refused.
+        let error = update_task(
+            GuiMutation::untracked(),
+            app.state(),
+            gui_edit(serde_json::json!("automatic"), serde_json::json!("")),
+        )
+        .await
+        .expect_err("an explicit Automatic with no reviewer is refused");
+        assert!(error.contains("AI Reviewer"), "{error}");
+    }
+
     /// An Edit with every field unchanged except the ones a test names.
     fn edit_of(task_id: Uuid, model: Option<&str>, dependencies: Option<Vec<Uuid>>) -> UpdateTaskParams {
         UpdateTaskParams {

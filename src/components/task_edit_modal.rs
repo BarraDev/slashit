@@ -23,6 +23,20 @@ pub enum TaskEditMode {
     Edit(Box<Task>),
 }
 
+/// The review fields an Edit save sends. A field the form left as it was is
+/// omitted, so an unrelated edit never submits the stored review configuration
+/// as an explicit request, which the backend judges.
+fn review_fields_to_save(
+    saved_mode: ReviewMode,
+    saved_reviewer: Option<&str>,
+    review_mode: ReviewMode,
+    reviewer: &str,
+) -> (Option<ReviewMode>, Option<String>) {
+    let mode = (review_mode != saved_mode).then_some(review_mode);
+    let reviewer = (reviewer != saved_reviewer.unwrap_or_default()).then(|| reviewer.to_string());
+    (mode, reviewer)
+}
+
 /// The model each Worker runtime keeps during one edit. Switching runtimes
 /// keeps the model of the runtime being left and restores the one kept for the
 /// runtime entered. A runtime with nothing kept has no model, so one must be
@@ -604,11 +618,21 @@ pub fn TaskEditModal(
                                                     complexity: None,
                                                     impact: None,
                                                     security_severity: None,
-                                                    review_mode: review_mode_val,
+                                                    // The form offers no review choice for a new Task, so the
+                                                    // backend default applies rather than an explicit request.
+                                                    review_mode: None,
                                                     provider: provider_val,
                                                 }).await
                                             }
                                             TaskEditMode::Edit(task) => {
+                                                // Review fields are sent only when the form changed them, so an
+                                                // unrelated edit does not re-submit the stored configuration.
+                                                let (review_mode_save, reviewer_save) = review_fields_to_save(
+                                                    task.review_mode,
+                                                    task.reviewer_model.as_deref(),
+                                                    review_mode_val,
+                                                    &reviewer_val,
+                                                );
                                                 // The dependency and the other fields are one backend write: a refused
                                                 // part changes nothing, so the Task never keeps a partial Save.
                                                 update_task(crate::services::task_service::UpdateTaskParams {
@@ -621,9 +645,9 @@ pub fn TaskEditModal(
                                                     impact: None,
                                                     security_severity: None,
                                                     model: Some(model_val),
-                                                    reviewer_model: Some(reviewer_val),
+                                                    reviewer_model: reviewer_save,
                                                     provider: Some(provider_val),
-                                                    review_mode: Some(review_mode_val),
+                                                    review_mode: review_mode_save,
                                                     planning_mode: Some(planning_val),
                                                     dependencies: edit_dependency,
                                                 }).await.map(|opt| opt.unwrap_or(*task))
@@ -676,7 +700,28 @@ pub fn TaskEditModal(
 
 #[cfg(test)]
 mod tests {
-    use super::{CodingProvider, KeptModels};
+    use super::{review_fields_to_save, CodingProvider, KeptModels, ReviewMode};
+
+    /// An unrelated edit of a saved Task sends no review field, so a legacy
+    /// Automatic Task with no reviewer is not re-judged as an explicit request.
+    #[test]
+    fn an_unchanged_review_configuration_is_not_sent() {
+        use ReviewMode::{Automatic, Manual};
+        assert_eq!(review_fields_to_save(Automatic, None, Automatic, ""), (None, None));
+        assert_eq!(review_fields_to_save(Manual, Some("sonnet"), Manual, "sonnet"), (None, None));
+    }
+
+    /// A review choice the person changed is sent, including a cleared reviewer.
+    #[test]
+    fn a_changed_review_configuration_is_sent() {
+        use ReviewMode::{Automatic, Manual};
+        assert_eq!(
+            review_fields_to_save(Manual, None, Automatic, "sonnet"),
+            (Some(Automatic), Some("sonnet".to_string())),
+        );
+        assert_eq!(review_fields_to_save(Automatic, Some("opus"), Automatic, ""), (None, Some(String::new())));
+        assert_eq!(review_fields_to_save(Automatic, Some("opus"), Manual, "opus"), (Some(Manual), None));
+    }
 
     /// Switching the Worker never writes the provider default over a saved
     /// model, and a runtime that has none kept starts empty.
