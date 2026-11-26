@@ -257,6 +257,7 @@ mod tests {
                 reviewer_model: None,
                 new_attempt: None,
                 new_attempt_confirmed: false,
+                continuation_instructions: Vec::new(),
                 approved_execution: None,
                 executed_approvals: Vec::new(),
                 created_at: chrono::Utc::now(),

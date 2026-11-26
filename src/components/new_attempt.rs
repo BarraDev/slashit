@@ -26,6 +26,7 @@ use crate::services::new_attempt_service::{
 fn basis(request: &AuthorizeNewAttemptRequest) -> AuthorizeNewAttemptRequest {
     AuthorizeNewAttemptRequest {
         decision_id: Uuid::nil(),
+        instructions: None,
         ..request.clone()
     }
 }
@@ -87,6 +88,9 @@ pub fn NewAttemptPanel(
     let decision = StoredValue::new(None::<AuthorizeNewAttemptRequest>);
     // Set while the last request's answer is unknown: it is sent again, exactly.
     let unknown = RwSignal::new(false);
+    // What the person typed, and the interrupted run it was typed for.
+    let instructions = RwSignal::new(String::new());
+    let instructions_run = StoredValue::new(None::<u32>);
     let asked = StoredValue::new(Latest::default());
 
     let reload = move || {
@@ -152,6 +156,11 @@ pub fn NewAttemptPanel(
                 }
             }
         }
+        // Instructions written for one interrupted run are not offered to another.
+        if instructions_run.get_value() != shown.run {
+            instructions.set(String::new());
+            instructions_run.set_value(shown.run);
+        }
         refusal.set(None);
         acknowledged.set(false);
         confirming.set(true);
@@ -161,9 +170,14 @@ pub fn NewAttemptPanel(
         if busy.get_untracked() || !acknowledged.get_untracked() {
             return;
         }
-        let Some(request) = decision.with_value(Clone::clone) else {
+        let Some(mut request) = decision.with_value(Clone::clone) else {
             return;
         };
+        // A request whose answer is unknown is sent again exactly as it was.
+        if !unknown.get_untracked() {
+            request = request.with_instructions(&instructions.get_untracked(), Uuid::new_v4());
+            decision.set_value(Some(request.clone()));
+        }
         busy.set(true);
         refusal.set(None);
         held.set(None);
@@ -181,6 +195,7 @@ pub fn NewAttemptPanel(
                     match started {
                         Ok(task) => {
                             decision.try_set_value(None);
+                            instructions.try_set(String::new());
                             apply_task.try_run(task);
                             crate::components::toast::success(
                                 "A new attempt started on this checkout.".to_string(),
@@ -297,6 +312,16 @@ pub fn NewAttemptPanel(
                                 <Show when=move || confirming.get()>
                                     <div data-testid="new-attempt-confirm" class="rounded-md border border-white/10 bg-black/20 p-2 space-y-2">
                                         <p class="text-xs font-semibold text-white/70">"Start a new coding attempt on this checkout?"</p>
+                                        <label class="block space-y-1 text-xs text-white/60">
+                                            <span>"Instructions for this run (optional). They are sent to this run only, are kept in the Task's history, and are not added to the Task description or a pull request description."</span>
+                                            <textarea
+                                                data-testid="new-attempt-instructions"
+                                                class="w-full min-h-20 rounded-md border border-white/10 bg-black/30 p-2 text-xs text-white/80 disabled:opacity-50"
+                                                disabled=move || busy.get() || unknown.get()
+                                                prop:value=move || instructions.get()
+                                                on:input=move |ev| instructions.set(event_target_value(&ev))
+                                            ></textarea>
+                                        </label>
                                         <label class="flex items-start gap-2 text-xs text-white/60">
                                             <input
                                                 data-testid="new-attempt-acknowledge"

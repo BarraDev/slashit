@@ -63,6 +63,8 @@ pub struct AuthorizeNewAttemptRequest {
     pub checkout: String,
     pub expected_head: String,
     pub dirty_fingerprint: String,
+    /// What the new run is told, in addition to the Task.
+    pub instructions: Option<String>,
 }
 
 impl AuthorizeNewAttemptRequest {
@@ -83,7 +85,21 @@ impl AuthorizeNewAttemptRequest {
             checkout: evidence.checkout.clone()?,
             expected_head: evidence.expected_head.clone()?,
             dirty_fingerprint: evidence.dirty_fingerprint.clone()?,
+            instructions: None,
         })
+    }
+
+    /// This decision carrying `text`. Different instructions are a different
+    /// decision, so they take `new_id`; the same ones keep the decision as it
+    /// is, so sending it again cannot apply twice. Blank text means none.
+    pub fn with_instructions(mut self, text: &str, new_id: Uuid) -> Self {
+        let text = text.trim();
+        let instructions = (!text.is_empty()).then(|| text.to_string());
+        if instructions != self.instructions {
+            self.instructions = instructions;
+            self.decision_id = new_id;
+        }
+        self
     }
 }
 
@@ -151,6 +167,19 @@ mod tests {
         assert_eq!(request.expected_head, "b".repeat(40));
         assert_eq!(request.dirty_fingerprint, "sha256:abc");
         assert_eq!(request.checkout, "/work/one");
+        assert_eq!(request.instructions, None);
+    }
+
+    #[test]
+    fn changed_instructions_make_a_new_decision_and_unchanged_ones_do_not() {
+        let first = Uuid::from_u128(9);
+        let second = Uuid::from_u128(10);
+        let plain = AuthorizeNewAttemptRequest::for_evidence(&evidence(), first).unwrap();
+        assert_eq!(plain.clone().with_instructions("  \n", second), plain);
+        let told = plain.with_instructions(" finish the tests ", second);
+        assert_eq!(told.decision_id, second);
+        assert_eq!(told.instructions.as_deref(), Some("finish the tests"));
+        assert_eq!(told.clone().with_instructions("finish the tests", first), told);
     }
 
     #[test]

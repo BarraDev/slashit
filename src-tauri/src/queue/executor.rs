@@ -5230,15 +5230,25 @@ impl TaskExecutor {
                 }
                 // What is handed to the provider is built from this snapshot.
                 let model = t.configured_model().map(str::to_string);
-                *launch_input.lock().unwrap_or_else(|p| p.into_inner()) = Some((
-                    build_run_prompt(
-                        t,
-                        Some(acquired.info.path.as_str()),
-                        approved.as_ref().and_then(|binding| binding.request.as_deref()),
-                    ),
-                    model,
-                    t.provider,
-                ));
+                let mut prompt = build_run_prompt(
+                    t,
+                    Some(acquired.info.path.as_str()),
+                    approved.as_ref().and_then(|binding| binding.request.as_deref()),
+                );
+                // Only this attempt's own decision supplies instructions. Those
+                // of earlier runs stay in the history and are not sent again.
+                if let Some((decision, instructions)) =
+                    new_attempt.and_then(|d| Some((d, d.instructions.as_deref()?)))
+                {
+                    prompt = crate::queue::prompt::with_continuation_instructions(
+                        prompt,
+                        instructions,
+                        decision.for_run,
+                        &acquired.info.path,
+                    );
+                }
+                *launch_input.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Some((prompt, model, t.provider));
                 if let Some(decision) = new_attempt {
                     // Only the decision the person made may start this run, and
                     // only while the Task still records exactly that recovery.
@@ -5250,6 +5260,19 @@ impl TaskExecutor {
                         return;
                     }
                     QueueManager::apply_promotion(t);
+                    // Bound to the run this same write starts.
+                    if let Some(instructions) = &decision.instructions {
+                        let run = t.next_run();
+                        t.continuation_instructions.push(
+                            crate::domain::task::ContinuationInstructions {
+                                run,
+                                follows_run: decision.for_run,
+                                decision_id: decision.decision_id,
+                                instructions: instructions.clone(),
+                                authorized_at: decision.authorized_at,
+                            },
+                        );
+                    }
                     // Consumed by this same record: the start cannot be recorded
                     // without the authorization ending, and the authorization
                     // cannot end without the run starting.
@@ -23835,6 +23858,7 @@ VERDICT: APPROVED"
                 expected_head: head,
                 dirty_fingerprint: String::new(),
                 dirty_paths: Vec::new(),
+                instructions: None,
                 authorized_at: chrono::Utc::now(),
             };
             let membership = TaskExecutor::read_membership(&w.executor.tasks, &w.executor.projects, &w.executor.workspace_registry, w.task_id).await;
@@ -25224,6 +25248,7 @@ VERDICT: APPROVED"
                     expected_head: fingerprint.head.clone(),
                     dirty_fingerprint: fingerprint.digest.clone(),
                     dirty_paths: fingerprint.dirty_paths.clone(),
+                    instructions: None,
                     authorized_at: chrono::Utc::now(),
                 };
                 let id = w.task_id;

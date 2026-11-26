@@ -11201,6 +11201,21 @@ mod tests {
     }
 
     #[test]
+    fn pr_body_never_carries_continuation_instructions() {
+        let mut task = create_test_task("Recovered");
+        task.description = Some("The original description".to_string());
+        task.continuation_instructions = vec![crate::domain::task::ContinuationInstructions {
+            run: 2,
+            follows_run: 1,
+            decision_id: uuid::Uuid::new_v4(),
+            instructions: "private recovery guidance".to_string(),
+            authorized_at: chrono::Utc::now(),
+        }];
+
+        assert_eq!(build_pr_body(&task, "org/repo"), "The original description");
+    }
+
+    #[test]
     fn pr_body_no_description_with_issue_ref() {
         let mut task = create_test_task("No desc fix");
         task.external_refs = vec![ExternalRef::GithubIssue {

@@ -387,6 +387,15 @@ pub struct Task {
     #[serde(skip)]
     pub new_attempt_confirmed: bool,
 
+    /// The instructions a person gave to individual recovery runs, one entry
+    /// per run that started with any, oldest first. Each is appended in the
+    /// write that records that run's start and is never changed or removed, so
+    /// a later recovery adds its own entry and an earlier one is never applied
+    /// again. It is run history, not part of the Task's definition: it does not
+    /// enter the description, the approval digests or a pull request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub continuation_instructions: Vec<ContinuationInstructions>,
+
     /// The coding input a Human approved when the Project Coordinator queued
     /// this Task, bound to the one run that approval may start. The executor
     /// compares it with the Task in the same write that records the run's
@@ -527,6 +536,27 @@ pub struct NewAttemptDecision {
     /// will include.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dirty_paths: Vec<String>,
+    /// What the person told the new run, if anything. It is part of the
+    /// decision's identity, and reaches only the run this decision starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    pub authorized_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// The longest continuation instructions one recovery run accepts.
+pub const MAX_CONTINUATION_INSTRUCTIONS_CHARS: usize = 20_000;
+
+/// The instructions one recovery run was started with.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ContinuationInstructions {
+    /// The run that received the instructions.
+    pub run: u32,
+    /// The recovered run it continued.
+    pub follows_run: u32,
+    /// The new-attempt decision that carried them.
+    pub decision_id: Uuid,
+    pub instructions: String,
     pub authorized_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -1074,6 +1104,7 @@ impl Task {
             review_fix_residue: None,
             new_attempt: None,
             new_attempt_confirmed: false,
+            continuation_instructions: Vec::new(),
             approved_execution: None,
             executed_approvals: Vec::new(),
             created_at: now,
@@ -2985,6 +3016,7 @@ mod tests {
             expected_head: "a".repeat(40),
             dirty_fingerprint: "sha256:0".into(),
             dirty_paths: Vec::new(),
+            instructions: None,
             authorized_at: chrono::Utc::now(),
         };
         task.new_attempt = Some(decision.clone());

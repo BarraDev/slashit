@@ -1847,6 +1847,7 @@ mod tests {
             expected_head: "a".repeat(40),
             dirty_fingerprint: "sha256:0".into(),
             dirty_paths: Vec::new(),
+            instructions: None,
             authorized_at: chrono::Utc::now(),
         });
 
