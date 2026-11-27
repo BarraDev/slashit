@@ -267,6 +267,7 @@ mod published_head_tests {
             fetched_at: Some(chrono::Utc::now()),
             attempted_at: chrono::Utc::now(),
             error,
+            generation: 0,
         }
     }
 

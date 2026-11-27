@@ -446,6 +446,31 @@ pub struct PrStatusEntry {
     pub attempted_at: DateTime<Utc>,
     /// Why the latest attempt failed; `None` when it succeeded.
     pub error: Option<PrFetchError>,
+    /// The generation of the reading in `status`; zero before any reading.
+    /// Not part of the board's shape, so it is never serialized.
+    #[serde(skip)]
+    pub generation: u64,
+}
+
+/// One successfully published reading of a pull request: the answer, and the
+/// generation that identifies it. Two readings with the same state and head
+/// are still two observations, because each publication gets its own
+/// generation; a coalesced caller that joined an attempt shares its
+/// generation. Application paths decide on the generation, not on the state
+/// and head alone (see [`PrStatuses::admit`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrObservation {
+    pub key: PrKey,
+    pub generation: u64,
+    pub status: PrStatus,
+}
+
+impl std::ops::Deref for PrObservation {
+    type Target = PrStatus;
+
+    fn deref(&self) -> &PrStatus {
+        &self.status
+    }
 }
 
 /// The wait a rate-limited pull request has earned: [`POLL_INTERVAL`] after
@@ -481,6 +506,15 @@ pub struct PrStatuses {
     /// Rate-limit streaks, kept beside the cache because a rate limit is
     /// about GitHub's quota, not about any reading.
     backoff: std::sync::Mutex<HashMap<PrKey, RateLimitBackoff>>,
+    /// The last generation handed to a published reading. Global, so it is
+    /// also monotonic for every pull request.
+    readings: std::sync::atomic::AtomicU64,
+    /// One admission gate per pull request. A publication and an admission
+    /// for the same pull request take it, so an admitted observation was the
+    /// latest at one instant. Held only across a synchronous cache write or
+    /// comparison, never across a network call and never while waiting for a
+    /// Task lifecycle lease.
+    gates: std::sync::Mutex<HashMap<PrKey, std::sync::Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// The claim on one pull request's attempt in flight. Dropping it ends the
@@ -529,6 +563,8 @@ impl PrStatuses {
             entries: std::sync::RwLock::new(HashMap::new()),
             in_flight: std::sync::Mutex::new(HashMap::new()),
             backoff: std::sync::Mutex::new(HashMap::new()),
+            readings: std::sync::atomic::AtomicU64::new(0),
+            gates: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -546,7 +582,7 @@ impl PrStatuses {
     /// so a refresh and the background poll never both ask for the same pull
     /// request at once. If that attempt is cancelled before it records
     /// anything, the waiting call asks itself.
-    pub async fn refresh(&self, key: &PrKey) -> Result<PrStatus, PrFetchError> {
+    pub async fn refresh(&self, key: &PrKey) -> Result<PrObservation, PrFetchError> {
         loop {
             let now = Utc::now();
             if let Some(until) = self.held_until(key, now) {
@@ -570,7 +606,7 @@ impl PrStatuses {
             }
             let started = Utc::now();
             let result = self.fetch(key).await;
-            let answer = self.settle(key, started, Utc::now(), result);
+            let answer = self.settle(key, started, Utc::now(), result).await;
             claim.settled();
             return answer;
         }
@@ -603,15 +639,20 @@ impl PrStatuses {
 
     /// What the cache says about `key`'s latest attempt, as an answer to a
     /// caller that did not make it.
-    fn answer(&self, key: &PrKey) -> Result<PrStatus, PrFetchError> {
+    fn answer(&self, key: &PrKey) -> Result<PrObservation, PrFetchError> {
         match self.get(key) {
             Some(PrStatusEntry {
                 error: Some(error), ..
             }) => Err(error),
             Some(PrStatusEntry {
                 status: Some(status),
+                generation,
                 ..
-            }) => Ok(status),
+            }) => Ok(PrObservation {
+                key: key.clone(),
+                generation,
+                status,
+            }),
             _ => Err(PrFetchError::new(
                 PrFetchErrorKind::Failed,
                 "GitHub's answer for this pull request is not available yet",
@@ -652,15 +693,24 @@ impl PrStatuses {
     /// answer is not handed back either: a caller would otherwise write an
     /// older state onto the task, say a closure after the pull request was
     /// reopened, which the cache itself refused.
-    fn settle(
+    async fn settle(
         &self,
         key: &PrKey,
         started: DateTime<Utc>,
         finished: DateTime<Utc>,
         result: Result<PrStatus, PrFetchError>,
-    ) -> Result<PrStatus, PrFetchError> {
+    ) -> Result<PrObservation, PrFetchError> {
+        // Publication is ordered by the per-pull-request gate: an admission
+        // (`admit`) sees either this reading or none of it, never half.
+        let gate = self.gate(key);
+        let _publishing = gate.lock().await;
         if self.record(key, started, finished, &result) {
-            result
+            let generation = self.get(key).map_or(0, |e| e.generation);
+            result.map(|status| PrObservation {
+                key: key.clone(),
+                generation,
+                status,
+            })
         } else {
             Err(PrFetchError::new(
                 PrFetchErrorKind::Failed,
@@ -675,7 +725,7 @@ impl PrStatuses {
     /// Each is its own attempt, with its own timeout and its own cache entry,
     /// so one that hangs or fails holds up a single slot and never takes a
     /// sibling's answer with it.
-    pub async fn refresh_each(&self, keys: Vec<PrKey>) -> Vec<(PrKey, Result<PrStatus, PrFetchError>)> {
+    pub async fn refresh_each(&self, keys: Vec<PrKey>) -> Vec<(PrKey, Result<PrObservation, PrFetchError>)> {
         in_order_bounded(keys, CONCURRENCY, |key| async move {
             let answer = self.refresh(&key).await;
             (key, answer)
@@ -686,6 +736,37 @@ impl PrStatuses {
     /// The cached entry for `key`, without asking anyone.
     pub fn get(&self, key: &PrKey) -> Option<PrStatusEntry> {
         self.entries.read().unwrap_or_else(|e| e.into_inner()).get(key).cloned()
+    }
+
+    /// Whether `observation` is still the cache's latest successful reading of
+    /// its pull request. Compared by generation, so a newer reading with the
+    /// same state and full head supersedes it too. A failed attempt leaves the
+    /// last good reading in place and is not a newer reading.
+    pub fn is_latest(&self, observation: &PrObservation) -> bool {
+        self.get(&observation.key)
+            .is_some_and(|e| e.status.is_some() && e.generation == observation.generation)
+    }
+
+    /// The admission boundary for an application of `observation`: whether it
+    /// is still the latest reading, decided while no publication for the same
+    /// pull request can land. The caller holds the Task lifecycle lease first
+    /// (the gate is never waited for while a lease is awaited), reads the
+    /// Task's evidence, calls this, and releases the gate at once. An admitted
+    /// decision is not revoked by a later publication.
+    pub async fn admit(&self, observation: &PrObservation) -> bool {
+        let gate = self.gate(&observation.key);
+        let _admitting = gate.lock().await;
+        self.is_latest(observation)
+    }
+
+    /// The admission and publication gate for `key`, created on first use.
+    fn gate(&self, key: &PrKey) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        self.gates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key.clone())
+            .or_default()
+            .clone()
     }
 
     /// The cached entries among `keys`, without asking anyone.
@@ -709,6 +790,19 @@ impl PrStatuses {
         self.record(key, at, at, &Ok(status));
     }
 
+    /// Publish `status` as read now and return the observation it became, for
+    /// a test of an application path.
+    #[cfg(test)]
+    pub fn observe(&self, key: &PrKey, status: PrStatus) -> PrObservation {
+        self.remember(key, status);
+        let entry = self.get(key).expect("a published reading has an entry");
+        PrObservation {
+            key: key.clone(),
+            generation: entry.generation,
+            status: entry.status.expect("a published reading has a status"),
+        }
+    }
+
     /// Store an attempt that started at `started` and ended at `finished`.
     ///
     /// An answer to an attempt older than the one already recorded is
@@ -729,6 +823,7 @@ impl PrStatuses {
             fetched_at: None,
             attempted_at: started,
             error: None,
+            generation: 0,
         });
         if started < entry.attempted_at {
             return false;
@@ -737,6 +832,7 @@ impl PrStatuses {
         match result {
             Ok(status) => {
                 entry.status = Some(status.clone());
+                entry.generation = self.readings.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 entry.fetched_at = Some(finished);
                 entry.error = None;
             }
@@ -1105,6 +1201,7 @@ mod tests {
         let entry = PrStatusEntry {
             repo: "o/r".to_string(),
             number: 7,
+            generation: 0,
             status: Some(PrStatus {
                 state: PrState::Open,
                 checks: ChecksState::NoChecks,
@@ -1350,8 +1447,46 @@ mod tests {
         PrStatus { state, checks, failing_checks: vec![], failing_check_count: 0, review_decision: None, mergeable: None , merge_commit: None, head_oid: None}
     }
 
-    #[test]
-    fn a_failure_keeps_the_last_good_status_and_a_success_clears_the_error() {
+    #[tokio::test]
+    async fn a_reading_is_superseded_by_any_newer_publication_even_with_the_same_state_and_head() {
+        let cache = PrStatuses::with_program("unused", FETCH_TIMEOUT);
+        let key = PrKey::new("o/r", 1);
+        let at_b = "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2";
+        let at_h = "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3";
+        let open_at = |head: Option<&str>| PrStatus {
+            head_oid: head.map(str::to_string),
+            ..status(PrState::Open, ChecksState::Passing)
+        };
+
+        let first = cache.observe(&key, open_at(Some(at_b)));
+        assert!(cache.is_latest(&first));
+        assert!(cache.admit(&first).await);
+
+        // An equal state and full head published again is a new observation.
+        let same = cache.observe(&key, open_at(Some(at_b)));
+        assert_ne!(first.generation, same.generation);
+        assert!(!cache.is_latest(&first));
+        assert!(!cache.admit(&first).await);
+        assert!(cache.admit(&same).await);
+
+        // A different head, an absent head and another state all supersede it.
+        let other_head = cache.observe(&key, open_at(Some(at_h)));
+        assert!(!cache.admit(&same).await);
+        assert!(cache.admit(&other_head).await);
+        let absent = cache.observe(&key, open_at(None));
+        assert!(!cache.admit(&other_head).await);
+        let closed = cache.observe(&key, status(PrState::Closed, ChecksState::Passing));
+        assert!(!cache.admit(&absent).await);
+        assert!(cache.admit(&closed).await);
+
+        // A failed attempt after the good reading keeps it as the latest one.
+        let later = Utc::now() + chrono::Duration::seconds(1);
+        cache.record(&key, later, later, &Err(PrFetchError::new(PrFetchErrorKind::Failed, "down")));
+        assert!(cache.admit(&closed).await);
+    }
+
+    #[tokio::test]
+    async fn a_failure_keeps_the_last_good_status_and_a_success_clears_the_error() {
         let cache = PrStatuses::with_program("unused", FETCH_TIMEOUT);
         let key = PrKey::new("o/r", 1);
         let t = |s: i64| DateTime::from_timestamp(1_800_000_000 + s, 0).unwrap();
@@ -1373,10 +1508,10 @@ mod tests {
 
         // An older attempt answering late does not put its reading back, and
         // its caller is not handed it to act on.
-        let late = cache.settle(&key, t(45), t(90), Ok(good_again()));
+        let late = cache.settle(&key, t(45), t(90), Ok(good_again())).await;
         assert_eq!(late.map_err(|e| e.kind), Err(PrFetchErrorKind::Failed));
         assert_eq!(cache.get(&key).unwrap().status, Some(newer.clone()));
-        assert_eq!(cache.settle(&key, t(70), t(71), Ok(newer.clone())), Ok(newer));
+        assert_eq!(cache.settle(&key, t(70), t(71), Ok(newer.clone())).await.map(|o| o.status), Ok(newer));
 
         fn good_again() -> PrStatus {
             status(PrState::Open, ChecksState::Passing)
@@ -1478,7 +1613,7 @@ mod tests {
             let status = statuses.refresh(&key).await.unwrap();
             assert_eq!(status.checks, ChecksState::NoChecks);
             assert_eq!(status.review_decision, Some(ReviewDecision::Approved));
-            assert_eq!(statuses.get(&key).unwrap().status, Some(status));
+            assert_eq!(statuses.get(&key).unwrap().status, Some(status.status.clone()));
             let args = std::fs::read_to_string(dir.path().join("args")).unwrap();
             assert_eq!(args.trim(), format!("pr view 42 --repo owner/repo --json {FIELDS}"));
         }
