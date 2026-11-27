@@ -99,6 +99,9 @@ fn tone_class(tone: Tone) -> &'static str {
 #[component]
 pub fn TaskActivity(task: Memo<Option<Task>>) -> impl IntoView {
     let expanded = RwSignal::new(false);
+    // Open by default; folding it keeps the drawer's Output and Changes above
+    // it from being followed by a long history.
+    let open = RwSignal::new(true);
     // Recomputed only when the task record changes, not on a clock.
     let rows = Memo::new(move |_| {
         task.with(|t| t.as_ref().map(|t| activity_rows(t, &local_offset_at, Utc::now())).unwrap_or_default())
@@ -106,7 +109,19 @@ pub fn TaskActivity(task: Memo<Option<Task>>) -> impl IntoView {
 
     view! {
         <section data-testid="task-drawer-timeline" class="space-y-2">
-            <h3 class="text-xs font-semibold uppercase tracking-wide text-white/50">"Activity"</h3>
+            <h3 class="text-xs font-semibold uppercase tracking-wide text-white/50">
+                <button
+                    data-testid="task-drawer-timeline-toggle"
+                    class="flex items-center gap-1.5 uppercase tracking-wide hover:text-white/80"
+                    aria-expanded=move || if open.get() { "true" } else { "false" }
+                    aria-controls="task-drawer-timeline-rows"
+                    on:click=move |_| open.update(|o| *o = !*o)
+                >
+                    <span class="text-[10px]">{move || if open.get() { "▼" } else { "▶" }}</span>
+                    "Activity"
+                </button>
+            </h3>
+            <div id="task-drawer-timeline-rows" class="space-y-2" hidden=move || !open.get()>
             {move || rows.with(|rows| {
                 let (shown, hidden) = visible_rows(rows, expanded.get());
                 let earlier = (hidden > 0).then(|| view! {
@@ -124,6 +139,7 @@ pub fn TaskActivity(task: Memo<Option<Task>>) -> impl IntoView {
                     <ol class="space-y-1.5">{items}</ol>
                 }
             })}
+            </div>
         </section>
     }
 }

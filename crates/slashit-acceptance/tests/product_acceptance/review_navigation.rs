@@ -5,6 +5,8 @@
 //! board order. A move that would discard an unsent GitHub issue address is
 //! refused: the address stays in its field and the open Task does not change.
 //! Moving decides nothing: no Task is approved, moved or published by it.
+//! Across each move the drawer keeps its order: Output, then Changes, then
+//! Activity.
 
 use super::github_issue_link::{type_address, INPUT, ISSUE_URL};
 use super::human_review::click;
@@ -83,6 +85,7 @@ async fn step_through_the_column(driver: &WebDriver, repository: &GitFixture) ->
     open_board(driver, &project_id).await?;
     open_drawer(driver, &current, &current_title).await?;
     await_position(driver, "1 of 2 in Human Review").await?;
+    assert_drawer_order(driver).await?;
     if !disabled(driver, STEP_PREVIOUS).await? {
         bail!("Previous is offered on the first Task of the column");
     }
@@ -119,6 +122,15 @@ async fn step_through_the_column(driver: &WebDriver, repository: &GitFixture) ->
     if !disabled(driver, STEP_NEXT).await? {
         bail!("Next is offered on the last Task of the column");
     }
+    assert_drawer_order(driver).await?;
+
+    // And Previous walks back to the Task the journey started on.
+    click(driver, STEP_PREVIOUS, "the Previous Human Review task control").await?;
+    ui::visible(driver, &drawer_of(&current))
+        .await
+        .context("Previous did not open the preceding Task of the column")?;
+    await_position(driver, "1 of 2 in Human Review").await?;
+    expect_open(driver, &current, &current_title).await?;
 
     // Stepping changed no decision and no status.
     let listed = ui::invoke(driver, "list_tasks", json!({ "projectId": project_id })).await?;
@@ -134,6 +146,23 @@ async fn step_through_the_column(driver: &WebDriver, repository: &GitFixture) ->
         if entries != 0 {
             bail!("stepping recorded {entries} review decision(s) on {id}");
         }
+    }
+    Ok(())
+}
+
+/// The drawer reads Output, then Changes, then Activity.
+async fn assert_drawer_order(driver: &WebDriver) -> Result<()> {
+    let order = page(
+        driver,
+        "const ids = ['task-drawer-tab-output', 'task-drawer-tab-changes', 'task-drawer-timeline']; \
+         const els = ids.map(id => document.querySelector(`[data-testid=\"task-drawer\"] [data-testid=\"${id}\"]`)); \
+         if (els.some(e => !e)) { return ids.filter((_, i) => !els[i]); } \
+         return els.every((e, i) => i === 0 || (els[i - 1].compareDocumentPosition(e) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0);",
+        vec![],
+    )
+    .await?;
+    if order != Value::Bool(true) {
+        bail!("the drawer does not read Output, Changes, Activity in that order (missing or out of order: {order})");
     }
     Ok(())
 }
