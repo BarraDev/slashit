@@ -120,7 +120,12 @@ pub struct StartObservation {
 
 /// Why a publication was refused before any push. Each message names the
 /// condition a person can act on.
-pub fn start_refusal(commit: &str, branch: &str, observed: &StartObservation) -> Option<String> {
+pub fn start_refusal(
+    commit: &str,
+    branch: &str,
+    inspected_remote_head: &str,
+    observed: &StartObservation,
+) -> Option<String> {
     let pr = &observed.pull_request;
     if !pr.open {
         return Some(
@@ -149,6 +154,11 @@ pub fn start_refusal(commit: &str, branch: &str, observed: &StartObservation) ->
              the branch on GitHub first."
                 .to_string(),
         ),
+        Some(head) if head != inspected_remote_head => Some(
+            "The pull request's branch on the remote moved after you inspected it, so nothing was \
+             pushed. Choose Publish to PR again to compare the commit with the new remote head."
+                .to_string(),
+        ),
         Some(_) if !observed.remote_head_is_ancestor => Some(
             "The remote branch has commits this branch does not contain, so publishing would not \
              be a fast-forward. Nothing was pushed, and nothing was forced. Integrate the remote \
@@ -159,16 +169,60 @@ pub fn start_refusal(commit: &str, branch: &str, observed: &StartObservation) ->
     }
 }
 
-/// How a request that started pushing ended. `remote_after` is what the
-/// remote branch was read back as afterwards: `Err` when it could not be read.
+/// Why a push did not succeed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushFailure {
+    /// The push was stopped before `git push` was started.
+    NotSent(String),
+    /// Git reported the branch update as rejected, by its own lease check or by
+    /// the remote, so this push changed nothing.
+    Rejected(String),
+    /// The push failed without saying whether the branch was updated.
+    Unconfirmed(String),
+}
+
+impl PushFailure {
+    pub fn into_message(self) -> String {
+        match self {
+            PushFailure::NotSent(m) | PushFailure::Rejected(m) | PushFailure::Unconfirmed(m) => m,
+        }
+    }
+}
+
+/// How a request that started pushing ended. `remote_before` is the reviewed
+/// remote head the push required. `remote_after` is what the remote branch was
+/// read back as afterwards: `Err` when it could not be read.
 pub fn classify_outcome(
     commit: &str,
     remote_before: Option<&str>,
     remote_after: &Result<Option<String>, String>,
-    push: &Result<(), String>,
+    push: &Result<(), PushFailure>,
 ) -> PublicationState {
+    if matches!(remote_after, Ok(Some(head)) if head == commit) {
+        return PublicationState::Published {};
+    }
+    // These two prove this push left the branch alone, whatever it holds now.
+    match push {
+        Err(PushFailure::NotSent(error)) => {
+            return PublicationState::Refused { reason: format!("nothing was pushed: {error}") };
+        }
+        Err(PushFailure::Rejected(error)) => {
+            let moved = matches!(remote_after, Ok(after) if after.as_deref() != remote_before);
+            let reason = if moved {
+                format!(
+                    "The pull request's branch on the remote is no longer at the revision you \
+                     reviewed ({}), so the push was refused and nothing was pushed. Choose Publish \
+                     to PR again to compare the commit with the new remote head. {error}",
+                    remote_before.unwrap_or("none")
+                )
+            } else {
+                format!("the remote refused the push, and nothing was pushed: {error}")
+            };
+            return PublicationState::Refused { reason };
+        }
+        Ok(()) | Err(PushFailure::Unconfirmed(_)) => {}
+    }
     match remote_after {
-        Ok(Some(head)) if head == commit => PublicationState::Published {},
         Err(error) => PublicationState::Unknown {
             reason: format!(
                 "the remote branch could not be read after the push, so whether it changed is \
@@ -176,12 +230,16 @@ pub fn classify_outcome(
             ),
         },
         Ok(after) => match push {
-            Err(error) if after.as_deref() == remote_before => PublicationState::Refused {
-                reason: format!("the remote refused the push, and its branch did not change: {error}"),
-            },
-            Err(error) => PublicationState::Unknown {
+            Err(failure) if after.as_deref() == remote_before => PublicationState::Refused {
                 reason: format!(
-                    "the push failed and the remote branch is not at the published commit: {error}"
+                    "the push failed, and the remote branch did not change: {}",
+                    failure.clone().into_message()
+                ),
+            },
+            Err(failure) => PublicationState::Unknown {
+                reason: format!(
+                    "the push failed and the remote branch is not at the published commit: {}",
+                    failure.clone().into_message()
                 ),
             },
             Ok(()) => PublicationState::Unknown {
@@ -288,50 +346,58 @@ mod tests {
 
     #[test]
     fn a_ready_fast_forward_on_an_open_pull_request_may_start() {
-        assert_eq!(start_refusal(NEW, BRANCH, &ready()), None);
+        assert_eq!(start_refusal(NEW, BRANCH, OLD, &ready()), None);
     }
 
     #[test]
     fn a_closed_or_merged_pull_request_is_refused() {
         let mut observed = ready();
         observed.pull_request.open = false;
-        assert!(start_refusal(NEW, BRANCH, &observed).unwrap().contains("closed or merged"));
+        assert!(start_refusal(NEW, BRANCH, OLD, &observed).unwrap().contains("closed or merged"));
     }
 
     #[test]
     fn a_pull_request_for_another_head_or_not_this_branch_is_refused() {
         let mut other_head = ready();
         other_head.pull_request.head_branch = "someone-else".to_string();
-        assert!(start_refusal(NEW, BRANCH, &other_head).is_some());
+        assert!(start_refusal(NEW, BRANCH, OLD, &other_head).is_some());
 
         let mut not_own = ready();
         not_own.pull_request.is_branch_pull_request = false;
-        assert!(start_refusal(NEW, BRANCH, &not_own).is_some());
+        assert!(start_refusal(NEW, BRANCH, OLD, &not_own).is_some());
     }
 
     #[test]
     fn a_branch_that_moved_since_the_person_chose_the_commit_is_refused() {
         let mut moved = ready();
         moved.local_tip = Some(OLD.to_string());
-        assert!(start_refusal(NEW, BRANCH, &moved).unwrap().contains("no longer at the commit"));
+        assert!(start_refusal(NEW, BRANCH, OLD, &moved).unwrap().contains("no longer at the commit"));
 
         let mut missing = ready();
         missing.local_tip = None;
-        assert!(start_refusal(NEW, BRANCH, &missing).is_some());
+        assert!(start_refusal(NEW, BRANCH, OLD, &missing).is_some());
     }
 
     #[test]
     fn a_missing_remote_branch_is_refused() {
         let mut gone = ready();
         gone.remote_head = None;
-        assert!(start_refusal(NEW, BRANCH, &gone).unwrap().contains("missing on the remote"));
+        assert!(start_refusal(NEW, BRANCH, OLD, &gone).unwrap().contains("missing on the remote"));
+    }
+
+    #[test]
+    fn a_remote_head_other_than_the_inspected_one_is_refused_even_as_a_fast_forward() {
+        let mut moved = ready();
+        moved.remote_head = Some("3".repeat(40));
+        let message = start_refusal(NEW, BRANCH, OLD, &moved).unwrap();
+        assert!(message.contains("moved after you inspected it"));
     }
 
     #[test]
     fn a_non_fast_forward_is_refused_before_any_push() {
         let mut diverged = ready();
         diverged.remote_head_is_ancestor = false;
-        let message = start_refusal(NEW, BRANCH, &diverged).unwrap();
+        let message = start_refusal(NEW, BRANCH, OLD, &diverged).unwrap();
         assert!(message.contains("not be a fast-forward"));
         assert!(message.contains("nothing was forced"));
     }
@@ -339,17 +405,40 @@ mod tests {
     #[test]
     fn a_landed_push_is_published_even_when_the_push_reported_an_error() {
         let after = Ok(Some(NEW.to_string()));
-        let push = Err("connection reset".to_string());
+        let push = Err(PushFailure::Unconfirmed("connection reset".to_string()));
         assert_eq!(classify_outcome(NEW, Some(OLD), &after, &push), PublicationState::Published {});
     }
 
     #[test]
     fn a_push_the_remote_refused_with_no_change_is_refused() {
         let after = Ok(Some(OLD.to_string()));
-        let push = Err("rejected (non-fast-forward)".to_string());
+        let push = Err(PushFailure::Rejected("rejected (non-fast-forward)".to_string()));
         assert!(matches!(
             classify_outcome(NEW, Some(OLD), &after, &push),
             PublicationState::Refused { .. }
+        ));
+    }
+
+    #[test]
+    fn a_rejected_push_to_a_moved_remote_is_refused_as_no_longer_reviewed() {
+        let push = Err(PushFailure::Rejected("stale info".to_string()));
+        for after in [Ok(Some("3".repeat(40))), Ok(None)] {
+            let state = classify_outcome(NEW, Some(OLD), &after, &push);
+            assert!(
+                matches!(&state, PublicationState::Refused { reason }
+                    if reason.contains("no longer at the revision you reviewed") && reason.contains(OLD)),
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unconfirmed_failure_with_a_moved_remote_stays_unknown() {
+        let after = Ok(Some("3".repeat(40)));
+        let push = Err(PushFailure::Unconfirmed("connection reset".to_string()));
+        assert!(matches!(
+            classify_outcome(NEW, Some(OLD), &after, &push),
+            PublicationState::Unknown { .. }
         ));
     }
 
@@ -366,7 +455,7 @@ mod tests {
     fn an_unreadable_remote_after_the_push_is_unknown_never_refused() {
         let after = Err("network down".to_string());
         assert!(matches!(
-            classify_outcome(NEW, Some(OLD), &after, &Err("timeout".to_string())),
+            classify_outcome(NEW, Some(OLD), &after, &Err(PushFailure::Unconfirmed("timeout".to_string()))),
             PublicationState::Unknown { .. }
         ));
     }

@@ -7,6 +7,7 @@ use crate::domain::github_issue_link::{parse_issue_url, IssueAddress};
 use crate::domain::pr_reply_history::{
     self as reply_history, PrReplyRecord, ReplyKey, GITHUB_HOST,
 };
+use crate::domain::publication::PushFailure;
 use crate::domain::task::{
     ExternalRef, PrCommentKind, PrReviewApplyResult, PrReviewComment, PrReviewDecision,
     PrReviewItem, PrReviewPlan,
@@ -10156,19 +10157,23 @@ mod after_slug_hook {
 pub(crate) mod before_gate_hook {
     use std::sync::Mutex;
 
-    static HOOK: Mutex<Option<(String, Box<dyn FnOnce() + Send>)>> = Mutex::new(None);
+    /// One armed hook per working directory, so tests running in parallel do
+    /// not replace each other's.
+    type Armed = Vec<(String, Box<dyn FnOnce() + Send>)>;
+
+    static HOOKS: Mutex<Armed> = Mutex::new(Vec::new());
 
     pub(super) fn arm(working_dir: &str, hook: impl FnOnce() + Send + 'static) {
-        *HOOK.lock().unwrap() = Some((working_dir.to_string(), Box::new(hook)));
+        let mut armed = HOOKS.lock().unwrap();
+        armed.retain(|(dir, _)| dir != working_dir);
+        armed.push((working_dir.to_string(), Box::new(hook)));
     }
 
     pub(super) fn run(working_dir: &str) {
         let due = {
-            let mut slot = HOOK.lock().unwrap();
-            match slot.as_ref() {
-                Some((dir, _)) if dir == working_dir => slot.take().map(|(_, hook)| hook),
-                _ => None,
-            }
+            let mut armed = HOOKS.lock().unwrap();
+            let at = armed.iter().position(|(dir, _)| dir == working_dir);
+            at.map(|at| armed.swap_remove(at).1)
         };
         if let Some(hook) = due {
             hook();
@@ -10191,7 +10196,83 @@ async fn push_branch_pinned_gated(
     pinned: Option<&str>,
     before_push: &(dyn Fn() -> Result<(), String> + Sync),
 ) -> Result<String, String> {
-    let branch = checked_task_branch(branch)?;
+    push_task_branch(working_dir, branch, pinned, None, before_push)
+        .await
+        .map_err(PushFailure::into_message)
+}
+
+/// Publish `commit` only while the remote branch is exactly `expected_remote`,
+/// and only as a fast-forward of it.
+///
+/// `--force-with-lease=<ref>:<expected>` makes the update a compare-and-swap:
+/// git refuses when the remote advertises any other value, and the remote
+/// refuses when the branch moves after that. A lease also permits a rewrite of
+/// the expected value, so this first proves from the commit objects that
+/// `expected_remote` is an ancestor of `commit`. Replace refs and grafts are
+/// ignored for that proof, because the push sends the real objects.
+async fn push_reviewed_commit_gated(
+    working_dir: &str,
+    branch: &str,
+    commit: &str,
+    expected_remote: &str,
+    before_push: &(dyn Fn() -> Result<(), String> + Sync),
+) -> Result<(), PushFailure> {
+    push_task_branch(working_dir, branch, Some(commit), Some((commit, expected_remote)), before_push)
+        .await
+        .map(|_| ())
+}
+
+/// Refuse unless `ancestor` is an ancestor of `commit` in the commit objects
+/// themselves.
+async fn require_real_ancestor(
+    working_dir: &str,
+    git_dir: &[String],
+    ancestor: &str,
+    commit: &str,
+) -> Result<(), String> {
+    let no_grafts = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let status = crate::host_process::tokio_command(program("git"))
+        .args(git_dir)
+        .args(["--no-replace-objects", "merge-base", "--is-ancestor", ancestor, commit])
+        .env("GIT_GRAFT_FILE", no_grafts)
+        .current_dir(working_dir)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run git: {e}"))?
+        .status;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("The commit could not be shown to be a fast-forward of the reviewed remote head.".to_string())
+    }
+}
+
+/// Whether `git push --porcelain` reported every branch update as rejected. A
+/// `[remote failure]` is not a rejection: the remote never said what it did.
+fn push_was_rejected(porcelain: &str) -> bool {
+    let mut updates = porcelain.lines().filter(|l| l.contains('\t')).peekable();
+    updates.peek().is_some()
+        && updates.all(|line| {
+            let mut fields = line.split('\t');
+            fields.next() == Some("!")
+                && fields.nth(1).is_some_and(|summary| {
+                    summary.starts_with("[rejected]") || summary.starts_with("[remote rejected]")
+                })
+        })
+}
+
+/// The one body of the pinned pushes. `lease` is the commit to publish and the
+/// value the remote branch must still have.
+async fn push_task_branch(
+    working_dir: &str,
+    branch: &str,
+    pinned: Option<&str>,
+    lease: Option<(&str, &str)>,
+    before_push: &(dyn Fn() -> Result<(), String> + Sync),
+) -> Result<String, PushFailure> {
+    use PushFailure::{NotSent, Rejected, Unconfirmed};
+    let branch = checked_task_branch(branch).map_err(NotSent)?;
     let mut git_args: Vec<String> = Vec::new();
     if is_jj_repo(working_dir).await {
         run_cmd(
@@ -10200,38 +10281,61 @@ async fn push_branch_pinned_gated(
             working_dir,
         )
         .await
-        .map_err(|e| format!("jj git export failed: {}", e))?;
+        .map_err(|e| NotSent(format!("jj git export failed: {}", e)))?;
     }
-    if let Some(git_dir) = jj_git_dir_arg(working_dir).await? {
+    if let Some(git_dir) = jj_git_dir_arg(working_dir).await.map_err(NotSent)? {
         git_args.push(git_dir);
     }
 
     let source = match pinned {
         Some(commit) => {
-            let now = git_branch_tip(working_dir, branch).await?;
+            let now = git_branch_tip(working_dir, branch).await.map_err(NotSent)?;
             if now.as_deref() != Some(commit) {
-                return Err(
+                return Err(NotSent(
                     "The task's branch changed since you approved it, so nothing was pushed. \
                      Review the branch as it is and approve it again to continue."
                         .to_string(),
-                );
+                ));
             }
             commit.to_string()
         }
         None => format!("refs/heads/{branch}"),
     };
     let refspec = format!("{source}:refs/heads/{branch}");
-    git_args.extend(["push", "-u", "--", "origin", &refspec].map(String::from));
+    let mut options = vec!["-u".to_string()];
+    if let Some((commit, expected)) = lease {
+        require_real_ancestor(working_dir, &git_args, expected, commit)
+            .await
+            .map_err(NotSent)?;
+        options.push("--porcelain".to_string());
+        options.push(format!("--force-with-lease=refs/heads/{branch}:{expected}"));
+    }
+    git_args.push("push".to_string());
+    git_args.extend(options);
+    git_args.extend(["--", "origin", &refspec].map(String::from));
     #[cfg(test)]
     before_gate_hook::run(working_dir);
-    before_push()?;
-    let git_args: Vec<&str> = git_args.iter().map(String::as_str).collect();
-    run_cmd("git", &git_args, working_dir)
+    before_push().map_err(NotSent)?;
+    let output = crate::host_process::tokio_command(program("git"))
+        .args(&git_args)
+        .current_dir(working_dir)
+        .output()
         .await
-        .map_err(|e| format!("git push failed: {}", e))?;
+        .map_err(|e| NotSent(format!("git push failed: Failed to run git: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let porcelain = String::from_utf8_lossy(&output.stdout);
+        return Err(if lease.is_some() && push_was_rejected(&porcelain) {
+            Rejected(format!("git push failed: {}\n{}", porcelain.trim(), stderr.trim()))
+        } else {
+            Unconfirmed(format!("git push failed: git failed: {stderr}"))
+        });
+    }
     if pinned.is_some() {
         // A push whose source is an object ID cannot record the upstream.
-        track_pushed_branch(working_dir, branch).await?;
+        track_pushed_branch(working_dir, branch)
+            .await
+            .map_err(Unconfirmed)?;
     }
     Ok(branch.to_string())
 }

@@ -251,7 +251,9 @@ used, then:
   pending, agent runs, reviews, pull request operations and every cleanup of
   the Task are refused; unrelated Tasks are unaffected.
 
-This is the one place SlashIt force-pushes, and only with that lease.
+This is the one place SlashIt force-pushes, and only with that lease. Publish
+to PR also passes a lease, as a compare-and-swap on the remote head the person
+inspected, but only after proving the push is a fast-forward of it.
 
 ### Not covered
 
