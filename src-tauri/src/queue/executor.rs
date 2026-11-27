@@ -971,6 +971,37 @@ fn in_pr_lifecycle(task: &Task) -> bool {
     )
 }
 
+/// The URL of the pull request reference on `task` that `key` names.
+fn linked_pull_request_url(task: &Task, key: &crate::pr_status::PrKey) -> Option<String> {
+    task.external_refs.iter().find_map(|r| match r {
+        ExternalRef::GithubPr { url, repo, number, .. }
+            if *number == key.number && *repo == key.repo =>
+        {
+            Some(url.clone())
+        }
+        _ => None,
+    })
+}
+
+/// Whether `task`'s approved correction is delivered through the pull request
+/// `key` as observed: G2's `open_delivery` on the URL the Task links to `key`.
+fn delivery_verified(
+    task: &Task,
+    key: &crate::pr_status::PrKey,
+    state: &str,
+    head_oid: Option<&str>,
+) -> bool {
+    linked_pull_request_url(task, key).is_some_and(|url| {
+        crate::domain::publication::open_delivery(task, &url, state, head_oid)
+            == crate::domain::publication::OpenDelivery::Delivered
+    })
+}
+
+/// Whether `task` is in a post-PR correction for the pull request `key`.
+fn is_post_pr_correction(task: &Task, key: &crate::pr_status::PrKey) -> bool {
+    crate::domain::publication::is_post_pr_correction(task, links_pull_request(task, key))
+}
+
 /// Whether `task` still links exactly the pull request `key`: repository and
 /// number both.
 fn links_pull_request(task: &Task, key: &crate::pr_status::PrKey) -> bool {
@@ -3615,6 +3646,7 @@ impl TaskExecutor {
                     task_id,
                     &key,
                     status.state,
+                    status.head_oid.as_deref(),
                     status.merge_commit.as_deref(),
                 ).await {
                     self.events.agent_event(AgentEvent::Log {
@@ -3658,11 +3690,17 @@ impl TaskExecutor {
     ///
     /// `merge_commit` is the commit GitHub reported for a merged pull request.
     /// It is recorded with the merge, and never on its own.
+    ///
+    /// `head_oid` is the full head of the same answer. An open pull request
+    /// moves a published Task that is in Human Review only when
+    /// `open_delivery` verifies it (G2 in `docs/architecture/post-pr-corrections.md`);
+    /// otherwise an open answer records the state alone, as it always has.
     pub(crate) async fn apply_polled_pr_state(
         &self,
         task_id: Uuid,
         key: &crate::pr_status::PrKey,
         state: crate::pr_status::PrState,
+        head_oid: Option<&str>,
         merge_commit: Option<&str>,
     ) -> Result<(), String> {
         use crate::pr_status::PrState;
@@ -3707,7 +3745,7 @@ impl TaskExecutor {
                     .await
             }
             PrState::Merged => {}
-            _ => self.record_pr_poll_state(task_id, key, recorded).await,
+            _ => self.record_pr_poll_state(task_id, key, recorded, head_oid).await,
         }
         Ok(())
     }
@@ -3824,6 +3862,7 @@ impl TaskExecutor {
         task_id: Uuid,
         key: &crate::pr_status::PrKey,
         state: &str,
+        head_oid: Option<&str>,
     ) {
         // Declined while another transition holds the task: the next poll
         // observes the same state again, so nothing is lost.
@@ -3834,15 +3873,45 @@ impl TaskExecutor {
         if self.task_project_removed(task_id).await {
             return;
         }
+        // G2, decided on the Task before any owner is ended. Only a published
+        // Human Review correction can move here: an open pull request at the
+        // approved commit, with its publication recorded. Anything else
+        // records the state alone.
+        let verified = {
+            let tasks = self.tasks.read().await;
+            tasks.get(&task_id).is_some_and(|t| {
+                t.status == TaskStatus::HumanReview && delivery_verified(t, key, state, head_oid)
+            })
+        };
+        if verified {
+            // An owner that cannot be ended leaves the Task where it is: the
+            // next observation asks again, and nothing is moved half-way.
+            let running = Some(self as &dyn crate::lifecycle::ExecutionOwnership);
+            if let Err(e) = crate::lifecycle::end_active_ownership(running, task_id).await {
+                self.events.agent_event(AgentEvent::Log {
+                    task_id: task_id.to_string(),
+                    level: LogLevel::Warn,
+                    message: format!("Pull request {state:?} at the approved commit was observed for task {task_id}, but its live run could not be ended, so the task stays in Human Review: {e}"),
+                });
+                return;
+            }
+        }
         let state_owned = state.to_string();
         let key_owned = key.clone();
         let revise = move |staged: &mut HashMap<Uuid, Task>| {
             let Some(t) = staged.get_mut(&task_id) else {
                 return false;
             };
-            let changed = record_observed_pr_state(t, &key_owned, &state_owned);
-            if changed && state_owned == "CLOSED" && in_pr_lifecycle(t) {
+            let mut changed = record_observed_pr_state(t, &key_owned, &state_owned);
+            // A post-PR correction keeps its status and error on a closure:
+            // the closure is recorded as the pull request's state only.
+            let correction = is_post_pr_correction(t, &key_owned);
+            if changed && state_owned == "CLOSED" && in_pr_lifecycle(t) && !correction {
                 t.error_message = Some("PR was closed without merge".to_string());
+            }
+            if verified && t.status == TaskStatus::HumanReview && delivery_verified(t, &key_owned, &state_owned, head_oid) {
+                t.status = TaskStatus::PrCreated;
+                changed = true;
             }
             changed
         };
@@ -10365,7 +10434,7 @@ mod tests {
             .apply_polled_pr_state(
                 id,
                 &crate::pr_status::PrKey::new("owner/repo", 7),
-                crate::pr_status::PrState::Merged,
+                crate::pr_status::PrState::Merged, None,
                 Some(merged),
             )
             .await.expect("observation applies");
@@ -10394,7 +10463,7 @@ mod tests {
         let _fault = fault::fail_at(Stage::SyncTemp, std::io::ErrorKind::Other);
         let error = executor.apply_polled_pr_state(id,
             &crate::pr_status::PrKey::new("owner/repo", 7),
-            crate::pr_status::PrState::Merged,
+            crate::pr_status::PrState::Merged, None,
             Some("1111111111111111111111111111111111111111"))
             .await.expect_err("failed persistence must reach the caller");
         assert!(error.contains("Could not record merge commit"), "{error}");
@@ -10413,7 +10482,7 @@ mod tests {
         let _fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
         let error = executor.apply_polled_pr_state(id,
             &crate::pr_status::PrKey::new("owner/repo", 7),
-            crate::pr_status::PrState::Merged, Some(commit))
+            crate::pr_status::PrState::Merged, None, Some(commit))
             .await.expect_err("unconfirmed durability is not success");
         assert!(crate::config::says_in_place_but_unconfirmed(&error), "{error}");
         assert_eq!(recorded_merge_commits(&executor.tasks.read().await[&id]), vec![Some(commit.into())]);
@@ -10429,16 +10498,16 @@ mod tests {
         let commit = "1111111111111111111111111111111111111111";
         let lease = executor.lifecycle.try_acquire(id).await.unwrap();
         let error = executor.apply_polled_pr_state(id, &key,
-            crate::pr_status::PrState::Merged, Some(commit)).await.unwrap_err();
+            crate::pr_status::PrState::Merged, None, Some(commit)).await.unwrap_err();
         assert!(error.contains("busy"), "{error}");
         assert_eq!(recorded_merge_commits(&executor.tasks.read().await[&id]), vec![None]);
         drop(lease);
-        executor.apply_polled_pr_state(id, &key, crate::pr_status::PrState::Merged, Some(commit))
+        executor.apply_polled_pr_state(id, &key, crate::pr_status::PrState::Merged, None, Some(commit))
             .await.unwrap();
         let before = executor.tasks.read().await[&id].updated_at;
         let _lease = executor.lifecycle.try_acquire(id).await.unwrap();
         block_persistence(&temps[0]);
-        executor.apply_polled_pr_state(id, &key, crate::pr_status::PrState::Merged, None)
+        executor.apply_polled_pr_state(id, &key, crate::pr_status::PrState::Merged, None, None)
             .await.expect("valid evidence requires neither a lease nor a write");
         assert_eq!(executor.tasks.read().await[&id].updated_at, before);
     }
@@ -10451,12 +10520,12 @@ mod tests {
         let key = crate::pr_status::PrKey::new("owner/repo", 7);
         for commit in [None, Some("main")] {
             let error = executor.apply_polled_pr_state(id, &key,
-                crate::pr_status::PrState::Merged, commit).await.unwrap_err();
+                crate::pr_status::PrState::Merged, None, commit).await.unwrap_err();
             assert!(error.contains("no usable merge commit"), "{error}");
         }
         executor.tasks.write().await.get_mut(&id).unwrap().cleanup_in_flight = true;
         let error = executor.apply_polled_pr_state(id, &key,
-            crate::pr_status::PrState::Merged,
+            crate::pr_status::PrState::Merged, None,
             Some("1111111111111111111111111111111111111111")).await.unwrap_err();
         assert!(error.contains("cleanup"), "{error}");
         assert_eq!(recorded_merge_commits(&executor.tasks.read().await[&id]), vec![None]);
@@ -11218,7 +11287,7 @@ mod tests {
         block_persistence(&temps[0]);
 
         executor
-            .record_pr_poll_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), "CLOSED")
+            .record_pr_poll_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), "CLOSED", None)
             .await;
 
         let after = executor.tasks.read().await.get(&id).cloned().expect("task");
@@ -11261,7 +11330,7 @@ mod tests {
         let before = executor.tasks.read().await.get(&id).cloned().expect("task");
 
         let removal = executor.lifecycle.try_acquire(id).await.expect("the removal takes the lease");
-        executor.record_pr_poll_state(id, &key, "CLOSED").await;
+        executor.record_pr_poll_state(id, &key, "CLOSED", None).await;
         assert_eq!(
             format!("{:?}", executor.tasks.read().await[&id].external_refs),
             format!("{:?}", before.external_refs),
@@ -11271,7 +11340,7 @@ mod tests {
             Some(chrono::Utc::now());
         drop(removal);
 
-        executor.record_pr_poll_state(id, &key, "CLOSED").await;
+        executor.record_pr_poll_state(id, &key, "CLOSED", None).await;
         let after = executor.tasks.read().await.get(&id).cloned().expect("task");
         assert_eq!(
             format!("{:?}", after.external_refs),
@@ -11301,7 +11370,7 @@ mod tests {
             std::io::ErrorKind::Other,
         );
         executor
-            .record_pr_poll_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), "CLOSED")
+            .record_pr_poll_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), "CLOSED", None)
             .await;
         drop(fault);
 
@@ -11337,7 +11406,7 @@ mod tests {
         let (id, project_id) = task_with_open_pr(&executor, None).await;
 
         executor
-            .record_pr_poll_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), "CLOSED")
+            .record_pr_poll_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), "CLOSED", None)
             .await;
 
         let after = executor.tasks.read().await.get(&id).cloned().expect("task");
@@ -11558,7 +11627,7 @@ mod tests {
 
         let key = crate::pr_status::PrKey::new("owner/repo", 7);
         for _ in 0..3 {
-            executor.record_pr_poll_state(id, &key, "OPEN").await;
+            executor.record_pr_poll_state(id, &key, "OPEN", None).await;
         }
 
         let after = executor.tasks.read().await.get(&id).cloned().unwrap();
@@ -11586,7 +11655,7 @@ mod tests {
             let before = executor.tasks.read().await[&id].updated_at;
 
             executor
-                .record_pr_poll_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), "OPEN")
+                .record_pr_poll_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), "OPEN", None)
                 .await;
 
             let after = executor.tasks.read().await[&id].clone();
@@ -11636,7 +11705,7 @@ mod tests {
             .apply_polled_pr_state(
                 id,
                 &crate::pr_status::PrKey::new("owner/repo", 7),
-                crate::pr_status::PrState::Merged,
+                crate::pr_status::PrState::Merged, None,
                 Some(merged),
             )
             .await.expect("observation applies");
@@ -11671,7 +11740,7 @@ mod tests {
             .apply_polled_pr_state(
                 id,
                 &crate::pr_status::PrKey::new("owner/repo", 7),
-                crate::pr_status::PrState::Merged,
+                crate::pr_status::PrState::Merged, None,
                 Some("1111111111111111111111111111111111111111"),
             )
             .await.expect("observation applies");
@@ -11723,7 +11792,7 @@ mod tests {
             .apply_polled_pr_state(
                 id,
                 &crate::pr_status::PrKey::new("owner/repo", 7),
-                crate::pr_status::PrState::Merged,
+                crate::pr_status::PrState::Merged, None,
                 None,
             )
             .await.expect("observation applies");
@@ -11813,7 +11882,7 @@ mod tests {
             .apply_polled_pr_state(
                 id,
                 &crate::pr_status::PrKey::new("owner/repo", 7),
-                crate::pr_status::PrState::Merged,
+                crate::pr_status::PrState::Merged, None,
                 None,
             )
             .await.expect("observation applies");
@@ -11923,7 +11992,7 @@ mod tests {
             crate::pr_status::PrState::Closed,
             crate::pr_status::PrState::Open,
         ] {
-            executor.apply_polled_pr_state(id, &key, answer, None).await.expect("observation applies");
+            executor.apply_polled_pr_state(id, &key, answer, None, None).await.expect("observation applies");
         }
 
         for (seen, task) in [
@@ -11973,7 +12042,7 @@ mod tests {
             .apply_polled_pr_state(
                 id,
                 &crate::pr_status::PrKey::new("owner/repo", 7),
-                crate::pr_status::PrState::Merged,
+                crate::pr_status::PrState::Merged, None,
                 None,
             )
             .await.expect("observation applies");
@@ -12028,7 +12097,7 @@ mod tests {
             .apply_polled_pr_state(
                 id,
                 &crate::pr_status::PrKey::new("owner/repo", 7),
-                crate::pr_status::PrState::Merged,
+                crate::pr_status::PrState::Merged, None,
                 None,
             )
             .await.expect("observation applies");
@@ -12266,7 +12335,7 @@ mod tests {
             .apply_polled_pr_state(
                 id,
                 &crate::pr_status::PrKey::new("owner/repo", 7),
-                crate::pr_status::PrState::Merged,
+                crate::pr_status::PrState::Merged, None,
                 None,
             )
             .await.expect("observation applies");
@@ -12330,7 +12399,7 @@ mod tests {
         let before = executor.tasks.read().await.get(&id).unwrap().updated_at;
 
         executor
-            .record_pr_poll_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), "OPEN")
+            .record_pr_poll_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), "OPEN", None)
             .await;
 
         let after = executor.tasks.read().await.get(&id).cloned().unwrap();
@@ -12342,7 +12411,7 @@ mod tests {
         );
         // Another repository's pull request with the same number is not this one.
         executor
-            .record_pr_poll_state(id, &crate::pr_status::PrKey::new("other/repo", 7), "CLOSED")
+            .record_pr_poll_state(id, &crate::pr_status::PrKey::new("other/repo", 7), "CLOSED", None)
             .await;
         assert_eq!(
             recorded_pr_state(&executor.tasks.read().await[&id]).as_deref(),
@@ -12765,7 +12834,9 @@ mod tests {
         let key = crate::pr_status::PrKey::new("owner/repo", 7);
         for (status, fails) in [
             (TaskStatus::PrCreated, true),
-            (TaskStatus::HumanReview, true),
+            // A published Human Review is a post-PR correction (G1): its
+            // closure records the state and nothing else.
+            (TaskStatus::HumanReview, false),
             (TaskStatus::Done, true),
             (TaskStatus::Backlog, false),
             (TaskStatus::Queue, false),
@@ -12781,7 +12852,7 @@ mod tests {
             .await;
 
             executor
-                .apply_polled_pr_state(id, &key, crate::pr_status::PrState::Closed, None)
+                .apply_polled_pr_state(id, &key, crate::pr_status::PrState::Closed, None, None)
                 .await.expect("observation applies");
 
             let after = executor.tasks.read().await[&id].clone();
@@ -12793,6 +12864,130 @@ mod tests {
             assert_eq!(after.status, status, "a closure never moves the task");
             assert_eq!(after.error_message.is_some(), fails, "{status:?}");
         }
+    }
+
+    /// The background poll and Check now share `apply_polled_pr_state`. An
+    /// open answer moves a published Human Review correction only when its
+    /// full head is the approved commit and that commit is recorded as
+    /// published to the pull request (G2); any other answer records the state
+    /// and keeps the approval current.
+    #[tokio::test]
+    async fn a_poll_moves_a_published_correction_only_at_its_approved_head() {
+        use crate::domain::publication::{PrPublication, PublicationState};
+        let (executor, _temps) = test_executor();
+        let key = crate::pr_status::PrKey::new("owner/repo", 7);
+        let approved = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+        for (head, expected) in [
+            (Some(approved), TaskStatus::PrCreated),
+            (None, TaskStatus::HumanReview),
+            (Some("b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"), TaskStatus::HumanReview),
+        ] {
+            let (id, _) = seed_with_pr(
+                &executor,
+                TaskStatus::HumanReview,
+                pr_ref("owner/repo", 7, Some("OPEN")),
+            )
+            .await;
+            {
+                let mut tasks = executor.tasks.write().await;
+                let t = tasks.get_mut(&id).unwrap();
+                t.human_review.record_arrival();
+                t.human_review
+                    .approve(Some(approved.to_string()), chrono::Utc::now());
+                let mut publication = PrPublication::pending(
+                    uuid::Uuid::new_v4(),
+                    approved.to_string(),
+                    "task-branch".to_string(),
+                    "https://github.com/owner/repo/pull/7".to_string(),
+                    None,
+                    chrono::Utc::now(),
+                );
+                publication.state = PublicationState::Published {};
+                t.pr_publication = Some(publication);
+            }
+
+            executor
+                .apply_polled_pr_state(id, &key, crate::pr_status::PrState::Open, head, None)
+                .await
+                .expect("observation applies");
+
+            let after = executor.tasks.read().await[&id].clone();
+            assert_eq!(after.status, expected, "head {head:?}");
+            assert!(
+                after.human_review.is_approved()
+                    && after.human_review.approved_tip() == Some(approved),
+                "head {head:?}: the approval of the approved commit stays current"
+            );
+        }
+    }
+
+    /// G2 on the poll route, for the two cases the approved-head test does not
+    /// cover: an approved open pull request with no publication record stays
+    /// in Human Review, and a closure during a correction run keeps the live
+    /// run, its status and its error.
+    #[tokio::test]
+    async fn a_poll_holds_a_correction_without_its_record_and_keeps_a_closed_run() {
+        let (executor, _temps) = test_executor();
+        let key = crate::pr_status::PrKey::new("owner/repo", 7);
+        let approved = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+
+        let (id, _) = seed_with_pr(
+            &executor,
+            TaskStatus::HumanReview,
+            pr_ref("owner/repo", 7, Some("OPEN")),
+        )
+        .await;
+        {
+            let mut tasks = executor.tasks.write().await;
+            let t = tasks.get_mut(&id).unwrap();
+            t.human_review.record_arrival();
+            t.human_review
+                .approve(Some(approved.to_string()), chrono::Utc::now());
+        }
+        executor
+            .apply_polled_pr_state(
+                id,
+                &key,
+                crate::pr_status::PrState::Open,
+                Some(approved),
+                None,
+            )
+            .await
+            .expect("observation applies");
+        let after = executor.tasks.read().await[&id].clone();
+        assert_eq!(after.status, TaskStatus::HumanReview, "no publication record");
+        assert!(
+            after.human_review.is_approved() && after.human_review.approved_tip() == Some(approved),
+            "the approval of the approved commit stays current"
+        );
+
+        let (run_id, _) = seed_with_pr(
+            &executor,
+            TaskStatus::InProgress,
+            pr_ref("owner/repo", 7, Some("OPEN")),
+        )
+        .await;
+        let owner = executor
+            .register_fake_running_execution_for_test(run_id)
+            .await;
+        executor
+            .apply_polled_pr_state(
+                run_id,
+                &key,
+                crate::pr_status::PrState::Closed,
+                None,
+                None,
+            )
+            .await
+            .expect("observation applies");
+        let after = executor.tasks.read().await[&run_id].clone();
+        assert!(
+            !owner.load(std::sync::atomic::Ordering::SeqCst),
+            "the correction run is not ended by a closure"
+        );
+        assert_eq!(after.status, TaskStatus::InProgress);
+        assert!(after.error_message.is_none(), "a correction keeps its error");
+        assert_eq!(recorded_pr_state(&after).as_deref(), Some("CLOSED"));
     }
 
     #[cfg(unix)]
@@ -12819,7 +13014,7 @@ mod tests {
             )
             .await;
 
-            executor.apply_polled_pr_state(id, &key, stale, None).await.expect("observation applies");
+            executor.apply_polled_pr_state(id, &key, stale, None, None).await.expect("observation applies");
 
             let after = executor.tasks.read().await[&id].clone();
             assert_eq!(

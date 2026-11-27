@@ -23,6 +23,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::task::{Task, TaskStatus};
+
 /// The publication most recently requested for a Task. One record is kept:
 /// a new request replaces it only once the previous one is settled.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -309,6 +311,120 @@ pub fn replay(existing: Option<&PrPublication>, commit: &str, branch: &str, pr_u
     }
 }
 
+/// What an observed open pull request says about a Task's current approval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenDelivery {
+    /// The open pull request holds the approved commit, and SlashIt published
+    /// that commit to this pull request.
+    Delivered,
+    /// Some evidence is missing or disagrees. The reason names what, for the
+    /// person reading the board and for the tests.
+    NotYetObserved(String),
+}
+
+/// Whether an observed open pull request shows a published Task's current
+/// approval as delivered (G2 of `docs/architecture/post-pr-corrections.md`).
+///
+/// Every piece is required, and each is read from the same observation:
+/// - the current decision is an approval that recorded its commit B;
+/// - the observation reads `OPEN` with a full head equal to B (an absent,
+///   abbreviated or different head is not evidence);
+/// - `pr_publication` is `Published` at B for this pull request. An absent,
+///   other, pending, unknown or refused record is not evidence.
+///
+/// Pure: it decides nothing about the Task's status, owner or record.
+pub fn open_delivery(
+    task: &Task,
+    pr_url: &str,
+    observed_state: &str,
+    observed_head: Option<&str>,
+) -> OpenDelivery {
+    use OpenDelivery::NotYetObserved;
+    if !observed_state.eq_ignore_ascii_case("OPEN") {
+        return NotYetObserved("the pull request is not open".to_string());
+    }
+    if !task.human_review.is_approved() {
+        return NotYetObserved("the Task has no current approval".to_string());
+    }
+    let Some(approved) = task.human_review.approved_tip() else {
+        return NotYetObserved("the current approval records no commit".to_string());
+    };
+    let Some(head) = observed_head else {
+        return NotYetObserved(format!(
+            "GitHub reported no full head for the pull request; the approved commit is {approved}"
+        ));
+    };
+    if head != approved {
+        return NotYetObserved(format!(
+            "the pull request head is {head}; the approved commit is {approved}"
+        ));
+    }
+    match task.pr_publication.as_ref() {
+        None => NotYetObserved(format!("no publication record shows {approved} published")),
+        Some(p) if p.pr_url != pr_url => {
+            NotYetObserved("the publication record names another pull request".to_string())
+        }
+        Some(p) if p.commit != approved => NotYetObserved(format!(
+            "the publication record names {}, not the approved commit {approved}",
+            p.commit
+        )),
+        Some(p) if !matches!(p.state, PublicationState::Published {}) => {
+            NotYetObserved("the publication is not settled as published".to_string())
+        }
+        Some(_) => OpenDelivery::Delivered,
+    }
+}
+
+/// Whether a Task is in a post-PR correction for the pull request it is
+/// linked to: linked before the observation, and out of PR Created in a
+/// status a correction run or its review occupies.
+pub fn is_post_pr_correction(task: &Task, linked_before: bool) -> bool {
+    linked_before
+        && matches!(
+            task.status,
+            TaskStatus::Queue | TaskStatus::InProgress | TaskStatus::AiReview | TaskStatus::HumanReview
+        )
+}
+
+/// What an observation of an open or closed pull request does to its Task's
+/// status and owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrObservationEffect {
+    /// The Task moves to PR Created, and its live owner is ended first, as a
+    /// link has always done.
+    MovesToPrCreated,
+    /// Only the pull request's state is recorded. The status, the run and the
+    /// Task Checkout are kept, and no owner is ended.
+    RecordsStateOnly,
+}
+
+/// The effect of one observed pull request state (and its full head) on a
+/// Task. Outside a post-PR correction this is today's rule; inside one, only
+/// an open pull request that [`open_delivery`] verifies moves the Task.
+///
+/// The caller passes the state and head of the same observation it writes,
+/// and handles `MERGED` itself.
+pub fn pr_observation_effect(
+    task: &Task,
+    pr_url: &str,
+    linked_before: bool,
+    observed_state: &str,
+    observed_head: Option<&str>,
+) -> PrObservationEffect {
+    if !is_post_pr_correction(task, linked_before) {
+        return PrObservationEffect::MovesToPrCreated;
+    }
+    // Only Human Review can be delivered by an observation. A queued, running
+    // or AI-reviewed correction belongs to its run, which keeps its status.
+    if task.status != TaskStatus::HumanReview {
+        return PrObservationEffect::RecordsStateOnly;
+    }
+    match open_delivery(task, pr_url, observed_state, observed_head) {
+        OpenDelivery::Delivered => PrObservationEffect::MovesToPrCreated,
+        OpenDelivery::NotYetObserved(_) => PrObservationEffect::RecordsStateOnly,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,5 +650,144 @@ mod tests {
             let back: PrPublication = toml::from_str(&text).expect("deserialize");
             assert_eq!(back, r);
         }
+    }
+
+    // ── G2: open delivery evidence (open_delivery) and the effect that
+    // follows from it (pr_observation_effect) ──
+
+    const PR_URL: &str = "https://github.com/testorg/testrepo/pull/9";
+
+    /// A Task in Human Review, approved at `APPROVED`, linked to `PR`, with
+    /// `publication` recorded for the approved commit (or none).
+    fn approved_correction(status: TaskStatus, publication: Option<PublicationState>) -> Task {
+        let mut task = crate::test_helpers::create_test_task_full(
+            "correction",
+            Uuid::new_v4(),
+            status,
+            0,
+        );
+        task.pr_url = Some(PR_URL.to_string());
+        task.human_review.record_arrival();
+        task.human_review.approve(Some(APPROVED.to_string()), Utc::now());
+        task.pr_publication = publication.map(|state| {
+            let mut p = PrPublication::pending(
+                Uuid::new_v4(),
+                APPROVED.to_string(),
+                "task-branch".to_string(),
+                PR_URL.to_string(),
+                None,
+                Utc::now(),
+            );
+            p.state = state;
+            p
+        });
+        task
+    }
+
+    const APPROVED: &str = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+    const OTHER: &str = "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2";
+
+    fn published() -> Option<PublicationState> {
+        Some(PublicationState::Published {})
+    }
+
+    #[test]
+    fn an_open_pr_at_the_approved_head_with_a_published_record_is_delivered() {
+        let task = approved_correction(TaskStatus::HumanReview, published());
+        assert_eq!(
+            open_delivery(&task, PR_URL, "OPEN", Some(APPROVED)),
+            OpenDelivery::Delivered
+        );
+    }
+
+    #[test]
+    fn each_missing_or_disagreeing_piece_of_evidence_is_not_delivered() {
+        let cases: Vec<(&str, Task, &str, Option<&str>)> = vec![
+            ("an absent head", approved_correction(TaskStatus::HumanReview, published()), "OPEN", None),
+            ("an abbreviated head", approved_correction(TaskStatus::HumanReview, published()), "OPEN", Some(&APPROVED[..7])),
+            ("a different head", approved_correction(TaskStatus::HumanReview, published()), "OPEN", Some(OTHER)),
+            ("no publication record", approved_correction(TaskStatus::HumanReview, None), "OPEN", Some(APPROVED)),
+            ("a pending record", approved_correction(TaskStatus::HumanReview, Some(PublicationState::Pending {})), "OPEN", Some(APPROVED)),
+            ("an unknown record", approved_correction(TaskStatus::HumanReview, Some(PublicationState::Unknown { reason: "x".into() })), "OPEN", Some(APPROVED)),
+            ("a refused record", approved_correction(TaskStatus::HumanReview, Some(PublicationState::Refused { reason: "x".into() })), "OPEN", Some(APPROVED)),
+            ("a closed pull request", approved_correction(TaskStatus::HumanReview, published()), "CLOSED", Some(APPROVED)),
+            ("no current approval", {
+                let mut t = approved_correction(TaskStatus::HumanReview, published());
+                t.human_review.withdraw_approval();
+                t
+            }, "OPEN", Some(APPROVED)),
+        ];
+        for (why, task, state, head) in cases {
+            assert!(
+                matches!(open_delivery(&task, PR_URL, state, head), OpenDelivery::NotYetObserved(_)),
+                "{why} must not be evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn a_record_for_another_commit_or_pull_request_is_not_evidence() {
+        let mut other_commit = approved_correction(TaskStatus::HumanReview, published());
+        other_commit.pr_publication.as_mut().unwrap().commit = OTHER.to_string();
+        assert!(matches!(
+            open_delivery(&other_commit, PR_URL, "OPEN", Some(APPROVED)),
+            OpenDelivery::NotYetObserved(_)
+        ));
+
+        let mut other_pr = approved_correction(TaskStatus::HumanReview, published());
+        other_pr.pr_publication.as_mut().unwrap().pr_url =
+            "https://github.com/testorg/testrepo/pull/10".to_string();
+        assert!(matches!(
+            open_delivery(&other_pr, PR_URL, "OPEN", Some(APPROVED)),
+            OpenDelivery::NotYetObserved(_)
+        ));
+    }
+
+    #[test]
+    fn a_correction_outside_pr_created_moves_only_on_open_delivery() {
+        let unverified = approved_correction(TaskStatus::HumanReview, None);
+        assert_eq!(
+            pr_observation_effect(&unverified, PR_URL, true, "OPEN", Some(APPROVED)),
+            PrObservationEffect::RecordsStateOnly
+        );
+        let verified = approved_correction(TaskStatus::HumanReview, published());
+        assert_eq!(
+            pr_observation_effect(&verified, PR_URL, true, "OPEN", Some(APPROVED)),
+            PrObservationEffect::MovesToPrCreated
+        );
+        // A closure during a correction records the state only, even when the
+        // record and head agree: G2 covers open pull requests only.
+        assert_eq!(
+            pr_observation_effect(&verified, PR_URL, true, "CLOSED", Some(APPROVED)),
+            PrObservationEffect::RecordsStateOnly
+        );
+    }
+
+    #[test]
+    fn a_running_correction_records_only_the_state_until_its_head_is_delivered() {
+        for status in [TaskStatus::Queue, TaskStatus::InProgress, TaskStatus::AiReview] {
+            let task = approved_correction(status.clone(), published());
+            assert_eq!(
+                pr_observation_effect(&task, PR_URL, true, "OPEN", Some(APPROVED)),
+                PrObservationEffect::RecordsStateOnly,
+                "{status:?} is a correction whose run owns the status"
+            );
+        }
+    }
+
+    #[test]
+    fn outside_a_correction_the_effect_is_todays_rule() {
+        // A first link (not linked before) and a Task that is not a correction
+        // keep the move they have always made, whatever the observation.
+        let first_link = approved_correction(TaskStatus::HumanReview, None);
+        assert_eq!(
+            pr_observation_effect(&first_link, PR_URL, false, "OPEN", None),
+            PrObservationEffect::MovesToPrCreated
+        );
+        let closed_in_pr_created = approved_correction(TaskStatus::PrCreated, None);
+        assert_eq!(
+            pr_observation_effect(&closed_in_pr_created, PR_URL, true, "CLOSED", None),
+            PrObservationEffect::MovesToPrCreated
+        );
     }
 }
