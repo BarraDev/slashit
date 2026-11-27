@@ -77,6 +77,12 @@ pub fn refs_link_issue(refs: &[ExternalRef], repo: &str, number: i32) -> bool {
     })
 }
 
+/// Whether an issue address being typed is unsent text that moving to another
+/// Task would discard. Blank text is not a draft.
+pub fn draft_is_unsaved(address: &str) -> bool {
+    !address.trim().is_empty()
+}
+
 /// The GitHub Issues section of the task drawer.
 #[component]
 pub fn TaskIssueLinks(
@@ -84,6 +90,9 @@ pub fn TaskIssueLinks(
     #[prop(into)] task: Signal<Option<Task>>,
     /// Apply a task record a command returned.
     apply_task: Callback<Task>,
+    /// The address being typed. The drawer owns it so it can tell when the
+    /// section holds an unsent draft.
+    address: RwSignal<String>,
 ) -> impl IntoView {
     let rows = Memo::new(move |_| {
         task.with(|t| {
@@ -92,7 +101,6 @@ pub fn TaskIssueLinks(
                 .unwrap_or_default()
         })
     });
-    let address = RwSignal::new(String::new());
     let busy = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
 
@@ -314,6 +322,14 @@ mod tests {
         assert!(!refs_link_issue(&refs, "owner/repo", 8));
         assert!(!refs_link_issue(&refs, "owner/other", 7));
         assert!(!refs_link_issue(&[], "owner/repo", 7));
+    }
+
+    #[test]
+    fn a_typed_issue_address_is_an_unsent_draft_but_blank_text_is_not() {
+        assert!(draft_is_unsaved("https://github.com/o/r/issues/9"));
+        assert!(draft_is_unsaved("  o/r"));
+        assert!(!draft_is_unsaved(""));
+        assert!(!draft_is_unsaved("   "));
     }
 
     #[test]

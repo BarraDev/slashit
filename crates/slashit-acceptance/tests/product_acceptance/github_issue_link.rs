@@ -13,9 +13,9 @@ use super::*;
 use slashit_acceptance::fake_agent::FakeAgent;
 use slashit_acceptance::fake_gh::FakeGh;
 
-const ISSUE_URL: &str = "https://github.com/slashit-acceptance/fixture/issues/7";
+pub(super) const ISSUE_URL: &str = "https://github.com/slashit-acceptance/fixture/issues/7";
 const REFUSED_URL: &str = "https://github.com/slashit-acceptance/fixture/issues/9";
-const INPUT: &str = "[data-testid=\"task-drawer-issue-input\"]";
+pub(super) const INPUT: &str = "[data-testid=\"task-drawer-issue-input\"]";
 const LINK: &str = "[data-testid=\"task-drawer-issue-link\"]";
 const SECTION: &str = "[data-testid=\"task-drawer-issues\"]";
 const ROW: &str = "[data-testid=\"task-drawer-issue\"]";
@@ -179,7 +179,7 @@ fn invoked(args: &[String], expected: &[&str]) -> bool {
     args.len() >= expected.len() && args.iter().zip(expected).all(|(arg, want)| arg == want)
 }
 
-async fn type_address(driver: &WebDriver, text: &str) -> Result<()> {
+pub(super) async fn type_address(driver: &WebDriver, text: &str) -> Result<()> {
     let field = ui::visible(driver, INPUT)
         .await
         .context("the Issue address field is not shown")?;

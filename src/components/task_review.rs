@@ -540,6 +540,9 @@ pub fn HumanReviewPanel(
     viewed_tip: RwSignal<Option<String>>,
     /// Asked when the Changes tab shows a commit other than the one to approve.
     on_stale: Callback<()>,
+    /// Set while the Request Changes draft holds text, so the drawer can block
+    /// a move to another Task that would discard it.
+    unsaved: RwSignal<bool>,
 ) -> impl IntoView {
     let availability = RwSignal::new(None::<PrAvailability>);
     spawn_local(async move {
@@ -560,6 +563,13 @@ pub fn HumanReviewPanel(
     let error = RwSignal::new(None::<String>);
     let composing = RwSignal::new(false);
     let feedback = RwSignal::new(String::new());
+    Effect::new(move |_| {
+        let draft = feedback.with(|f| !f.is_empty());
+        unsaved.try_set(draft);
+    });
+    on_cleanup(move || {
+        unsaved.try_set(false);
+    });
     let confirming_local = RwSignal::new(false);
     // Whether the approval still covers the branch as it is. Asked again
     // whenever the task record changes, so a branch that moved is not shown
