@@ -328,6 +328,10 @@ pub enum PrFetchErrorKind {
     RateLimited,
     /// There is no `gh` to run.
     NotInstalled,
+    /// The answer arrived, but a reading that started later was published
+    /// first, so this one was not recorded and must not be acted on. Not an
+    /// absence of status: the cache holds a newer reading than this one.
+    Superseded,
     /// Anything else: GitHub refused, the network failed, the answer was
     /// unreadable.
     Failed,
@@ -713,7 +717,7 @@ impl PrStatuses {
             })
         } else {
             Err(PrFetchError::new(
-                PrFetchErrorKind::Failed,
+                PrFetchErrorKind::Superseded,
                 "a newer reading of this pull request arrived first",
             ))
         }
@@ -1509,7 +1513,7 @@ mod tests {
         // An older attempt answering late does not put its reading back, and
         // its caller is not handed it to act on.
         let late = cache.settle(&key, t(45), t(90), Ok(good_again())).await;
-        assert_eq!(late.map_err(|e| e.kind), Err(PrFetchErrorKind::Failed));
+        assert_eq!(late.map_err(|e| e.kind), Err(PrFetchErrorKind::Superseded));
         assert_eq!(cache.get(&key).unwrap().status, Some(newer.clone()));
         assert_eq!(cache.settle(&key, t(70), t(71), Ok(newer.clone())).await.map(|o| o.status), Ok(newer));
 

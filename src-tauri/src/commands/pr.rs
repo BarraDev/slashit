@@ -9327,9 +9327,25 @@ async fn link_pr_to_task_reserved(
     crate::commands::project::refuse_if_task_project_removed(state, task_uuid)
         .await
         .map_err(PrLinkFailure::NotRecorded)?;
+    // The pull request this task is linked to before GitHub is asked. The
+    // lease check below compares against it, so a relink during the read is
+    // refused rather than judged as a first link.
+    let linked_before_read = linked_pr_identity(state, task_uuid).await;
     // One answer supplies both the state and the full head: G2 judges the head
     // of the same observation that the state is recorded from.
-    let answer = refresh_pr_url(&state.pr_statuses, pr_url).await.ok();
+    let answer = match refresh_pr_url(&state.pr_statuses, pr_url).await {
+        Ok(observation) => Some(observation),
+        // A newer reading replaced this one in the cache. That is not an
+        // unavailable status: the first-link fallback below must not record
+        // from it, so the link is refused and asked again.
+        Err(e) if e.kind == crate::pr_status::PrFetchErrorKind::Superseded => {
+            return Err(PrLinkFailure::NotRecorded(format!(
+                "a newer reading of {pr_url} arrived while GitHub was being asked, so the pull \
+                 request was not linked to the task. Refresh again."
+            )));
+        }
+        Err(_) => None,
+    };
     let remote_state = answer
         .as_ref()
         .and_then(|s| s.state.as_recorded().map(str::to_string));
@@ -9363,6 +9379,17 @@ async fn link_pr_to_task_reserved(
     // failure to report a PR against.
     if !state.task.tasks.read().await.contains_key(&task_uuid) {
         return Ok(());
+    }
+    // A link changed while GitHub was asked (relinked to another pull request,
+    // or unlinked) makes the answer about a pull request the task no longer
+    // links. Refused here, before the admission, any owner end or any write.
+    // An equivalent URL of the same pull request is not a change.
+    if linked_pr_identity(state, task_uuid).await != linked_before_read {
+        return Err(PrLinkFailure::NotRecorded(
+            "the task was changed while the pull request was being opened, so it was not \
+             linked to the task"
+                .to_string(),
+        ));
     }
     // The admission boundary, under the lease and before any owner is ended or
     // anything is written. A reading a newer one replaced authorizes nothing,
@@ -9422,7 +9449,9 @@ async fn link_pr_to_task_reserved(
             .await
             .get(&task_uuid)
             .is_some_and(|t| {
-                let linked_before = t.authoritative_pr_url() == Some(pr_url);
+                let linked_before = t
+                    .authoritative_pr_url()
+                    .is_some_and(|linked| same_pull_request(linked, pr_url));
                 pr_observation_effect(
                     t,
                     pr_url,
@@ -9449,7 +9478,9 @@ async fn link_pr_to_task_reserved(
     let apply = move |staged: &mut std::collections::HashMap<Uuid, Task>| {
         if let Some(task) = staged.get_mut(&task_uuid) {
             // Judged on the staged Task, before this write links it.
-            let linked_before = task.authoritative_pr_url() == Some(pr_url);
+            let linked_before = task
+                .authoritative_pr_url()
+                .is_some_and(|linked| same_pull_request(linked, pr_url));
             let moves = pr_observation_effect(
                 task,
                 pr_url,
@@ -9567,13 +9598,13 @@ fn apply_pr_link(task: &mut Task, pr_url: &str, remote_state: Option<&str>) {
     if !task
         .external_refs
         .iter()
-        .any(|r| matches!(r, ExternalRef::GithubPr { url, .. } if url == pr_url))
+        .any(|r| matches!(r, ExternalRef::GithubPr { url, .. } if same_pull_request(url, pr_url)))
     {
         task.external_refs.push(ref_);
     } else if let Some(remote) = remote_state {
         for r in task.external_refs.iter_mut() {
             if let ExternalRef::GithubPr { url, state: s, .. } = r {
-                if url == pr_url {
+                if same_pull_request(url, pr_url) {
                     *s = Some(remote.to_string());
                 }
             }
@@ -9596,10 +9627,24 @@ fn pr_key_for_url(pr_url: &str) -> Option<crate::pr_status::PrKey> {
 async fn refresh_pr_url(
     statuses: &crate::pr_status::PrStatuses,
     pr_url: &str,
-) -> Result<crate::pr_status::PrObservation, String> {
-    let key = pr_key_for_url(pr_url)
-        .ok_or_else(|| format!("{pr_url} is not a GitHub pull request URL"))?;
-    statuses.refresh(&key).await.map_err(|e| e.message)
+) -> Result<crate::pr_status::PrObservation, crate::pr_status::PrFetchError> {
+    let key = pr_key_for_url(pr_url).ok_or_else(|| crate::pr_status::PrFetchError {
+        kind: crate::pr_status::PrFetchErrorKind::Failed,
+        message: format!("{pr_url} is not a GitHub pull request URL"),
+    })?;
+    statuses.refresh(&key).await
+}
+
+/// The identity of the pull request `task_uuid` is linked to now, if any.
+async fn linked_pr_identity(state: &crate::AppState, task_uuid: Uuid) -> Option<(String, u64)> {
+    state
+        .task
+        .tasks
+        .read()
+        .await
+        .get(&task_uuid)?
+        .authoritative_pr_url()
+        .and_then(pull_request_identity)
 }
 
 /// The state ("OPEN" | "CLOSED" | "MERGED") GitHub reports for `pr_url`, or
@@ -24917,6 +24962,150 @@ mod tests {
                 assert_eq!(after.pr_publication, before.pr_publication, "publication record");
                 assert_eq!(after.worktree_path, before.worktree_path, "checkout path");
                 assert_eq!(recorded_pr_state(&after), recorded_pr_state(&before), "nothing recorded");
+            }
+
+            /// A first link whose read the cache refuses as superseded is not an
+            /// unavailable status. Superseded deterministically: a reading stamped
+            /// after this read starts is already published, so the read's own
+            /// result is refused. The first-link fallback must not record from
+            /// it, so the task keeps its status, link and references.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_superseded_first_link_is_refused_and_not_recorded_as_unavailable() {
+                use crate::pr_status::{ChecksState, PrKey, PrState, PrStatus};
+                let _guard = PATH_LOCK.lock().await;
+                let _mock = MockGh::setup(CORRECTION_PR, &open_at(OTHER_HEAD));
+                let (state, _tmp) = build_test_state().await;
+                let task_id =
+                    seed_task(&state, "/tmp", Some("task-branch"), TaskStatus::HumanReview).await;
+                {
+                    let mut tasks = state.task.tasks.write().await;
+                    let t = tasks.get_mut(&task_id).unwrap();
+                    t.human_review.record_arrival();
+                    t.human_review.approve(Some(APPROVED_HEAD.to_string()), chrono::Utc::now());
+                }
+                let before = state.task.tasks.read().await[&task_id].clone();
+                let newer = PrStatus {
+                    state: PrState::Open,
+                    checks: ChecksState::Passing,
+                    failing_checks: vec![],
+                    failing_check_count: 0,
+                    review_decision: None,
+                    mergeable: None,
+                    merge_commit: None,
+                    head_oid: Some(OTHER_HEAD.to_string()),
+                };
+                state.pr_statuses.remember_at(
+                    &PrKey::new("testorg/testrepo", 9),
+                    newer,
+                    chrono::Utc::now() + chrono::TimeDelta::hours(1),
+                );
+
+                let answer = link_pr_to_task(&state, task_id, CORRECTION_PR).await;
+                assert!(
+                    matches!(answer, Err(PrLinkFailure::NotRecorded(_))),
+                    "a superseded read is refused, not linked as unavailable: {answer:?}"
+                );
+                let after = state.task.tasks.read().await[&task_id].clone();
+                assert_eq!(after.status, TaskStatus::HumanReview, "status kept");
+                assert_eq!(after.pr_url, before.pr_url, "no link recorded");
+                assert_eq!(after.external_refs, before.external_refs, "no reference added");
+            }
+
+            /// A link changed while GitHub is read (here, relinked to another
+            /// pull request) is refused under the lease, before the owner ends or
+            /// anything is written. The read was of a pull request the task no
+            /// longer links, so it is judged as the change it is, not as a first
+            /// link that would move the task and relink it back.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_relink_while_the_pull_request_is_read_is_refused_before_any_effect() {
+                use crate::pr_status::PrKey;
+                let _guard = PATH_LOCK.lock().await;
+                let (state, task_id, executor, _tmp, _mock) = correction_at_approved_head().await;
+                let owner = executor.register_fake_running_execution_for_test(task_id).await;
+                let before = state.task.tasks.read().await[&task_id].clone();
+                let key = PrKey::new("testorg/testrepo", 9);
+                let statuses = state.pr_statuses.clone();
+                let tasks = state.task.tasks.clone();
+                let lease = state
+                    .task_lifecycle_locks
+                    .acquire(task_id)
+                    .await
+                    .expect("the lease is free");
+                const OTHER_PR: &str = "https://github.com/testorg/testrepo/pull/10";
+
+                let (answer, ()) = tokio::join!(
+                    link_pr_to_task_reserved(&state, task_id, CORRECTION_PR, None),
+                    async move {
+                        // The read has answered, so the link has taken its snapshot
+                        // and is waiting for the lease this test holds.
+                        while statuses.get(&key).and_then(|e| e.status).is_none() {
+                            tokio::task::yield_now().await;
+                        }
+                        tasks.write().await.get_mut(&task_id).unwrap().pr_url =
+                            Some(OTHER_PR.to_string());
+                        drop(lease);
+                    },
+                );
+                assert!(
+                    matches!(answer, Err(PrLinkFailure::NotRecorded(_))),
+                    "a relink during the read is refused: {answer:?}"
+                );
+
+                let after = state.task.tasks.read().await[&task_id].clone();
+                assert!(!owner.load(std::sync::atomic::Ordering::SeqCst), "the owner is not ended");
+                assert_eq!(after.status, TaskStatus::HumanReview, "status kept");
+                assert_eq!(after.pr_url.as_deref(), Some(OTHER_PR), "the other link is kept");
+                assert_eq!(after.external_refs, before.external_refs, "references kept");
+                assert_eq!(after.human_review.entries, before.human_review.entries, "approval history");
+                assert_eq!(after.pr_publication, before.pr_publication, "publication record");
+                assert_eq!(after.worktree_path, before.worktree_path, "checkout path");
+            }
+
+            /// Linking the pull request a task already links under an equivalent
+            /// URL (trailing slash) is the same pull request, so the correction
+            /// guard still applies: an OPEN pull request whose head does not
+            /// contain the approved commit records its state and ends no owner.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_equivalent_url_for_the_linked_pull_request_keeps_the_correction_guard() {
+                use crate::domain::task::ExternalRef;
+                let _guard = PATH_LOCK.lock().await;
+                let _mock = MockGh::setup(CORRECTION_PR, &open_at(OTHER_HEAD));
+                let (state, _tmp) = build_test_state().await;
+                let executor = attach_test_executor(&state);
+                let task_id =
+                    seed_task(&state, "/tmp", Some("task-branch"), TaskStatus::HumanReview).await;
+                stamp_correction(&state, task_id, Some(crate::domain::publication::PublicationState::Published {})).await;
+                let slashed = format!("{CORRECTION_PR}/");
+                {
+                    let mut tasks = state.task.tasks.write().await;
+                    let t = tasks.get_mut(&task_id).unwrap();
+                    t.pr_url = Some(slashed.clone());
+                    for r in t.external_refs.iter_mut() {
+                        if let ExternalRef::GithubPr { url, .. } = r {
+                            *url = slashed.clone();
+                        }
+                    }
+                }
+                let owner = executor.register_fake_running_execution_for_test(task_id).await;
+                let before = state.task.tasks.read().await[&task_id].clone();
+
+                link_pr_to_task_reserved(&state, task_id, CORRECTION_PR, None)
+                    .await
+                    .expect("recording the state of the linked pull request succeeds");
+
+                let after = state.task.tasks.read().await[&task_id].clone();
+                assert!(!owner.load(std::sync::atomic::Ordering::SeqCst), "the owner is not ended");
+                assert_eq!(after.status, TaskStatus::HumanReview, "status kept");
+                assert_eq!(after.pr_publication, before.pr_publication, "publication record");
+                let github_refs = after
+                    .external_refs
+                    .iter()
+                    .filter(|r| matches!(r, ExternalRef::GithubPr { .. }))
+                    .count();
+                assert_eq!(github_refs, 1, "the equivalent URL is not a second reference");
             }
 
             /// PR link, a newer reading published while an admitted move waits
