@@ -11,12 +11,10 @@
 //!
 //! Written against CodeRabbit CLI 0.9.7.
 
-use crate::process_tree;
+use crate::process_tree::TreeOwner;
 use serde::Deserialize;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
-use tokio::process::Child;
 
 /// The CLI documents reviews of up to 15 minutes; past this it is stopped.
 pub(crate) const REVIEW_TIMEOUT: Duration = Duration::from_secs(20 * 60);
@@ -128,63 +126,13 @@ fn review_args<'a>(working_dir: &'a str, base_commit: &'a str) -> [&'a str; 8] {
     ]
 }
 
-/// The CodeRabbit process group a run spawned. Its group is signalled only
-/// while the leader is unreaped, so the group id still names this run's group.
-/// Dropping it ends the group on any path the run does not finish normally,
-/// including a dropped future.
-struct Group {
-    leader: Option<u32>,
-    unreaped: AtomicBool,
-}
-
-impl Group {
-    fn new(leader: Option<u32>) -> Self {
-        Self {
-            leader,
-            unreaped: AtomicBool::new(true),
-        }
-    }
-
-    /// Ends every process in the group. A no-op once the leader is reaped.
-    fn signal(&self) {
-        if !self.unreaped.load(Ordering::SeqCst) {
-            return;
-        }
-        if let Some(pid) = self.leader {
-            #[cfg(unix)]
-            process_tree::kill_process_group(pid);
-            #[cfg(windows)]
-            process_tree::kill_process_tree(pid);
-            #[cfg(not(any(unix, windows)))]
-            let _ = pid;
-        }
-    }
-
-    /// Ends the group, then kills and reaps the leader.
-    async fn stop(&self, child: &mut Child) {
-        self.signal();
-        let _ = child.kill().await; // kills and reaps
-        self.reaped();
-    }
-
-    /// Recorded right after the leader's reap, after which its pid may be reissued.
-    fn reaped(&self) {
-        self.unreaped.store(false, Ordering::SeqCst);
-    }
-}
-
-impl Drop for Group {
-    fn drop(&mut self) {
-        self.signal();
-    }
-}
-
 /// Run the CodeRabbit CLI found on `PATH` and read its result.
 ///
-/// The run leads its own process group, and every process in it is ended when
-/// the run completes (so a descendant cannot outlive the review), times out,
-/// is cancelled, or the future is dropped. A cancelled run returns an empty
-/// result, which the caller discards.
+/// The run's process tree is owned by a [`TreeOwner`] (a process group on
+/// Unix, a Job Object on Windows), and every process in it is ended when the
+/// run completes (so a descendant cannot outlive the review), times out, is
+/// cancelled, or the future is dropped. A run whose tree cannot be owned is not
+/// started. A cancelled run returns an empty result, which the caller discards.
 pub(crate) async fn run_review(
     working_dir: &str,
     base_commit: &str,
@@ -211,18 +159,17 @@ pub(crate) async fn run_review(
         // Covers the paths where this future is simply dropped (an aborted
         // task, a runtime shutdown) for the leader itself.
         .kill_on_drop(true);
-    // Unix: the leader and whatever it starts share a group, so the group can
-    // be ended as a whole (see `Group`).
-    #[cfg(unix)]
-    command.process_group(0);
-    let mut child = match command.spawn() {
-        Ok(child) => child,
+    // Spawned with its tree owned (see `TreeOwner::spawn`). Declared after the
+    // child it owns is not enough on its own: the tuple binds `child` first, so
+    // the owner drops first, while the leader is unreaped.
+    let (mut child, group) = match TreeOwner::spawn(&mut command) {
+        Ok(spawned) => spawned,
         Err(e) => {
-            return CodeRabbitReview::failed(format!("the CodeRabbit CLI could not start: {e}"))
+            return CodeRabbitReview::failed(format!(
+                "the CodeRabbit CLI could not be started with its processes owned: {e}"
+            ))
         }
     };
-    // Declared after `child`, so it drops first, while the leader is unreaped.
-    let group = Group::new(child.id());
 
     let (Some(mut out), Some(mut err)) = (child.stdout.take(), child.stderr.take()) else {
         group.stop(&mut child).await;
@@ -238,13 +185,10 @@ pub(crate) async fn run_review(
             async { tokio::join!(out.read_to_end(&mut stdout), err.read_to_end(&mut stderr)) };
         // Once the leader has exited, whatever it left running is ended too.
         // That also closes the pipes a descendant would otherwise hold open.
-        // The exit is awaited without reaping, so the group id is still valid.
+        // The exit is awaited without reaping, so the tree is still owned.
         let end_group = async {
-            #[cfg(unix)]
-            if let Some(pid) = group.leader {
-                process_tree::wait_for_exit_without_reaping(pid).await;
-                group.signal();
-            }
+            group.wait_for_leader_exit().await;
+            group.signal();
         };
         let run = async { tokio::join!(drain, end_group) };
         tokio::select! {
