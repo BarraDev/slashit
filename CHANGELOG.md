@@ -14,6 +14,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   only in the desktop app, and `slashit open-pr` uses that authorization once.
   A moved branch invalidates it. A Task board that holds such a request cannot
   be read by an earlier version.
+- **PR Comment Review from the CLI.** `slashit pr-review` reads a Task's stored
+  PR Comment Review: each finding with a stable ID, the reviewer's comment, the
+  agent's summary and reasoning, the original proposal, any Human override and
+  the effective instruction, the decision and approval, and what was fixed and
+  replied. `--json` prints it in full and `--markdown FILE` exports it to a new
+  file. It only reads.
 
 ## [0.0.4]
 

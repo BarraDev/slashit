@@ -143,6 +143,7 @@ slashit tasks [--project ID]                # List tasks
 slashit runs TASK_ID                        # Show one Task's recent execution evidence
 slashit review TASK_ID                      # Review state as JSON
 slashit delivery TASK_ID                    # Delivery state as JSON
+slashit pr-review TASK_ID [--markdown FILE] # PR Comment Review findings (read-only; --json for all fields)
 slashit request TASK_ID approve --commit SHA --actor NAME   # Ask a person (or: open-pr)
 slashit open-pr TASK_ID --request ID --actor NAME           # Use a person's authorization once
 slashit create --project ID "Task title"    # Create task

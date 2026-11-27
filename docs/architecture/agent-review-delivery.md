@@ -10,10 +10,17 @@ A person makes every approval and publication decision.
 |---|---|---|
 | `slashit review <task>` | `GetReviewState` | reads decisions, approval coverage, branch commit, requests (JSON) |
 | `slashit delivery <task>` | `GetDeliveryState` | reads the pull request, failures, requests to open one (JSON) |
+| `slashit pr-review <task> [--markdown <file>]` | `GetPrCommentReview` | reads the PR Comment Review: findings, overrides, approvals, fix and reply evidence (JSON or Markdown) |
 | `slashit request <task> approve\|open-pr --commit <sha> --actor <name>` | `RequestOperation` | files a question for a person |
 | `slashit open-pr <task> --request <id> --actor <name>` | `OpenPr` | spends one authorization |
 
 There is no verb that decides a request, and no `approve_task` over IPC.
+`GetPrCommentReview` answers from the Task's stored review plan alone: it never
+analyzes, starts a fix agent, approves a finding or edits the plan. Each finding
+carries a `finding_id` derived from the stored plan (`<kind>:<comment id>`, or
+`item:<position>` for a finding with no comment), so two reads of the same plan
+name it alike. The Markdown export is written by the CLI process to a new file;
+the instance writes nothing.
 Request Changes, merging and force pushes are not reachable this way.
 
 ## Mechanism

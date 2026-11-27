@@ -9,9 +9,9 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use slashit::{client, output, task_ref};
+use slashit::{client, output, pr_review, task_ref};
 use slashit_ipc::client::{ClientError, ClientOptions};
-use slashit_ipc::{InstanceInfo, IpcRequest};
+use slashit_ipc::{InstanceInfo, IpcRequest, PrCommentReview};
 
 #[derive(Parser)]
 #[command(name = "slashit", about = "Control the SlashIt workspace manager", version)]
@@ -82,6 +82,22 @@ enum Commands {
     Delivery {
         /// Task ID
         task_id: String,
+    },
+    /// Show or export a Task's PR Comment Review (read-only)
+    ///
+    /// The stored analysis of the pull request's review comments: each
+    /// finding's stable ID, the reviewer comment, the agent's summary and
+    /// reasoning, the original proposal, any Human override, the effective
+    /// instruction, the decision and approval, and what was fixed and
+    /// published. Nothing is analyzed, no agent is started, and no approval or
+    /// plan is changed. `--json` prints the full answer.
+    PrReview {
+        /// Task ID
+        task_id: String,
+        /// Also write the review as Markdown to this new file; an existing
+        /// file is never replaced
+        #[arg(long, value_name = "PATH")]
+        markdown: Option<PathBuf>,
     },
     /// Ask a person to approve a commit, or to authorize opening its pull request
     ///
@@ -312,6 +328,10 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
+    if let Commands::PrReview { markdown: Some(path), .. } = &cli.command {
+        export_pr_review(&response.data, path);
+    }
+
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&response.data)?);
         return Ok(());
@@ -337,6 +357,12 @@ async fn main() -> Result<()> {
         Commands::Ping => output::print_instance(&response.data),
         Commands::Features => output::print_features(&response.data),
         Commands::Runs { .. } => output::print_runs(&response.data),
+        Commands::PrReview { .. } => {
+            match serde_json::from_value::<PrCommentReview>(response.data.clone()) {
+                Ok(review) => print!("{}", pr_review::summary_text(&review)),
+                Err(_) => println!("{}", serde_json::to_string_pretty(&response.data)?),
+            }
+        }
         _ => {
             // For mutation commands, print a simple success message
             if let Some(msg) = response.data.as_str() {
@@ -359,6 +385,7 @@ fn task_refs(command: &mut Commands) -> Vec<&mut String> {
         | Commands::Runs { task_id }
         | Commands::Review { task_id }
         | Commands::Delivery { task_id }
+        | Commands::PrReview { task_id, .. }
         | Commands::Request { task_id, .. }
         | Commands::OpenPr { task_id, .. }
         | Commands::Move { task_id, .. }
@@ -413,6 +440,19 @@ async fn resolve_task_refs(command: &mut Commands, options: &ClientOptions) {
     }
 }
 
+/// Write the review's Markdown export to the new file `path`, or exit with
+/// status 1. The instance only read; the file is written by this process.
+fn export_pr_review(data: &serde_json::Value, path: &std::path::Path) {
+    let review: PrCommentReview = match serde_json::from_value(data.clone()) {
+        Ok(review) => review,
+        Err(e) => fail(&format!("could not understand the instance's reply: {e}")),
+    };
+    if let Err(e) = pr_review::write_new_file(path, &pr_review::markdown(&review)) {
+        fail(&format!("could not write {}: {e}", path.display()));
+    }
+    eprintln!("Wrote {}", path.display());
+}
+
 fn fail(message: &str) -> ! {
     eprintln!("{}", output::error_line(message));
     std::process::exit(1)
@@ -454,6 +494,9 @@ fn request_for(command: &Commands) -> Result<IpcRequest> {
             task_id: task_id.clone(),
         },
         Commands::Delivery { task_id } => IpcRequest::GetDeliveryState {
+            task_id: task_id.clone(),
+        },
+        Commands::PrReview { task_id, .. } => IpcRequest::GetPrCommentReview {
             task_id: task_id.clone(),
         },
         Commands::Request { task_id, operation, commit, actor } => IpcRequest::RequestOperation {
@@ -673,6 +716,10 @@ mod dispatch_tests {
             other => panic!("open-pr mapped to {other:?}"),
         }
         assert!(Cli::try_parse_from(["slashit", "approve", TASK]).is_err());
+        match request_for_args(&["slashit", "pr-review", TASK, "--markdown", "out.md"]) {
+            IpcRequest::GetPrCommentReview { task_id } => assert_eq!(task_id, TASK),
+            other => panic!("pr-review mapped to {other:?}"),
+        }
     }
 
     #[test]

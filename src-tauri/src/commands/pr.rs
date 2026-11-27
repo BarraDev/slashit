@@ -22,6 +22,9 @@ use uuid::Uuid;
 mod republish;
 pub use republish::{RepublishOutcome, RepublishStatus};
 
+mod inspection;
+pub(crate) use inspection::pr_comment_review;
+
 mod publication;
 pub use publication::*;
 
