@@ -3713,13 +3713,11 @@ impl TaskExecutor {
         }
         // Answers are applied once a whole batch has settled, so a newer
         // reading may have landed in the meantime, say an open after a
-        // reopen. Only what the cache still says is acted on.
-        if self
-            .pr_statuses
-            .get(key)
-            .and_then(|e| e.status)
-            .is_some_and(|s| s.state != state)
-        {
+        // reopen, or an open at another head. Only what the cache still says
+        // is acted on: the observation's state and full head, not its state
+        // alone. The same check is repeated under the lease in
+        // `record_pr_poll_state`, the authoritative boundary.
+        if self.pr_statuses.latest_reading_differs(key, recorded, head_oid) {
             return Ok(());
         }
         // A recorded merge needs only its evidence repaired, even when
@@ -3873,6 +3871,14 @@ impl TaskExecutor {
         if self.task_project_removed(task_id).await {
             return;
         }
+        // The authoritative freshness check, under the lease and before any
+        // owner is ended. A reading a newer one replaced (an older OPEN at
+        // another head, say) authorizes nothing and records nothing; the
+        // newer reading is observed on its own pass. Read once here, so the
+        // G2 decision below and the write it guards judge the same reading.
+        if self.pr_statuses.latest_reading_differs(key, state, head_oid) {
+            return;
+        }
         // G2, decided on the Task before any owner is ended. Only a published
         // Human Review correction can move here: an open pull request at the
         // approved commit, with its publication recorded. Anything else
@@ -3898,7 +3904,16 @@ impl TaskExecutor {
         }
         let state_owned = state.to_string();
         let key_owned = key.clone();
+        let head_owned = head_oid.map(str::to_string);
+        let statuses = &self.pr_statuses;
         let revise = move |staged: &mut HashMap<Uuid, Task>| {
+            // The commit boundary: the freshness check is repeated here, inside
+            // the board's write guard, because the owner end above is an await
+            // a newer reading may land during. A superseded observation writes
+            // nothing, so it neither moves the Task nor records its state.
+            if statuses.latest_reading_differs(&key_owned, &state_owned, head_owned.as_deref()) {
+                return false;
+            }
             let Some(t) = staged.get_mut(&task_id) else {
                 return false;
             };
@@ -12988,6 +13003,215 @@ mod tests {
         assert_eq!(after.status, TaskStatus::InProgress);
         assert!(after.error_message.is_none(), "a correction keeps its error");
         assert_eq!(recorded_pr_state(&after).as_deref(), Some("CLOSED"));
+    }
+
+    // ── G2 freshness on the background poll: a reading a newer one replaced
+    // authorizes nothing, judged on its state and full head, under the lease ──
+
+    const CORRECTION_PR_URL: &str = "https://github.com/owner/repo/pull/7";
+    const APPROVED_AT: &str = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+    const NEWER_AT: &str = "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2";
+
+    fn open_reading(head: Option<&str>) -> crate::pr_status::PrStatus {
+        crate::pr_status::PrStatus {
+            state: crate::pr_status::PrState::Open,
+            checks: crate::pr_status::ChecksState::Passing,
+            failing_checks: vec![],
+            failing_check_count: 0,
+            review_decision: None,
+            mergeable: None,
+            merge_commit: None,
+            head_oid: head.map(str::to_string),
+        }
+    }
+
+    /// A published correction at `status`: linked to the pull request, approved
+    /// at `APPROVED_AT` in a new arrival, with a Published record for that commit.
+    async fn published_correction(executor: &TaskExecutor, status: TaskStatus) -> Uuid {
+        use crate::domain::publication::{PrPublication, PublicationState};
+        let (id, _) =
+            seed_with_pr(executor, status, pr_ref("owner/repo", 7, Some("OPEN"))).await;
+        {
+            let mut tasks = executor.tasks.write().await;
+            let t = tasks.get_mut(&id).unwrap();
+            t.human_review.record_arrival();
+            t.human_review
+                .approve(Some(APPROVED_AT.to_string()), chrono::Utc::now());
+            let mut publication = PrPublication::pending(
+                uuid::Uuid::new_v4(),
+                APPROVED_AT.to_string(),
+                "task-branch".to_string(),
+                CORRECTION_PR_URL.to_string(),
+                None,
+                chrono::Utc::now(),
+            );
+            publication.state = PublicationState::Published {};
+            t.pr_publication = Some(publication);
+        }
+        id
+    }
+
+    /// The rejected observation left the correction as it was: status, live
+    /// owner, approval history and the approved commit's currency, publication
+    /// record, and Task Checkout.
+    async fn assert_correction_kept(
+        executor: &TaskExecutor,
+        id: Uuid,
+        before: &Task,
+        owner: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        why: &str,
+    ) {
+        let after = executor.tasks.read().await[&id].clone();
+        assert_eq!(after.status, before.status, "{why}: status");
+        assert!(
+            !owner.load(std::sync::atomic::Ordering::SeqCst),
+            "{why}: the correction owner is not ended"
+        );
+        assert_eq!(after.human_review.entries, before.human_review.entries, "{why}: approval history");
+        assert!(
+            after.human_review.is_approved() && after.human_review.approved_tip() == Some(APPROVED_AT),
+            "{why}: the approval of the approved commit stays current"
+        );
+        assert_eq!(after.pr_publication, before.pr_publication, "{why}: publication record");
+        assert_eq!(after.branch_name, before.branch_name, "{why}: checkout branch");
+        assert_eq!(after.worktree_path, before.worktree_path, "{why}: checkout path");
+    }
+
+    #[tokio::test]
+    async fn an_older_open_applied_after_a_newer_open_at_another_head_is_not_acted_on() {
+        let (executor, _temps) = test_executor();
+        let key = crate::pr_status::PrKey::new("owner/repo", 7);
+        let id = published_correction(&executor, TaskStatus::HumanReview).await;
+        let owner = executor.register_fake_running_execution_for_test(id).await;
+        // The newer OPEN reading at NEWER_AT is recorded before the older OPEN
+        // at APPROVED_AT is applied. Same state, so a state-only check would
+        // let the older head authorize the move.
+        executor.pr_statuses.remember(&key, open_reading(Some(NEWER_AT)));
+        let before = executor.tasks.read().await[&id].clone();
+
+        executor
+            .apply_polled_pr_state(
+                id,
+                &key,
+                crate::pr_status::PrState::Open,
+                Some(APPROVED_AT),
+                None,
+            )
+            .await
+            .expect("observation applies");
+
+        assert_correction_kept(&executor, id, &before, &owner, "older OPEN after newer OPEN").await;
+    }
+
+    #[tokio::test]
+    async fn the_lease_boundary_refuses_an_observation_a_newer_reading_replaced() {
+        // The early check in `apply_polled_pr_state` has already passed when
+        // the newer reading lands; this call is the one taken under the lease.
+        let (executor, _temps) = test_executor();
+        let key = crate::pr_status::PrKey::new("owner/repo", 7);
+        let id = published_correction(&executor, TaskStatus::HumanReview).await;
+        let owner = executor.register_fake_running_execution_for_test(id).await;
+        executor.pr_statuses.remember(&key, open_reading(Some(NEWER_AT)));
+        let before = executor.tasks.read().await[&id].clone();
+
+        executor
+            .record_pr_poll_state(id, &key, "OPEN", Some(APPROVED_AT))
+            .await;
+
+        assert_correction_kept(&executor, id, &before, &owner, "stale OPEN under the lease").await;
+    }
+
+    #[tokio::test]
+    async fn a_current_open_at_the_approved_head_moves_a_correction_when_the_cache_agrees() {
+        let (executor, _temps) = test_executor();
+        let key = crate::pr_status::PrKey::new("owner/repo", 7);
+        let id = published_correction(&executor, TaskStatus::HumanReview).await;
+        let owner = executor.register_fake_running_execution_for_test(id).await;
+        executor.pr_statuses.remember(&key, open_reading(Some(APPROVED_AT)));
+
+        executor
+            .apply_polled_pr_state(
+                id,
+                &key,
+                crate::pr_status::PrState::Open,
+                Some(APPROVED_AT),
+                None,
+            )
+            .await
+            .expect("observation applies");
+
+        let after = executor.tasks.read().await[&id].clone();
+        assert_eq!(after.status, TaskStatus::PrCreated);
+        assert!(owner.load(std::sync::atomic::Ordering::SeqCst), "the run is ended before the move");
+        assert!(
+            after.human_review.is_approved() && after.human_review.approved_tip() == Some(APPROVED_AT),
+            "the approval of the approved commit stays current"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_current_open_without_the_approved_head_keeps_the_correction() {
+        // Missing or mismatched head, with the cache agreeing with the answer:
+        // the state is current, but the head is not evidence of delivery.
+        for head in [None, Some(NEWER_AT)] {
+            let (executor, _temps) = test_executor();
+            let key = crate::pr_status::PrKey::new("owner/repo", 7);
+            let id = published_correction(&executor, TaskStatus::HumanReview).await;
+            let owner = executor.register_fake_running_execution_for_test(id).await;
+            executor.pr_statuses.remember(&key, open_reading(head));
+            let before = executor.tasks.read().await[&id].clone();
+
+            executor
+                .apply_polled_pr_state(id, &key, crate::pr_status::PrState::Open, head, None)
+                .await
+                .expect("observation applies");
+
+            assert_correction_kept(&executor, id, &before, &owner, &format!("head {head:?}")).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_newer_open_landing_while_the_owner_ends_refuses_the_background_move() {
+        // The background poll's first check passes against the OPEN reading at
+        // the approved head. The owner's cancellation is the next effect, and a
+        // newer OPEN at another head lands while it is being ended. The commit
+        // boundary judges the observation again and refuses it, so the Task
+        // keeps its status, approval, publication and Checkout.
+        let (executor, _temps) = test_executor();
+        let key = crate::pr_status::PrKey::new("owner/repo", 7);
+        let id = published_correction(&executor, TaskStatus::HumanReview).await;
+        let gated = executor.register_gated_running_execution_for_test(id).await;
+        executor.pr_statuses.remember(&key, open_reading(Some(APPROVED_AT)));
+        let before = executor.tasks.read().await[&id].clone();
+
+        let (applied, ()) = tokio::join!(
+            executor.apply_polled_pr_state(
+                id,
+                &key,
+                crate::pr_status::PrState::Open,
+                Some(APPROVED_AT),
+                None,
+            ),
+            async {
+                while !gated.cancel_seen.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+                executor.pr_statuses.remember(&key, open_reading(Some(NEWER_AT)));
+                gated.release.send(true).expect("the owner is waiting for release");
+            },
+        );
+        applied.expect("observation applies");
+
+        let after = executor.tasks.read().await[&id].clone();
+        assert_eq!(after.status, before.status, "status");
+        assert_eq!(after.human_review.entries, before.human_review.entries, "approval history");
+        assert!(
+            after.human_review.is_approved() && after.human_review.approved_tip() == Some(APPROVED_AT),
+            "the approval of the approved commit stays current"
+        );
+        assert_eq!(after.pr_publication, before.pr_publication, "publication record");
+        assert_eq!(after.worktree_path, before.worktree_path, "checkout path");
+        assert_eq!(recorded_pr_state(&after), recorded_pr_state(&before), "nothing recorded");
     }
 
     #[cfg(unix)]

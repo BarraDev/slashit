@@ -404,19 +404,25 @@ pub enum PrObservationEffect {
 ///
 /// The caller passes the state and head of the same observation it writes,
 /// and handles `MERGED` itself.
+///
+/// `latest` says the observation is still the newest reading of the pull
+/// request (no newer reading with another state or head has been recorded).
+/// A superseded observation is not evidence inside a correction, whatever
+/// its head says: a newer reading decides, and the one judged here does not.
 pub fn pr_observation_effect(
     task: &Task,
     pr_url: &str,
     linked_before: bool,
     observed_state: &str,
     observed_head: Option<&str>,
+    latest: bool,
 ) -> PrObservationEffect {
     if !is_post_pr_correction(task, linked_before) {
         return PrObservationEffect::MovesToPrCreated;
     }
     // Only Human Review can be delivered by an observation. A queued, running
     // or AI-reviewed correction belongs to its run, which keeps its status.
-    if task.status != TaskStatus::HumanReview {
+    if task.status != TaskStatus::HumanReview || !latest {
         return PrObservationEffect::RecordsStateOnly;
     }
     match open_delivery(task, pr_url, observed_state, observed_head) {
@@ -747,18 +753,18 @@ mod tests {
     fn a_correction_outside_pr_created_moves_only_on_open_delivery() {
         let unverified = approved_correction(TaskStatus::HumanReview, None);
         assert_eq!(
-            pr_observation_effect(&unverified, PR_URL, true, "OPEN", Some(APPROVED)),
+            pr_observation_effect(&unverified, PR_URL, true, "OPEN", Some(APPROVED), true),
             PrObservationEffect::RecordsStateOnly
         );
         let verified = approved_correction(TaskStatus::HumanReview, published());
         assert_eq!(
-            pr_observation_effect(&verified, PR_URL, true, "OPEN", Some(APPROVED)),
+            pr_observation_effect(&verified, PR_URL, true, "OPEN", Some(APPROVED), true),
             PrObservationEffect::MovesToPrCreated
         );
         // A closure during a correction records the state only, even when the
         // record and head agree: G2 covers open pull requests only.
         assert_eq!(
-            pr_observation_effect(&verified, PR_URL, true, "CLOSED", Some(APPROVED)),
+            pr_observation_effect(&verified, PR_URL, true, "CLOSED", Some(APPROVED), true),
             PrObservationEffect::RecordsStateOnly
         );
     }
@@ -768,7 +774,7 @@ mod tests {
         for status in [TaskStatus::Queue, TaskStatus::InProgress, TaskStatus::AiReview] {
             let task = approved_correction(status.clone(), published());
             assert_eq!(
-                pr_observation_effect(&task, PR_URL, true, "OPEN", Some(APPROVED)),
+                pr_observation_effect(&task, PR_URL, true, "OPEN", Some(APPROVED), true),
                 PrObservationEffect::RecordsStateOnly,
                 "{status:?} is a correction whose run owns the status"
             );
@@ -781,13 +787,29 @@ mod tests {
         // keep the move they have always made, whatever the observation.
         let first_link = approved_correction(TaskStatus::HumanReview, None);
         assert_eq!(
-            pr_observation_effect(&first_link, PR_URL, false, "OPEN", None),
+            pr_observation_effect(&first_link, PR_URL, false, "OPEN", None, true),
             PrObservationEffect::MovesToPrCreated
         );
         let closed_in_pr_created = approved_correction(TaskStatus::PrCreated, None);
         assert_eq!(
-            pr_observation_effect(&closed_in_pr_created, PR_URL, true, "CLOSED", None),
+            pr_observation_effect(&closed_in_pr_created, PR_URL, true, "CLOSED", None, true),
             PrObservationEffect::MovesToPrCreated
+        );
+    }
+
+    #[test]
+    fn a_superseded_open_observation_during_a_correction_records_only_the_state() {
+        // The same OPEN answer at the approved head moves the correction only
+        // while it is the newest reading. A newer reading that replaced it
+        // (another head, or another state) decides instead, so this one holds.
+        let verified = approved_correction(TaskStatus::HumanReview, published());
+        assert_eq!(
+            pr_observation_effect(&verified, PR_URL, true, "OPEN", Some(APPROVED), true),
+            PrObservationEffect::MovesToPrCreated
+        );
+        assert_eq!(
+            pr_observation_effect(&verified, PR_URL, true, "OPEN", Some(APPROVED), false),
+            PrObservationEffect::RecordsStateOnly
         );
     }
 }

@@ -688,6 +688,18 @@ impl PrStatuses {
         self.entries.read().unwrap_or_else(|e| e.into_inner()).get(key).cloned()
     }
 
+    /// Whether the cache's latest successful reading of `key` is a different
+    /// observation from `recorded` with `head_oid`: another state, or another
+    /// full head under the same state. An observation that a newer reading
+    /// replaced must not act, even when its state still matches (two OPEN
+    /// readings with different heads are two observations). A failed attempt
+    /// leaves the last good reading in place and is not a newer reading.
+    pub fn latest_reading_differs(&self, key: &PrKey, recorded: &str, head_oid: Option<&str>) -> bool {
+        self.get(key).and_then(|e| e.status).is_some_and(|latest| {
+            latest.state.as_recorded() != Some(recorded) || latest.head_oid.as_deref() != head_oid
+        })
+    }
+
     /// The cached entries among `keys`, without asking anyone.
     pub fn entries_for<'a>(&self, keys: impl IntoIterator<Item = &'a PrKey>) -> Vec<PrStatusEntry> {
         let entries = self.entries.read().unwrap_or_else(|e| e.into_inner());
@@ -1348,6 +1360,37 @@ mod tests {
 
     fn status(state: PrState, checks: ChecksState) -> PrStatus {
         PrStatus { state, checks, failing_checks: vec![], failing_check_count: 0, review_decision: None, mergeable: None , merge_commit: None, head_oid: None}
+    }
+
+    #[test]
+    fn a_reading_is_superseded_by_a_newer_one_with_another_state_or_full_head() {
+        let cache = PrStatuses::with_program("unused", FETCH_TIMEOUT);
+        let key = PrKey::new("o/r", 1);
+        let at_b = "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2";
+        let at_h = "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3";
+        let open_at = |head: Option<&str>| PrStatus {
+            head_oid: head.map(str::to_string),
+            ..status(PrState::Open, ChecksState::Passing)
+        };
+
+        // Nothing cached: no newer reading exists.
+        assert!(!cache.latest_reading_differs(&key, "OPEN", Some(at_b)));
+
+        // The newest reading is OPEN at H: an older OPEN at H is the same
+        // observation, while an older OPEN at B (same state, other head) is not.
+        cache.remember(&key, open_at(Some(at_h)));
+        assert!(!cache.latest_reading_differs(&key, "OPEN", Some(at_h)));
+        assert!(cache.latest_reading_differs(&key, "OPEN", Some(at_b)));
+        // An absent head is a different observation from a full one.
+        assert!(cache.latest_reading_differs(&key, "OPEN", None));
+        // A different state is superseded whatever its head.
+        assert!(cache.latest_reading_differs(&key, "CLOSED", Some(at_h)));
+
+        // A failed attempt after the good reading keeps it as the latest reading.
+        let t = |s: i64| DateTime::from_timestamp(1_800_000_000 + s, 0).unwrap();
+        cache.record(&key, t(10), t(11), &Err(PrFetchError::new(PrFetchErrorKind::Failed, "down")));
+        assert!(!cache.latest_reading_differs(&key, "OPEN", Some(at_h)));
+        assert!(cache.latest_reading_differs(&key, "OPEN", Some(at_b)));
     }
 
     #[test]
