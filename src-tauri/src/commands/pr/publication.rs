@@ -25,13 +25,14 @@
 //! `Published`. A repeat answered from an existing record reads nothing and
 //! settles nothing.
 //!
-//! Residual limits. The pull request and the remote branch are read again after
-//! the record is written and before the push, but GitHub can still merge or
-//! close the pull request in the moments between those reads and the push, and
-//! the push then reaches the branch. A remote head that moves in that window to
-//! another ancestor of the commit is pushed over as a fast-forward, although it
-//! is not the head the person inspected; any other move is refused by the
-//! remote. A repeated request for a commit already recorded as published
+//! The push is a compare-and-swap on the remote head the person inspected: it
+//! updates the branch only while the branch still has that value, and only to a
+//! descendant of it. It uses `--force-with-lease` for the comparison, after
+//! proving the fast-forward locally; nothing is ever rewritten.
+//!
+//! Residual limits. The pull request is read again after the record is written
+//! and before the push, but GitHub can still merge or close it in the moments
+//! between that read and the push, and the push then reaches the branch. A repeated request for a commit already recorded as published
 //! from the same branch to the same pull request is answered from the record,
 //! without reading the remote again. A record of another branch or pull request
 //! never answers it: a pending one is settled for its own operation first, and
@@ -45,7 +46,7 @@ use uuid::Uuid;
 use crate::commands::gui_admission::GuiMutation;
 use crate::commands::pr::{
     delivered_against_remote, delivery_candidates, own_pr_url_for_branch, pr_url_for_task,
-    push_branch_pinned_gated, refuse_if_pr_operation_cancelled,
+    push_reviewed_commit_gated, refuse_if_pr_operation_cancelled,
     reserve_task_for_explicit_publication, resolve_repository_dir, run_cmd, task_branch_tip,
 };
 use crate::domain::publication::{
@@ -171,9 +172,10 @@ async fn inspect(state: &crate::AppState, task_id: Uuid) -> Result<PublicationIn
 ///
 /// Authorization. A person's confirmation covers the commit, branch and pull
 /// request it showed, and the remote head it compared the commit with
-/// (`remote_head`). The request checks the branch, the pull request and that
-/// remote head before it pushes, and pushes the commit by object ID, so it never pushes a different
-/// commit. The Task's status and its Human Review approval are not part of that
+/// (`remote_head`). The request checks the branch and the pull request before it
+/// pushes, pushes the commit by object ID, so it never pushes a different
+/// commit, and the push succeeds only while the remote branch is still at
+/// `remote_head`. The Task's status and its Human Review approval are not part of that
 /// consent: publishing does not approve the Task. A move that ends the request's
 /// owner is honored at the request's checkpoints: before the pending record is
 /// written, after GitHub is read again, and immediately before the push. After
@@ -625,9 +627,9 @@ async fn publish(
         refuse_if_pr_operation_cancelled(&lease, "pushing the branch")
             .inspect_err(|_| stopped_before_push.store(true, Ordering::SeqCst))
     };
-    let push = push_branch_pinned_gated(&working_dir, &branch, Some(commit), &gate)
-        .await
-        .map(|_| ());
+    // The push itself requires the remote branch to still be the inspected head,
+    // so a move after the re-read above is refused rather than pushed over.
+    let push = push_reviewed_commit_gated(&working_dir, &branch, commit, inspected_remote_head, &gate).await;
     if stopped_before_push.load(Ordering::SeqCst) {
         // The reason is about this request, not the Task: an owner can be ended
         // by a move that was then refused, or by a stop that timed out.
@@ -1775,6 +1777,98 @@ mod orchestration {
 
         assert!(matches!(&record.state, PublicationState::Refused { reason } if reason.contains("moved after you inspected")));
         assert_eq!(fx.remote_head().as_deref(), Some(c1.as_str()));
+    }
+
+    /// Advance the remote to `c1` after the request's last observation of it,
+    /// where only the push itself can notice, and check the refusal.
+    async fn assert_refused_as_stale(fx: &Fx, commit: &str, remote_expected: Option<&str>) {
+        let record = super::publish(&fx.state, fx.task_id, BRANCH, commit, PR, &fx.base).await.unwrap();
+
+        let PublicationState::Refused { reason } = &record.state else {
+            panic!("expected a refusal, got {:?}", record.state);
+        };
+        assert!(reason.contains("no longer at the revision you reviewed"), "{reason}");
+        assert!(reason.contains(&fx.base), "the reviewed revision is named: {reason}");
+        assert_eq!((record.commit.as_str(), record.remote_before.as_deref()), (commit, Some(fx.base.as_str())));
+        assert_eq!(fx.remote_head().as_deref(), remote_expected, "the remote branch must not be modified");
+        assert_eq!(fx.record().await, Some(record));
+    }
+
+    /// `c2` would still be a fast-forward of the new head `c1`, so only the
+    /// compare-and-swap refuses it.
+    #[tokio::test]
+    async fn a_remote_head_that_advances_after_the_last_observation_is_not_pushed_over() {
+        let fx = fixture().await;
+        let c1 = fx.commit("one");
+        let c2 = fx.commit("two");
+        test_seam::fix_observation(true, BRANCH, true);
+        let (checkout, moved) = (fx.checkout.clone(), format!("{c1}:refs/heads/{BRANCH}"));
+        crate::commands::pr::before_gate_hook::arm(&fx.checkout.to_string_lossy(), move || {
+            git(&checkout, &["push", "-q", "origin", &moved]);
+        });
+
+        assert_refused_as_stale(&fx, &c2, Some(&c1)).await;
+    }
+
+    /// The move lands after git has compared the advertised head with the lease:
+    /// the `pre-push` hook runs between that and the update, so the remote's own
+    /// compare-and-swap has to refuse.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_remote_head_that_advances_during_the_push_is_refused_by_the_remote() {
+        let fx = fixture().await;
+        let c1 = fx.commit("one");
+        let c2 = fx.commit("two");
+        test_seam::fix_observation(true, BRANCH, true);
+        // The remote holds the object, on another branch, for the hook to use.
+        git(&fx.checkout, &["push", "-q", "origin", &format!("{c1}:refs/heads/other")]);
+        let hooks = fx.checkout.join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        git(&fx.checkout, &["config", "core.hooksPath", hooks.to_str().unwrap()]);
+        crate::test_helpers::write_executable(
+            &hooks.join("pre-push"),
+            &format!(
+                "#!/bin/sh\ngit --git-dir='{}' update-ref refs/heads/{BRANCH} {c1}\n",
+                fx.remote.display()
+            ),
+        );
+
+        assert_refused_as_stale(&fx, &c2, Some(&c1)).await;
+    }
+
+    #[tokio::test]
+    async fn a_remote_branch_deleted_after_the_last_observation_is_not_recreated() {
+        let fx = fixture().await;
+        let c1 = fx.commit("one");
+        test_seam::fix_observation(true, BRANCH, true);
+        let remote = fx.remote.clone();
+        crate::commands::pr::before_gate_hook::arm(&fx.checkout.to_string_lossy(), move || {
+            git(&remote, &["update-ref", "-d", &format!("refs/heads/{BRANCH}")]);
+        });
+
+        assert_refused_as_stale(&fx, &c1, None).await;
+    }
+
+    /// A lease alone would let a diverged commit replace the reviewed head. A
+    /// replace ref that makes it look like a descendant must not change that.
+    #[tokio::test]
+    async fn a_replace_ref_cannot_turn_the_leased_push_into_a_rewrite() {
+        let fx = fixture().await;
+        let x = fx.commit("remote-only");
+        git(&fx.checkout, &["push", "-q", "origin", &format!("{x}:refs/heads/{BRANCH}")]);
+        git(&fx.checkout, &["reset", "-q", "--hard", &fx.base]);
+        let c1 = fx.commit("local");
+        git(&fx.checkout, &["replace", "--graft", &c1, &x]);
+        test_seam::fix_observation(true, BRANCH, true);
+
+        let record = super::publish(&fx.state, fx.task_id, BRANCH, &c1, PR, &x).await.unwrap();
+
+        assert!(
+            matches!(&record.state, PublicationState::Refused { reason } if reason.contains("fast-forward")),
+            "{:?}",
+            record.state
+        );
+        assert_eq!(fx.remote_head().as_deref(), Some(x.as_str()), "the remote commit must survive");
     }
 
     #[tokio::test]
