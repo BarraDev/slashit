@@ -72,6 +72,7 @@ fn every_activity_kind() -> Vec<Kind> {
         Kind::AiFixStarted { review: 2 },
         Kind::AiFixApplied { review: 2 },
         Kind::AiFixUnchanged { review: 3 },
+        Kind::CoderabbitReviewFailed { review: 3, reason: "failed".into() },
         Kind::AiFixFailed { review: 4, reason: "failed".into() },
         Kind::ReadyForReview { arrival: 1 },
         Kind::DeliveryFailed { reason: "refused".into() },
@@ -111,6 +112,7 @@ fn every_activity_kind() -> Vec<Kind> {
             | Kind::AiFixStarted { .. }
             | Kind::AiFixApplied { .. }
             | Kind::AiFixUnchanged { .. }
+            | Kind::CoderabbitReviewFailed { .. }
             | Kind::AiFixFailed { .. }
             | Kind::ReadyForReview { .. }
             | Kind::DeliveryFailed { .. }

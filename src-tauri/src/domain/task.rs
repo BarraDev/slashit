@@ -1190,6 +1190,7 @@ impl Task {
             ActivityKind::RunFailed { reason, .. }
             | ActivityKind::AiReviewFailed { reason, .. }
             | ActivityKind::AiReviewSkipped { reason, .. }
+            | ActivityKind::CoderabbitReviewFailed { reason, .. }
             | ActivityKind::AiFixFailed { reason, .. }
             | ActivityKind::DeliveryFailed { reason } => *reason = without_home_dir(reason),
             ActivityKind::RunResult { result, .. } => match result {
