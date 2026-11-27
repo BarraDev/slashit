@@ -15,6 +15,15 @@ use crate::output::escape_terminal;
 pub fn summary_text(review: &PrCommentReview) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "Task:  {} {}", review.task_id, escape_terminal(&review.task_title));
+    let check = &review.head_check;
+    let _ = write!(out, "Status: {}", check.state.as_str());
+    if let Some(oid) = &check.observed_head_oid {
+        let _ = write!(out, " (remote head {})", escape_terminal(oid));
+    }
+    if let Some(reason) = &check.reason {
+        let _ = write!(out, " ({})", escape_terminal(&one_line(reason)));
+    }
+    let _ = writeln!(out);
     let Some(plan) = &review.plan else {
         let _ = writeln!(out, "No PR Comment Review has been analyzed for this Task.");
         return out;
@@ -24,9 +33,10 @@ pub fn summary_text(review: &PrCommentReview) -> String {
     let _ = writeln!(out, "Findings: {}", plan.findings.len());
     for f in &plan.findings {
         let _ = writeln!(out);
+        let comment_id = f.comment_id.map_or_else(|| "none".to_string(), |id| id.to_string());
         let _ = writeln!(
             out,
-            "  {}  {}  {}",
+            "  {}  comment {comment_id}  {}  {}",
             escape_terminal(&f.finding_id),
             f.decision,
             state_label(f)
@@ -70,6 +80,10 @@ pub fn markdown(review: &PrCommentReview) -> String {
     if let Some(url) = &review.task_pr_url {
         let _ = writeln!(out, "- Task pull request: <{url}>");
     }
+    let _ = writeln!(out, "- Head check: {}", review.head_check.state.as_str());
+    if let Some(oid) = &review.head_check.observed_head_oid {
+        let _ = writeln!(out, "- Observed remote head: `{oid}`");
+    }
     let Some(plan) = &review.plan else {
         let _ = writeln!(out);
         let _ = writeln!(out, "No PR Comment Review has been analyzed for this Task.");
@@ -97,6 +111,9 @@ pub fn markdown(review: &PrCommentReview) -> String {
         let _ = writeln!(out, "- Decision: {}", f.decision);
         let _ = writeln!(out, "- Approved: {}", yes_no(f.approved));
         let _ = writeln!(out, "- Selected for fix: {}", yes_no(f.selected_for_fix));
+        if let Some(id) = f.comment_id.filter(|_| f.comment.is_some()) {
+            let _ = writeln!(out, "- Comment id: {id}");
+        }
         if let Some(c) = &f.comment {
             let mut author = format!("- Reviewer: {} ({}", one_line(&c.author), c.kind);
             if let Some(assoc) = &c.author_association {
@@ -235,6 +252,11 @@ mod tests {
             task_id: "6f96fefa-0000-0000-0000-000000000003".into(),
             task_title: "Fix login".into(),
             task_pr_url: Some("https://github.com/o/r/pull/7".into()),
+            head_check: PrCommentReviewHeadCheck {
+                state: PrCommentReviewHeadState::Stale,
+                observed_head_oid: Some("b".repeat(40)),
+                reason: None,
+            },
             plan: Some(PrCommentReviewPlan {
                 pr_url: "https://github.com/o/r/pull/7".into(),
                 repository: Some("o/r".into()),
@@ -301,9 +323,19 @@ mod tests {
             "Rename it to x.",
             &format!("- Fix commit: `{}`", "c".repeat(40)),
             "- Reply posted: no",
+            "- Head check: stale",
+            "- Comment id: 101",
         ] {
             assert!(md.contains(expected), "missing {expected:?} in:\n{md}");
         }
+    }
+
+    #[test]
+    fn the_summary_shows_the_head_check_and_both_finding_ids() {
+        let text = summary_text(&review());
+        let status = format!("Status: stale (remote head {})", "b".repeat(40));
+        assert!(text.contains(&status), "{text}");
+        assert!(text.contains("inline:101  comment 101  fix"), "{text}");
     }
 
     /// A reviewer's backticks and headings stay inside their block.

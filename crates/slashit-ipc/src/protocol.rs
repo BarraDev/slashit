@@ -62,8 +62,9 @@ pub enum IpcRequest {
     GetDeliveryState { task_id: String },
     /// Read one Task's PR Comment Review: its stored analysis, each finding
     /// with the Human's override, decision and approval, and what was fixed
-    /// and published. Answered from the Task record alone: never analyzes,
-    /// starts an agent, changes an approval or edits the plan.
+    /// and published. Answered from the Task record and one time-limited read
+    /// of the pull request's head on GitHub: never analyzes, starts an agent,
+    /// changes an approval, edits the plan or writes to GitHub.
     GetPrCommentReview { task_id: String },
     /// File a request for a person to decide in the desktop app. `operation` is
     /// `approve` or `open_pr`, `commit` the full object ID it is about, and

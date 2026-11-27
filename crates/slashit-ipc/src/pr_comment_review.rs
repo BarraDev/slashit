@@ -3,9 +3,10 @@
 //! holds it, shaped for reading and export.
 //!
 //! The instance builds it from the Task's stored review plan and reply
-//! records and nothing else, and the CLI renders it (JSON or Markdown) from
-//! these types. Nothing here can analyze, start an agent, change an approval
-//! or edit the plan.
+//! records, plus one read of the pull request's current head
+//! ([`PrCommentReviewHeadCheck`]), and the CLI renders it (JSON or Markdown)
+//! from these types. Nothing here can analyze, start an agent, change an
+//! approval or edit the plan.
 
 use serde::{Deserialize, Serialize};
 
@@ -17,10 +18,51 @@ pub struct PrCommentReview {
     /// The pull request the Task links, as SlashIt records it. `None` when
     /// the Task links none.
     pub task_pr_url: Option<String>,
+    /// Whether the stored analysis still matches the pull request's head, as
+    /// observed when this answer was built. Never stored.
+    pub head_check: PrCommentReviewHeadCheck,
     /// The stored analysis. `None` when the Task has never been analyzed. Its
     /// `pr_url` is the pull request it read, which can differ from
     /// `task_pr_url` if the Task was linked to another one since.
     pub plan: Option<PrCommentReviewPlan>,
+}
+
+/// The analyzed head compared with the pull request head on the remote.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrCommentReviewHeadCheck {
+    pub state: PrCommentReviewHeadState,
+    /// The head the remote reported. `None` unless the state is `current` or
+    /// `stale`.
+    pub observed_head_oid: Option<String>,
+    /// Why no comparison was made, for `unavailable` and `unknown`.
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrCommentReviewHeadState {
+    /// The remote head is the analyzed head.
+    Current,
+    /// The remote head is another commit.
+    Stale,
+    /// The head of the analyzed pull request could not be observed: the Task
+    /// links no pull request or another one, or the remote read failed.
+    Unavailable,
+    /// No analyzed head is stored: there is no plan, or it predates the
+    /// recording of the head. The remote is not read.
+    Unknown,
+}
+
+impl PrCommentReviewHeadState {
+    /// The name used on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Stale => "stale",
+            Self::Unavailable => "unavailable",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 /// The stored analysis, with every finding in it.

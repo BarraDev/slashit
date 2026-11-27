@@ -2,28 +2,77 @@
 //! Reading one Task's PR Comment Review for the control channel
 //! (`IpcRequest::GetPrCommentReview`).
 //!
-//! [`pr_comment_review`] is a pure function of a Task record: it takes the
-//! record by shared reference and has no access to the analyzer, the agent
+//! [`check_head`] reads the pull request's head from GitHub, and nothing else.
+//! [`pr_comment_review`] is a pure function of a Task record and that
+//! observation: it takes the record by shared reference and has no access to the analyzer, the agent
 //! runner, the approval writers or storage, so a read cannot analyze, start
 //! an agent, change an approval or edit the plan. It shows the same derived
 //! delivery state the review dialog does: the lifecycle backfill from the
 //! last Apply and the Task's PR-level reply records are applied to a copy of
 //! the stored plan, never to the plan itself.
 
+use std::time::Duration;
+
 use slashit_ipc::pr_comment_review::{
     PrCommentReview, PrCommentReviewApply, PrCommentReviewComment, PrCommentReviewExecution,
-    PrCommentReviewFinding, PrCommentReviewPlan, PrCommentReviewPublication,
+    PrCommentReviewFinding, PrCommentReviewHeadCheck, PrCommentReviewHeadState,
+    PrCommentReviewPlan, PrCommentReviewPublication,
 };
 
 use crate::domain::task::{PrCommentKind, PrReviewDecision, PrReviewPlan};
 use crate::domain::Task;
 
-/// One Task's PR Comment Review, as SlashIt holds it.
-pub(crate) fn pr_comment_review(task: &Task) -> PrCommentReview {
+/// Compare the head the stored plan was analyzed at with the head of the
+/// Task's pull request on GitHub now. GitHub is read only when there is a
+/// stored head and the plan is about the pull request the Task links.
+pub(crate) async fn check_head(task: &Task) -> PrCommentReviewHeadCheck {
+    use PrCommentReviewHeadState::{Current, Stale, Unavailable, Unknown};
+    let not_compared = |state, reason: &str| PrCommentReviewHeadCheck {
+        state,
+        observed_head_oid: None,
+        reason: Some(reason.to_string()),
+    };
+    let Some(plan) = &task.pr_review_plan else {
+        return not_compared(Unknown, "no review plan is stored");
+    };
+    let Some(analyzed) = &plan.analyzed_head_oid else {
+        return not_compared(Unknown, "the stored plan records no analyzed head");
+    };
+    let Some(pr_url) = task.authoritative_pr_url() else {
+        return not_compared(Unavailable, "the Task links no pull request");
+    };
+    if !super::same_pull_request(&plan.pr_url, pr_url) {
+        return not_compared(
+            Unavailable,
+            "the stored plan is for another pull request than the Task links",
+        );
+    }
+    let read = tokio::time::timeout(HEAD_READ_TIMEOUT, super::current_pr_head_oid(pr_url)).await;
+    match read {
+        Ok(Ok(head)) => PrCommentReviewHeadCheck {
+            state: if head == *analyzed { Current } else { Stale },
+            observed_head_oid: Some(head),
+            reason: None,
+        },
+        Ok(Err(error)) => not_compared(Unavailable, error.trim()),
+        Err(_) => not_compared(Unavailable, "reading the pull request head timed out"),
+    }
+}
+
+/// How long [`check_head`] waits for GitHub.
+const HEAD_READ_TIMEOUT: Duration = crate::pr_status::FETCH_TIMEOUT;
+
+/// One Task's PR Comment Review, as SlashIt holds it, with the head
+/// observation [`check_head`] made for it.
+pub(crate) fn pr_comment_review(
+    task: &Task,
+    head_check: PrCommentReviewHeadCheck,
+) -> PrCommentReview {
     PrCommentReview {
         task_id: task.id.to_string(),
         task_title: task.title.clone(),
         task_pr_url: task.authoritative_pr_url().map(str::to_string),
+        head_check,
         plan: task.pr_review_plan.as_ref().map(|stored| {
             let mut plan = stored.clone();
             plan.backfill_lifecycle_from_last_apply();
@@ -166,6 +215,15 @@ mod tests {
     use crate::domain::task::{FixEffect, PrReviewComment};
     use crate::test_helpers::create_test_pr_review_setup;
 
+    fn view_of(task: &Task) -> PrCommentReview {
+        let unread = PrCommentReviewHeadCheck {
+            state: PrCommentReviewHeadState::Unknown,
+            observed_head_oid: None,
+            reason: None,
+        };
+        pr_comment_review(task, unread)
+    }
+
     fn fixture() -> Task {
         let (mut task, mut plan) = create_test_pr_review_setup();
         plan.analyzed_head_oid = Some("a".repeat(40));
@@ -201,8 +259,8 @@ mod tests {
     #[test]
     fn finding_ids_are_stable_across_reads() {
         let task = fixture();
-        let first = pr_comment_review(&task);
-        let second = pr_comment_review(&task);
+        let first = view_of(&task);
+        let second = view_of(&task);
         assert_eq!(first, second);
         let ids: Vec<_> = first
             .plan
@@ -225,7 +283,7 @@ mod tests {
         let plan = task.pr_review_plan.as_mut().unwrap();
         let again = plan.items[0].clone();
         plan.items.push(again);
-        let view = pr_comment_review(&task);
+        let view = view_of(&task);
         let last = view.plan.unwrap().findings.pop().unwrap();
         assert_eq!(last.finding_id, "inline:101#2");
     }
@@ -233,7 +291,7 @@ mod tests {
     #[test]
     fn a_finding_shows_proposal_override_and_evidence() {
         let task = fixture();
-        let view = pr_comment_review(&task);
+        let view = view_of(&task);
         assert_eq!(view.task_pr_url.as_deref(), Some("https://github.com/test-org/test-repo/pull/42"));
         let plan = view.plan.unwrap();
         assert_eq!(plan.pr_number, Some(42));
@@ -259,6 +317,77 @@ mod tests {
     #[test]
     fn a_task_never_analyzed_has_no_plan() {
         let (task, _) = create_test_pr_review_setup();
-        assert!(pr_comment_review(&task).plan.is_none());
+        assert!(view_of(&task).plan.is_none());
+    }
+
+    #[cfg(unix)]
+    mod head_check {
+        use super::*;
+        use crate::test_helpers::FakeProgram;
+        use PrCommentReviewHeadState::{Current, Stale, Unavailable, Unknown};
+
+        async fn gh_answering(head: &str) -> FakeProgram {
+            FakeProgram::install("gh", &format!("printf '%s' '{{\"headRefOid\":\"{head}\"}}'"))
+                .await
+        }
+
+        #[tokio::test]
+        async fn the_analyzed_head_on_the_remote_is_current() {
+            let gh = gh_answering(&"a".repeat(40)).await;
+            let check = check_head(&fixture()).await;
+            assert_eq!(check.state, Current);
+            assert_eq!(check.observed_head_oid, Some("a".repeat(40)));
+            assert_eq!(gh.launches("gh"), 1);
+        }
+
+        #[tokio::test]
+        async fn another_head_on_the_remote_is_stale() {
+            let _gh = gh_answering(&"b".repeat(40)).await;
+            let task = fixture();
+            let before = serde_json::to_value(&task).unwrap();
+            let check = check_head(&task).await;
+            assert_eq!(check.state, Stale);
+            assert_eq!(check.observed_head_oid, Some("b".repeat(40)));
+            assert_eq!(serde_json::to_value(&task).unwrap(), before);
+        }
+
+        #[tokio::test]
+        async fn a_failed_remote_read_is_unavailable() {
+            let _gh = FakeProgram::install("gh", "echo 'no network' >&2; exit 1").await;
+            let check = check_head(&fixture()).await;
+            assert_eq!(check.state, Unavailable);
+            assert_eq!(check.observed_head_oid, None);
+            assert!(check.reason.unwrap().contains("no network"));
+        }
+
+        #[tokio::test]
+        async fn an_answer_without_a_head_is_unavailable() {
+            let _gh = FakeProgram::install("gh", "printf '{}'").await;
+            assert_eq!(check_head(&fixture()).await.state, Unavailable);
+        }
+
+        #[tokio::test]
+        async fn no_linked_or_another_pull_request_is_unavailable_without_a_read() {
+            let gh = gh_answering(&"a".repeat(40)).await;
+            let mut unlinked = fixture();
+            unlinked.pr_url = None;
+            unlinked.external_refs.clear();
+            assert_eq!(check_head(&unlinked).await.state, Unavailable);
+            let mut relinked = fixture();
+            relinked.pr_url = Some("https://github.com/test-org/test-repo/pull/43".into());
+            assert_eq!(check_head(&relinked).await.state, Unavailable);
+            assert_eq!(gh.launches("gh"), 0);
+        }
+
+        #[tokio::test]
+        async fn no_stored_plan_or_head_is_unknown_without_a_read() {
+            let gh = gh_answering(&"a".repeat(40)).await;
+            let mut task = fixture();
+            task.pr_review_plan.as_mut().unwrap().analyzed_head_oid = None;
+            assert_eq!(check_head(&task).await.state, Unknown);
+            task.pr_review_plan = None;
+            assert_eq!(check_head(&task).await.state, Unknown);
+            assert_eq!(gh.launches("gh"), 0);
+        }
     }
 }

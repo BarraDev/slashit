@@ -23,7 +23,7 @@ mod republish;
 pub use republish::{RepublishOutcome, RepublishStatus};
 
 mod inspection;
-pub(crate) use inspection::pr_comment_review;
+pub(crate) use inspection::{check_head, pr_comment_review};
 
 mod publication;
 pub use publication::*;
@@ -1938,20 +1938,17 @@ pub async fn address_pr_review(
 /// The head commit GitHub reports for `pr_url` now.
 async fn current_pr_head_oid(pr_url: &str) -> Result<String, String> {
     let (repo, number) = parse_pr_url(pr_url)?;
-    let json = run_cmd_no_cwd(
-        "gh",
-        &[
-            "pr",
-            "view",
-            &number,
-            "--repo",
-            &repo,
-            "--json",
-            "headRefOid",
-        ],
-    )
-    .await?;
-    pr_head_oid_from_json(&json)
+    // A read, so the child is killed if a caller stops waiting for it.
+    let output = crate::host_process::tokio_command("gh")
+        .args(["pr", "view", &number, "--repo", &repo, "--json", "headRefOid"])
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run gh: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("gh failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+    pr_head_oid_from_json(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Refuses a plan that was not analyzed at `current_head`. A plan saved
