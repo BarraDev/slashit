@@ -10,6 +10,7 @@ pub mod project_tabs;
 pub mod kanban;
 pub mod new_work_pause;
 pub mod task_card;
+pub mod board_prefs;
 pub mod pr_publication;
 pub mod pr_publication_state;
 pub mod unconfirmed_pr;
