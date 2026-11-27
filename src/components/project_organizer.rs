@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::components::toast;
 use crate::components::workspace_management::WorkspaceManagement;
 use crate::models::Project;
-use crate::services::{list_projects, remove_project, rename_project, set_project_pr_review_defaults};
+use crate::services::{get_project, list_projects, remove_project, rename_project, set_project_pr_review_defaults};
 
 #[component]
 pub fn ProjectOrganizer(
@@ -351,8 +351,19 @@ fn ProjectRow(
         })
     });
     let saving_defaults = RwSignal::new(false);
+    let auto_push_ref = NodeRef::<leptos::html::Input>::new();
+    // The click already flipped the checkbox; when the stored value did not
+    // change, the Memo does not re-run `prop:checked`, so set the DOM directly.
+    let show_auto_push = move |checked: bool| {
+        if let Some(input) = auto_push_ref.get_untracked() {
+            input.set_checked(checked);
+        }
+    };
     let save_defaults = move |next: crate::models::PrReviewDefaults| {
         if saving_defaults.get_untracked() {
+            if let Some(confirmed) = defaults.try_get_untracked() {
+                show_auto_push(confirmed.auto_push);
+            }
             return;
         }
         saving_defaults.set(true);
@@ -367,9 +378,36 @@ fn ProjectRow(
                     let _ = action_error.try_set(None);
                 }
                 Err(e) => {
-                    let _ = action_error.try_set(Some(format!(
-                        "Could not save the PR review defaults: {e}"
-                    )));
+                    // A failed save can still have taken effect (the change is in
+                    // place but not confirmed durable), so show what the backend holds.
+                    let stored = match get_project(id.to_string()).await {
+                        Ok(Some(project)) => Some(project.pr_review_defaults),
+                        _ => None,
+                    };
+                    let shown = match stored {
+                        Some(stored) => {
+                            let _ = projects.try_update(|list| {
+                                for project in list.iter_mut().filter(|p| p.id == id) {
+                                    project.pr_review_defaults = stored;
+                                }
+                            });
+                            Some(stored)
+                        }
+                        None => defaults.try_get_untracked(),
+                    };
+                    if let Some(shown) = shown {
+                        show_auto_push(shown.auto_push);
+                    }
+                    let message = if stored == Some(next) {
+                        format!(
+                            "The PR review default changed, but SlashIt could not confirm the \
+                             save is durable; it may be lost if the computer stops before the \
+                             next successful save. {e}"
+                        )
+                    } else {
+                        format!("Could not save the PR review defaults: {e}")
+                    };
+                    let _ = action_error.try_set(Some(message));
                 }
             }
             let _ = saving_defaults.try_set(false);
@@ -559,6 +597,7 @@ fn ProjectRow(
                     <input
                         type="checkbox"
                         data-testid="project-organizer-auto-push"
+                        node_ref=auto_push_ref
                         class="accent-yellow-500"
                         prop:checked=move || defaults.get().auto_push
                         disabled=move || saving_defaults.get() || removing.get()

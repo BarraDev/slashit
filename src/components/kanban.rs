@@ -510,24 +510,30 @@ pub fn Kanban(
             // made in the Project settings applies at once. A failed read
             // falls back to the safe default: off.
             let defaults = pr_review_defaults.get_untracked();
-            if !pr_review_dialog.open(task.clone(), defaults) {
-                return;
-            }
+            let needs_analysis = pr_review_dialog.open(task.clone(), defaults);
             let Some(opening) = pr_review_dialog.opening() else {
                 return;
             };
-            let project_id = project_id.clone();
-            spawn_local(async move {
-                if let Ok(Some(project)) = crate::services::get_project(project_id).await {
-                    // Only before the person has touched the toggle: it still
-                    // shows the value this opening started with.
-                    if pr_review_dialog.shows(opening)
-                        && pr_review_dialog.auto_push.get_untracked() == defaults.auto_push
-                    {
-                        pr_review_dialog.auto_push.set(project.pr_review_defaults.auto_push);
+            // Refresh the Project's defaults at every opening, including one
+            // that reuses a cached plan, so a changed default applies at once.
+            spawn_local({
+                let project_id = project_id.clone();
+                async move {
+                    let read = crate::services::get_project(project_id).await;
+                    let saved = match &read {
+                        Ok(Some(project)) => Some(project.pr_review_defaults),
+                        _ => None,
+                    };
+                    pr_review_dialog.adopt_saved_auto_push(opening, defaults, saved);
+                    if let Some(saved) = saved {
+                        let _ = pr_review_defaults.try_set(saved);
                     }
-                    let _ = pr_review_defaults.try_set(project.pr_review_defaults);
                 }
+            });
+            if !needs_analysis {
+                return;
+            }
+            spawn_local(async move {
                 match analyze_pr_comments(task.id.to_string()).await {
                     Ok(plan) => {
                         if pr_review_dialog.shows(opening) {
@@ -1128,6 +1134,23 @@ impl PrReviewDialog {
             return false;
         }
         self.error.set(Some(message));
+        true
+    }
+
+    /// Applies the Project's saved Auto-push default read for `opening`, which
+    /// started from the cached `started_with`. A failed read (`saved` is
+    /// `None`) falls back to the safe default: off. Only before the person has
+    /// touched the toggle: it still shows the value this opening started with.
+    fn adopt_saved_auto_push(
+        self,
+        opening: ReviewOpening,
+        started_with: crate::models::PrReviewDefaults,
+        saved: Option<crate::models::PrReviewDefaults>,
+    ) -> bool {
+        if !self.shows(opening) || self.auto_push.try_get_untracked() != Some(started_with.auto_push) {
+            return false;
+        }
+        self.auto_push.set(saved.is_some_and(|d| d.auto_push));
         true
     }
 
@@ -3687,6 +3710,32 @@ mod tests {
 
         assert!(dialog.open(column_task(2, "b"), Default::default()));
         assert!(!dialog.auto_push.get_untracked(), "a Project with the default off opens it off");
+    }
+
+    /// A failed Project read must not leave Auto-push on just because the
+    /// cached default was on; a successful read still applies the saved value,
+    /// and a toggle the person already changed is left alone.
+    #[test]
+    fn a_failed_project_read_turns_a_cached_auto_push_default_off() {
+        let owner = Owner::new();
+        let dialog = dialog(&owner);
+        let on = crate::models::PrReviewDefaults { auto_push: true };
+
+        assert!(dialog.open(column_task(1, "a"), on));
+        let opening = dialog.opening().expect("the dialog shows task a");
+        assert!(dialog.adopt_saved_auto_push(opening, on, None));
+        assert!(!dialog.auto_push.get_untracked(), "a failed read falls back to off");
+
+        assert!(dialog.open(column_task(2, "b"), on));
+        let opening = dialog.opening().expect("the dialog shows task b");
+        assert!(dialog.adopt_saved_auto_push(opening, on, Some(on)));
+        assert!(dialog.auto_push.get_untracked(), "a saved default of on still applies");
+
+        assert!(dialog.open(column_task(3, "c"), Default::default()));
+        let opening = dialog.opening().expect("the dialog shows task c");
+        dialog.auto_push.set(true);
+        assert!(!dialog.adopt_saved_auto_push(opening, Default::default(), None));
+        assert!(dialog.auto_push.get_untracked(), "the person's own choice is kept");
     }
 
     /// A reply selected for Task A must not stay selected, and keep Post enabled,
