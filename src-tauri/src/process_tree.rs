@@ -356,3 +356,310 @@ mod windows {
         .await;
     }
 }
+
+/// Runtime checks of [`TreeOwner`] on Windows. They run in the Windows test job
+/// (`.github/workflows/ci.yml`, `updater-transport`), which builds this crate's
+/// library test executable and runs the `process_tree` tests from it.
+///
+/// The fixture is that same executable, started with only `fixture_entry`
+/// selected and a mode in the environment. No shell or `PATH` program is
+/// involved, so every process tree here is deterministic.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::TreeOwner;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+    };
+
+    /// Which behaviour the fixture process takes.
+    const MODE: &str = "SLASHIT_TREE_FIXTURE_MODE";
+    /// The directory the fixture records pids in.
+    const RECORD: &str = "SLASHIT_TREE_FIXTURE_RECORD";
+    const ENTRY: &str = "process_tree::windows_tests::fixture_entry";
+
+    /// The fixture. Does nothing unless a test started this executable with
+    /// [`MODE`] set, so the ordinary test run passes it at once.
+    #[test]
+    fn fixture_entry() {
+        let Ok(mode) = std::env::var(MODE) else {
+            return;
+        };
+        let record = PathBuf::from(std::env::var_os(RECORD).expect("a record directory"));
+        match mode.as_str() {
+            // Starts a descendant that inherits this process's stdout and
+            // stderr, then leaves at once with the descendant still running.
+            "exit_leaving_descendant" => {
+                record_pid(&record, "leader", std::process::id());
+                start_descendant(&record);
+            }
+            "sleep_with_descendant" => {
+                record_pid(&record, "leader", std::process::id());
+                start_descendant(&record);
+                sleep_forever();
+            }
+            "sleep_forever" => sleep_forever(),
+            other => panic!("unknown fixture mode {other}"),
+        }
+    }
+
+    fn sleep_forever() -> ! {
+        loop {
+            std::thread::sleep(Duration::from_secs(600));
+        }
+    }
+
+    /// Starts a descendant that inherits this process's handles, and records
+    /// its pid. Written beside the target and renamed, so a reader never sees
+    /// a partial number.
+    ///
+    /// The descendant is left running on purpose: whether the tree ends it is
+    /// what the test checks. Its handle is forgotten, not waited on, because
+    /// waiting would never return.
+    fn start_descendant(record: &Path) {
+        let child = fixture_command("sleep_forever", record)
+            .spawn()
+            .expect("start the descendant");
+        record_pid(record, "descendant", child.id());
+        std::mem::forget(child);
+    }
+
+    fn record_pid(record: &Path, name: &str, pid: u32) {
+        let temp = record.join(format!("{name}.tmp"));
+        std::fs::write(&temp, pid.to_string()).expect("write a pid");
+        std::fs::rename(temp, record.join(name)).expect("publish a pid");
+    }
+
+    /// The fixture as a standard command. Its stdio is inherited, so whatever
+    /// starts it decides where its output goes.
+    fn fixture_command(mode: &str, record: &Path) -> std::process::Command {
+        let mut command = std::process::Command::new(std::env::current_exe().expect("test exe"));
+        command
+            .args(["--exact", ENTRY, "--nocapture", "--test-threads=1"])
+            .env(MODE, mode)
+            .env(RECORD, record);
+        command
+    }
+
+    struct Fixture {
+        dir: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Fixture {
+                dir: tempfile::tempdir().expect("tempdir"),
+            }
+        }
+
+        /// The fixture as an owned run's command: piped output, no stdin.
+        fn command(&self, mode: &str) -> tokio::process::Command {
+            let mut command = tokio::process::Command::from(fixture_command(mode, self.dir.path()));
+            command
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            command
+        }
+
+        /// The pid the fixture recorded as `name`, once it has started.
+        async fn recorded(&self, name: &str) -> u32 {
+            for _ in 0..400 {
+                let text = std::fs::read_to_string(self.dir.path().join(name)).unwrap_or_default();
+                if let Ok(pid) = text.trim().parse() {
+                    return pid;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("the fixture never recorded {name}");
+        }
+    }
+
+    /// Runs the fixture the way `queue::coderabbit::run_review` does: its
+    /// output is drained while the leader's exit is awaited, and the tree is
+    /// ended once the leader has exited. `stop` ends the run early through
+    /// the same path a timeout or cancellation takes.
+    /// Whether the run completed before `stop` ended it.
+    async fn run_until(
+        mut command: tokio::process::Command,
+        stop: impl std::future::Future<Output = ()>,
+    ) -> bool {
+        let (mut child, owner) = TreeOwner::spawn(&mut command).expect("spawn an owned tree");
+        let mut out = child.stdout.take().expect("stdout");
+        let mut err = child.stderr.take().expect("stderr");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let completed = {
+            let drain =
+                async { tokio::join!(out.read_to_end(&mut stdout), err.read_to_end(&mut stderr)) };
+            let end_group = async {
+                owner.wait_for_leader_exit().await;
+                owner.signal();
+            };
+            tokio::select! {
+                biased;
+                _ = stop => false,
+                _ = async { tokio::join!(drain, end_group) } => true,
+            }
+        };
+
+        if !completed {
+            owner.stop(&mut child).await;
+            return false;
+        }
+        child.wait().await.expect("the leader's exit status");
+        owner.reaped();
+        true
+    }
+
+    /// Gone, or a process that has exited and not yet been reclaimed by its
+    /// last handle.
+    fn is_running(pid: u32) -> bool {
+        // Safety: a handle this function opens and closes on every path. Its
+        // only use is to wait on the process with a zero timeout.
+        unsafe {
+            let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+            if handle.is_null() {
+                return false;
+            }
+            let running = WaitForSingleObject(handle, 0) == WAIT_TIMEOUT;
+            CloseHandle(handle);
+            running
+        }
+    }
+
+    async fn wait_until_stopped(pids: &[u32]) -> bool {
+        for _ in 0..400 {
+            if pids.iter().all(|pid| !is_running(*pid)) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    /// A process the run never started. It must survive every cleanup below.
+    struct Unrelated(std::process::Child);
+
+    impl Unrelated {
+        fn start(fixture: &Fixture) -> Self {
+            let mut command = fixture_command("sleep_forever", fixture.dir.path());
+            command
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            Unrelated(command.spawn().expect("start an unrelated process"))
+        }
+
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+    }
+
+    impl Drop for Unrelated {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_leader_that_exits_first_completes_and_ends_its_descendant() {
+        let fixture = Fixture::new();
+        let unrelated = Unrelated::start(&fixture);
+        let completed = tokio::time::timeout(
+            Duration::from_secs(60),
+            run_until(
+                fixture.command("exit_leaving_descendant"),
+                std::future::pending(),
+            ),
+        )
+        .await
+        .expect("a descendant kept the inherited pipes open");
+
+        assert!(completed);
+        let (leader, descendant) = (
+            fixture.recorded("leader").await,
+            fixture.recorded("descendant").await,
+        );
+        assert!(wait_until_stopped(&[leader, descendant]).await);
+        assert!(
+            is_running(unrelated.pid()),
+            "an unrelated process was ended"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_run_ends_the_whole_tree() {
+        let fixture = Fixture::new();
+        let unrelated = Unrelated::start(&fixture);
+        let completed = run_until(
+            fixture.command("sleep_with_descendant"),
+            tokio::time::sleep(Duration::from_secs(2)),
+        )
+        .await;
+
+        assert!(!completed);
+        let (leader, descendant) = (
+            fixture.recorded("leader").await,
+            fixture.recorded("descendant").await,
+        );
+        assert!(wait_until_stopped(&[leader, descendant]).await);
+        assert!(
+            is_running(unrelated.pid()),
+            "an unrelated process was ended"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_ends_the_whole_tree() {
+        let fixture = Fixture::new();
+        let unrelated = Unrelated::start(&fixture);
+        let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+        let (completed, (leader, descendant)) = tokio::join!(
+            run_until(fixture.command("sleep_with_descendant"), async {
+                let _ = cancelled.await;
+            }),
+            async {
+                let ids = (
+                    fixture.recorded("leader").await,
+                    fixture.recorded("descendant").await,
+                );
+                cancel.send(()).expect("the run is still waiting");
+                ids
+            }
+        );
+
+        assert!(!completed);
+        assert!(wait_until_stopped(&[leader, descendant]).await);
+        assert!(
+            is_running(unrelated.pid()),
+            "an unrelated process was ended"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_owner_ends_the_whole_tree() {
+        let fixture = Fixture::new();
+        let unrelated = Unrelated::start(&fixture);
+        let mut command = fixture.command("sleep_with_descendant");
+        let (mut child, owner) = TreeOwner::spawn(&mut command).expect("spawn an owned tree");
+        let (leader, descendant) = (
+            fixture.recorded("leader").await,
+            fixture.recorded("descendant").await,
+        );
+
+        drop(owner);
+        assert!(wait_until_stopped(&[leader, descendant]).await);
+        assert!(
+            is_running(unrelated.pid()),
+            "an unrelated process was ended"
+        );
+        // The leader was never reaped by the owner; reap it now.
+        let _ = child.kill().await;
+    }
+}

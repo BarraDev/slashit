@@ -470,6 +470,11 @@ jobs:
   # run, so the platform's certificate verifier is not consulted. Only the
   # `update_feed` tests run here, not the whole library, on the two non-Linux
   # release platforms. The Linux test job runs the rest of the backend.
+  #
+  # On Windows the same built library test executable also runs the
+  # `process_tree` tests: real Job Object runtime checks of the CodeRabbit run's
+  # process ownership (normal completion, timeout, cancellation, owner drop,
+  # inherited pipes, unrelated processes). Those tests are cfg'd out elsewhere.
   updater-transport:
     name: Updater transport tests (${{ matrix.platform }})
     runs-on: ${{ matrix.platform }}
@@ -548,6 +553,23 @@ jobs:
           $output | ForEach-Object { $_ }
           if ($LASTEXITCODE -ne 0) { throw "the update_feed tests exited with $LASTEXITCODE" }
           if (-not ($output -match 'test result: ok\. [1-9][0-9]* passed')) { throw "no update_feed test passed" }
+
+      # The fixture is this same executable, started with one test selected,
+      # so no shell or PATH program is involved. A leader that exits first
+      # completes with its descendant ended; a timeout, a cancellation and an
+      # owner drop each end the whole tree; an unrelated process survives all of
+      # them. A failure here names the test that failed in the log.
+      - name: Run process tree tests (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: src-tauri
+        env:
+          TEST_EXE: ${{ steps.build.outputs.exe }}
+        run: |
+          $output = & $env:TEST_EXE process_tree 2>&1
+          $output | ForEach-Object { $_ }
+          if ($LASTEXITCODE -ne 0) { throw "the process_tree tests exited with $LASTEXITCODE" }
+          if (-not ($output -match 'test result: ok\. [1-9][0-9]* passed')) { throw "no process_tree test passed" }
 
   # Durable replacement has a different implementation on each platform
   # (fsync, F_FULLFSYNC, a directory flush on Windows), so the crate that
