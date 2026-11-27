@@ -1225,7 +1225,7 @@ type ExecutionRecords = Arc<RwLock<HashMap<Uuid, AgentExecution>>>;
 /// then runs the same cleanup any other outcome runs, which is what makes
 /// "the stop returned" mean "the agent is gone".
 struct RunningTask {
-    handle: JoinHandle<()>,
+    handle: OwnerJoin,
     cancel: tokio::sync::watch::Sender<bool>,
     /// The execution record this run keeps in `executions`, which is where
     /// its [`AgentStatus`] lives. Known before the future first runs, so the
@@ -1278,8 +1278,127 @@ impl Drop for ProjectRunLease {
 /// process could be dropped-but-not-killed under if a cancellation won
 /// between a child spawning and this struct's own bookkeeping catching up.
 struct ReviewOwner {
-    handle: JoinHandle<()>,
+    handle: OwnerJoin,
     cancel: tokio::sync::watch::Sender<bool>,
+}
+
+/// The join handle of a live execution or review owner, shared between its
+/// map entry and the stop that joins it.
+///
+/// A stop removes nothing before the owner has finished. It takes the handle
+/// out of `Pending` into `Joining` for its bounded wait, and [`JoinWait`]
+/// puts it back on any exit that did not observe completion. That is what
+/// makes a stop cancelled mid-wait safe: a bare `JoinHandle` held by that
+/// future would be dropped with it, leaving the owner running with no map
+/// entry, so the Task would read as released. `Joined` means the owner has
+/// finished and only the entry's removal is left, which any later stop
+/// completes.
+#[derive(Clone)]
+struct OwnerJoin(Arc<std::sync::Mutex<JoinState>>);
+
+enum JoinState {
+    Pending(JoinHandle<()>),
+    Joining,
+    Joined,
+}
+
+/// What a stop may do with an owner's join, decided under its own lock.
+enum JoinAccess {
+    Wait(JoinWait),
+    /// Already joined by an earlier stop that was cancelled before it removed
+    /// the entry: nothing is running, so only the removal remains.
+    Finished,
+    /// Another join holds the handle. Stops are serialized by the Task
+    /// lifecycle lease, so this is refused rather than waited for.
+    Busy,
+}
+
+impl OwnerJoin {
+    fn new(handle: JoinHandle<()>) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(JoinState::Pending(handle))))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, JoinState> {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Whether the owner has finished. A handle held by a join in progress
+    /// is still running, so it is not finished.
+    fn is_finished(&self) -> bool {
+        match &*self.lock() {
+            JoinState::Pending(handle) => handle.is_finished(),
+            JoinState::Joining => false,
+            JoinState::Joined => true,
+        }
+    }
+
+    /// Whether `other` names this same owner (the same map value), so a stop
+    /// removes only the entry it joined, never a later owner's.
+    fn is_same_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    fn begin_join(&self) -> JoinAccess {
+        let mut state = self.lock();
+        match std::mem::replace(&mut *state, JoinState::Joining) {
+            JoinState::Pending(handle) => JoinAccess::Wait(JoinWait {
+                slot: self.clone(),
+                handle: Some(handle),
+            }),
+            JoinState::Joined => {
+                *state = JoinState::Joined;
+                JoinAccess::Finished
+            }
+            JoinState::Joining => {
+                *state = JoinState::Joining;
+                JoinAccess::Busy
+            }
+        }
+    }
+
+    /// Test support: the handle itself, for a test that joins it directly.
+    #[cfg(test)]
+    fn take_handle(&self) -> Option<JoinHandle<()>> {
+        match std::mem::replace(&mut *self.lock(), JoinState::Joined) {
+            JoinState::Pending(handle) => Some(handle),
+            other => {
+                *self.lock() = other;
+                None
+            }
+        }
+    }
+}
+
+/// A stop's bounded wait for an owner, holding its join handle. Dropping it
+/// before the owner is seen to finish -- a cancelled stop, or one that timed
+/// out -- restores the handle to the owner's slot synchronously, so the owner
+/// stays registered and joinable by a later stop.
+struct JoinWait {
+    slot: OwnerJoin,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl JoinWait {
+    /// Whether the owner finished within `bound`. A panicked owner counts as
+    /// finished: its join error is not a reason to keep the entry.
+    async fn finished_within(&mut self, bound: std::time::Duration) -> bool {
+        let handle = self.handle.as_mut().expect("the handle is held until the wait ends");
+        if tokio::time::timeout(bound, handle).await.is_ok() {
+            self.handle = None;
+            *self.slot.lock() = JoinState::Joined;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Drop for JoinWait {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            *self.slot.lock() = JoinState::Pending(handle);
+        }
+    }
 }
 
 /// A live PR-helper Claude invocation (`commands::pr::run_claude_pr_helper`)
@@ -2865,7 +2984,7 @@ impl TaskExecutor {
         self.running_handles.write().await.insert(
             task_id,
             RunningTask {
-                handle: tokio::spawn(std::future::pending::<()>()),
+                handle: OwnerJoin::new(tokio::spawn(std::future::pending::<()>())),
                 cancel,
                 execution_id: None,
             },
@@ -3639,16 +3758,10 @@ impl TaskExecutor {
         };
         let answers = self.pr_statuses.refresh_each(keys).await;
 
-        for ((key, answer), task_ids) in answers.into_iter().zip(task_ids) {
-            let Ok(status) = answer else { continue };
+        for ((_key, answer), task_ids) in answers.into_iter().zip(task_ids) {
+            let Ok(observation) = answer else { continue };
             for task_id in task_ids {
-                if let Err(message) = self.apply_polled_pr_state(
-                    task_id,
-                    &key,
-                    status.state,
-                    status.head_oid.as_deref(),
-                    status.merge_commit.as_deref(),
-                ).await {
+                if let Err(message) = self.apply_polled_pr_state(task_id, &observation).await {
                     self.events.agent_event(AgentEvent::Log {
                         task_id: task_id.to_string(),
                         level: LogLevel::Warn,
@@ -3698,33 +3811,27 @@ impl TaskExecutor {
     pub(crate) async fn apply_polled_pr_state(
         &self,
         task_id: Uuid,
-        key: &crate::pr_status::PrKey,
-        state: crate::pr_status::PrState,
-        head_oid: Option<&str>,
-        merge_commit: Option<&str>,
+        observation: &crate::pr_status::PrObservation,
     ) -> Result<(), String> {
         use crate::pr_status::PrState;
 
-        let Some(recorded) = state.as_recorded() else {
+        let key = &observation.key;
+        let Some(recorded) = observation.state.as_recorded() else {
             return Ok(());
         };
         if self.task_project_removed(task_id).await {
             return Ok(());
         }
-        // Answers are applied once a whole batch has settled, so a newer
-        // reading may have landed in the meantime, say an open after a
-        // reopen, or an open at another head. Only what the cache still says
-        // is acted on: the observation's state and full head, not its state
-        // alone. The same check is repeated under the lease in
-        // `record_pr_poll_state`, the authoritative boundary.
-        if self.pr_statuses.latest_reading_differs(key, recorded, head_oid) {
-            return Ok(());
-        }
+        // Freshness is not checked here. Every path that acts on the
+        // observation admits it under the Task lifecycle lease, before any
+        // owner is ended or any Task write: `record_pr_poll_state`,
+        // `complete_merged_task` and `record_missing_merge_commit`.
+        //
         // A recorded merge needs only its evidence repaired, even when
         // cleanup prevents a lifecycle transition. A declined repair must be
         // reported to an explicit refresh.
-        if state == PrState::Merged && self.merge_on_record(task_id, key).await {
-            return self.record_missing_merge_commit(task_id, key, merge_commit).await;
+        if observation.state == PrState::Merged && self.merge_on_record(task_id, key).await {
+            return self.record_missing_merge_commit(task_id, observation).await;
         }
         let lifecycle = {
             let tasks = self.tasks.read().await;
@@ -3737,13 +3844,13 @@ impl TaskExecutor {
                 None => return Ok(()),
             }
         };
-        match state {
+        match observation.state {
             PrState::Merged if lifecycle => {
-                self.complete_merged_task(task_id, key, recorded, merge_commit)
+                self.complete_merged_task(task_id, observation, recorded)
                     .await
             }
             PrState::Merged => {}
-            _ => self.record_pr_poll_state(task_id, key, recorded, head_oid).await,
+            _ => self.record_pr_poll_state(task_id, observation).await,
         }
         Ok(())
     }
@@ -3770,9 +3877,10 @@ impl TaskExecutor {
     async fn record_missing_merge_commit(
         &self,
         task_id: Uuid,
-        key: &crate::pr_status::PrKey,
-        commit: Option<&str>,
+        observation: &crate::pr_status::PrObservation,
     ) -> Result<(), String> {
+        let key = &observation.key;
+        let commit = observation.merge_commit.as_deref();
         {
             let tasks = self.tasks.read().await;
             let task = tasks.get(&task_id).ok_or("Task not found")?;
@@ -3805,6 +3913,11 @@ impl TaskExecutor {
         // Checked under the lease: removal holds it while it writes `removed_at`.
         if self.task_project_removed(task_id).await {
             return Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string());
+        }
+        // Admission under the lease: a superseded reading writes nothing, and
+        // the newer one is observed on its own.
+        if !self.pr_statuses.admit(observation).await {
+            return Ok(());
         }
         let key_owned = key.clone();
         let commit_owned = commit.to_string();
@@ -3858,10 +3971,12 @@ impl TaskExecutor {
     async fn record_pr_poll_state(
         &self,
         task_id: Uuid,
-        key: &crate::pr_status::PrKey,
-        state: &str,
-        head_oid: Option<&str>,
+        observation: &crate::pr_status::PrObservation,
     ) {
+        let key = &observation.key;
+        let Some(state) = observation.state.as_recorded() else {
+            return;
+        };
         // Declined while another transition holds the task: the next poll
         // observes the same state again, so nothing is lost.
         let Some(_lease) = self.lifecycle.try_acquire(task_id).await else {
@@ -3871,22 +3986,23 @@ impl TaskExecutor {
         if self.task_project_removed(task_id).await {
             return;
         }
-        // The authoritative freshness check, under the lease and before any
-        // owner is ended. A reading a newer one replaced (an older OPEN at
-        // another head, say) authorizes nothing and records nothing; the
-        // newer reading is observed on its own pass. Read once here, so the
-        // G2 decision below and the write it guards judge the same reading.
-        if self.pr_statuses.latest_reading_differs(key, state, head_oid) {
+        // The admission boundary, under the lease and before any owner is
+        // ended or any Task is written. A reading a newer publication replaced
+        // (same state and head or not) authorizes nothing and records nothing;
+        // the newer reading is observed on its own pass. Once admitted, the
+        // decision below is not revoked by a later publication.
+        if !self.pr_statuses.admit(observation).await {
             return;
         }
         // G2, decided on the Task before any owner is ended. Only a published
         // Human Review correction can move here: an open pull request at the
         // approved commit, with its publication recorded. Anything else
         // records the state alone.
+        let head = observation.head_oid.as_deref();
         let verified = {
             let tasks = self.tasks.read().await;
             tasks.get(&task_id).is_some_and(|t| {
-                t.status == TaskStatus::HumanReview && delivery_verified(t, key, state, head_oid)
+                t.status == TaskStatus::HumanReview && delivery_verified(t, key, state, head)
             })
         };
         if verified {
@@ -3904,16 +4020,8 @@ impl TaskExecutor {
         }
         let state_owned = state.to_string();
         let key_owned = key.clone();
-        let head_owned = head_oid.map(str::to_string);
-        let statuses = &self.pr_statuses;
+        let head_owned = observation.head_oid.clone();
         let revise = move |staged: &mut HashMap<Uuid, Task>| {
-            // The commit boundary: the freshness check is repeated here, inside
-            // the board's write guard, because the owner end above is an await
-            // a newer reading may land during. A superseded observation writes
-            // nothing, so it neither moves the Task nor records its state.
-            if statuses.latest_reading_differs(&key_owned, &state_owned, head_owned.as_deref()) {
-                return false;
-            }
             let Some(t) = staged.get_mut(&task_id) else {
                 return false;
             };
@@ -3924,7 +4032,7 @@ impl TaskExecutor {
             if changed && state_owned == "CLOSED" && in_pr_lifecycle(t) && !correction {
                 t.error_message = Some("PR was closed without merge".to_string());
             }
-            if verified && t.status == TaskStatus::HumanReview && delivery_verified(t, &key_owned, &state_owned, head_oid) {
+            if verified && t.status == TaskStatus::HumanReview && delivery_verified(t, &key_owned, &state_owned, head_owned.as_deref()) {
                 t.status = TaskStatus::PrCreated;
                 changed = true;
             }
@@ -4024,15 +4132,21 @@ impl TaskExecutor {
     async fn complete_merged_task(
         &self,
         task_id: Uuid,
-        key: &crate::pr_status::PrKey,
+        observation: &crate::pr_status::PrObservation,
         state: &str,
-        merge_commit: Option<&str>,
     ) {
+        let key = &observation.key;
+        let merge_commit = observation.merge_commit.as_deref();
         // Declined, not failed. Nothing was asked and nothing is owed, so the
         // next pass finds the task exactly as eligible as this one did.
         let Some(_lease) = self.lifecycle.try_acquire(task_id).await else {
             return;
         };
+        // Admission under the lease, before anything is ended or written: a
+        // merge read from a reading a newer one replaced completes nothing.
+        if !self.pr_statuses.admit(observation).await {
+            return;
+        }
         // The poll chose to finish this task from its column before the lease
         // was held; a move out of the delivery columns since then is the
         // user taking it back, and wins. The next poll decides again.
@@ -6745,7 +6859,7 @@ impl TaskExecutor {
         handles.insert(
             task_id,
             RunningTask {
-                handle,
+                handle: OwnerJoin::new(handle),
                 cancel,
                 execution_id: Some(execution_id),
             },
@@ -6955,52 +7069,64 @@ impl TaskExecutor {
         &self,
         task_id: Uuid,
     ) -> Result<Option<TaskStatus>, String> {
-        // Taken out of the map before awaiting anything, so the guard is
-        // released before the future below tries to remove itself.
+        // The entry is read, not removed, until the owner has been joined. It
+        // stays registered for the whole wait, so the owner is never absent
+        // from the map while it may still be running -- whatever happens to
+        // this future (a timeout, a cancellation, a dropped caller). Its join
+        // handle is handed to a `JoinWait` that restores it on any exit that
+        // did not observe the owner finish; see `OwnerJoin`.
         //
-        // The mark goes up while the map's write guard is still held, so a
-        // reader never sees the run absent from the map without also seeing
-        // that it is being ended.
+        // The mark goes up while the map's read guard is still held, so a
+        // reader never sees the run being ended without also seeing that it
+        // is being ended.
         let mut mark = None;
         let running = {
-            let mut handles = self.running_handles.write().await;
-            let owner = handles.remove(&task_id);
-            if owner.is_some() {
-                mark = Some(
-                    self.mark_ending(task_id, owner.as_ref().and_then(|run| run.execution_id)),
-                );
+            let handles = self.running_handles.read().await;
+            let owner = handles
+                .get(&task_id)
+                .map(|run| (run.handle.clone(), run.cancel.clone(), run.execution_id));
+            if let Some((_, _, execution_id)) = &owner {
+                mark = Some(self.mark_ending(task_id, *execution_id));
             }
             owner
         };
 
-        if let Some(mut owner) = running {
-            self.announce_stopping(task_id, owner.execution_id).await;
-            let _ = owner.cancel.send(true);
-            // A run that finished on its own between the removal and here has
+        if let Some((join, cancel, execution_id)) = running {
+            self.announce_stopping(task_id, execution_id).await;
+            let _ = cancel.send(true);
+            // A run that finished on its own between the read and here has
             // already recorded its own outcome; joining it is still correct,
             // it simply returns at once. A panicked run returns an error,
             // which the caller's own settling is what covers.
-            //
-            // `&mut owner.handle` rather than `owner.handle`: a `timeout` that
-            // elapses drops the future it was given, and a `JoinHandle`
-            // dropped without being polled to completion does not abort the
-            // task it names -- it only forgets about it. Borrowing keeps
-            // `owner` intact so it can be put back exactly as if this call
-            // had never reached in.
-            match tokio::time::timeout(AGENT_SHUTDOWN_TIMEOUT, &mut owner.handle).await {
-                Ok(_) => self.announce_stopped(task_id),
-                Err(_) => {
-                    // Still live, so still owning the checkout: put it back
-                    // exactly where it was found rather than leave the map
-                    // disagreeing with reality, and refuse instead of telling
-                    // a caller ownership ended when the agent has not
-                    // actually stopped.
-                    self.running_handles.write().await.insert(task_id, owner);
+            match join.begin_join() {
+                JoinAccess::Wait(mut wait) => {
+                    if !wait.finished_within(AGENT_SHUTDOWN_TIMEOUT).await {
+                        // Still live, so still owning the checkout: the entry
+                        // is untouched and the handle is back in its slot.
+                        // Refuse instead of telling a caller ownership ended
+                        // when the agent has not actually stopped.
+                        return Err(format!(
+                            "the agent for task {task_id} is still finishing up; nothing was \
+                             changed, so this can simply be asked for again shortly"
+                        ));
+                    }
+                }
+                JoinAccess::Finished => {}
+                JoinAccess::Busy => {
                     return Err(format!(
                         "the agent for task {task_id} is still finishing up; nothing was \
                          changed, so this can simply be asked for again shortly"
                     ));
                 }
+            }
+            self.announce_stopped(task_id);
+            // Joined, so the entry is spent. Removed only if it is still this
+            // owner's: the run may already have removed its own. A removal
+            // cancelled here leaves a `Joined` entry that the next stop
+            // finishes and that the poll tick's retain prunes.
+            let mut handles = self.running_handles.write().await;
+            if handles.get(&task_id).is_some_and(|run| run.handle.is_same_owner(&join)) {
+                handles.remove(&task_id);
             }
             return Ok(Some(TaskStatus::InProgress));
         }
@@ -7015,27 +7141,43 @@ impl TaskExecutor {
         // races a review that is still mid-flight -- it either sees the
         // review's own completed result already durable (nothing left to
         // end) or ends it before it can publish anything further.
+        // Same shape as the execution branch above, including the entry that
+        // stays registered until its owner is joined.
         let reviewing = {
-            let mut handles = self.reviewing_handles.write().await;
-            let owner = handles.remove(&task_id);
+            let handles = self.reviewing_handles.read().await;
+            let owner = handles
+                .get(&task_id)
+                .map(|review| (review.handle.clone(), review.cancel.clone()));
             if owner.is_some() {
                 mark = Some(self.mark_ending(task_id, None));
             }
             owner
         };
 
-        if let Some(mut owner) = reviewing {
+        if let Some((join, cancel)) = reviewing {
             self.announce_stopping(task_id, None).await;
-            let _ = owner.cancel.send(true);
-            match tokio::time::timeout(AGENT_SHUTDOWN_TIMEOUT, &mut owner.handle).await {
-                Ok(_) => self.announce_stopped(task_id),
-                Err(_) => {
-                    self.reviewing_handles.write().await.insert(task_id, owner);
+            let _ = cancel.send(true);
+            match join.begin_join() {
+                JoinAccess::Wait(mut wait) => {
+                    if !wait.finished_within(AGENT_SHUTDOWN_TIMEOUT).await {
+                        return Err(format!(
+                            "the AI review for task {task_id} is still finishing up; nothing was \
+                             changed, so this can simply be asked for again shortly"
+                        ));
+                    }
+                }
+                JoinAccess::Finished => {}
+                JoinAccess::Busy => {
                     return Err(format!(
                         "the AI review for task {task_id} is still finishing up; nothing was \
                          changed, so this can simply be asked for again shortly"
                     ));
                 }
+            }
+            self.announce_stopped(task_id);
+            let mut handles = self.reviewing_handles.write().await;
+            if handles.get(&task_id).is_some_and(|review| review.handle.is_same_owner(&join)) {
+                handles.remove(&task_id);
             }
             return Ok(Some(TaskStatus::AiReview));
         }
@@ -8773,7 +8915,7 @@ impl TaskExecutor {
             reviewing_handles.write().await.remove(&task_id);
         });
 
-        handles.insert(task_id, ReviewOwner { handle, cancel });
+        handles.insert(task_id, ReviewOwner { handle: OwnerJoin::new(handle), cancel });
     }
 
     /// Move a task to `HumanReview`/`Complete`, durably before the board can
@@ -9685,7 +9827,7 @@ impl TaskExecutor {
         self.running_handles.write().await.insert(
             task_id,
             RunningTask {
-                handle,
+                handle: OwnerJoin::new(handle),
                 cancel,
                 execution_id: None,
             },
@@ -9739,7 +9881,7 @@ impl TaskExecutor {
         self.reviewing_handles
             .write()
             .await
-            .insert(task_id, ReviewOwner { handle, cancel });
+            .insert(task_id, ReviewOwner { handle: OwnerJoin::new(handle), cancel });
         cleaned_up
     }
 
@@ -9764,7 +9906,7 @@ impl TaskExecutor {
         self.reviewing_handles
             .write()
             .await
-            .insert(task_id, ReviewOwner { handle, cancel });
+            .insert(task_id, ReviewOwner { handle: OwnerJoin::new(handle), cancel });
     }
 
     /// Register a live execution owner whose cleanup, once cancelled, makes
@@ -9807,7 +9949,7 @@ impl TaskExecutor {
         self.running_handles.write().await.insert(
             task_id,
             RunningTask {
-                handle,
+                handle: OwnerJoin::new(handle),
                 cancel,
                 execution_id: None,
             },
@@ -9855,7 +9997,7 @@ impl TaskExecutor {
         self.running_handles.write().await.insert(
             task_id,
             RunningTask {
-                handle,
+                handle: OwnerJoin::new(handle),
                 cancel,
                 execution_id: None,
             },
@@ -9899,7 +10041,7 @@ impl TaskExecutor {
         self.running_handles.write().await.insert(
             task_id,
             RunningTask {
-                handle,
+                handle: OwnerJoin::new(handle),
                 cancel,
                 execution_id: None,
             },
@@ -9931,7 +10073,7 @@ impl TaskExecutor {
         self.running_handles.write().await.insert(
             task_id,
             RunningTask {
-                handle,
+                handle: OwnerJoin::new(handle),
                 cancel,
                 execution_id: None,
             },
@@ -9952,11 +10094,88 @@ impl TaskExecutor {
         self.running_handles.write().await.insert(
             task_id,
             RunningTask {
-                handle,
+                handle: OwnerJoin::new(handle),
                 cancel,
                 execution_id: None,
             },
         );
+    }
+}
+
+/// Test-only front doors to the application paths. Each publishes the given
+/// reading as the newest one in the cache, then applies its observation as the
+/// poll and Check now do, so a test states a state and a head and nothing else.
+#[cfg(test)]
+impl TaskExecutor {
+    pub(crate) async fn apply_test_state(
+        &self,
+        task_id: Uuid,
+        key: &crate::pr_status::PrKey,
+        state: crate::pr_status::PrState,
+        head_oid: Option<&str>,
+        merge_commit: Option<&str>,
+    ) -> Result<(), String> {
+        let observation = self
+            .pr_statuses
+            .observe(key, test_pr_status(state, head_oid, merge_commit));
+        self.apply_polled_pr_state(task_id, &observation).await
+    }
+
+    pub(crate) async fn record_test_state(
+        &self,
+        task_id: Uuid,
+        key: &crate::pr_status::PrKey,
+        state: &str,
+        head_oid: Option<&str>,
+    ) {
+        use crate::pr_status::PrState;
+        let state = match state {
+            "OPEN" => PrState::Open,
+            "CLOSED" => PrState::Closed,
+            "MERGED" => PrState::Merged,
+            other => panic!("not a recognized pull request state: {other}"),
+        };
+        let observation = self
+            .pr_statuses
+            .observe(key, test_pr_status(state, head_oid, None));
+        self.record_pr_poll_state(task_id, &observation).await;
+    }
+}
+
+#[cfg(test)]
+impl TaskExecutor {
+    /// Test-only: a merged reading of `key`, published and then completed the
+    /// way the poll completes it.
+    pub(crate) async fn complete_test_merge(
+        &self,
+        task_id: Uuid,
+        key: &crate::pr_status::PrKey,
+        state: &str,
+        merge_commit: Option<&str>,
+    ) {
+        let observation = self.pr_statuses.observe(
+            key,
+            test_pr_status(crate::pr_status::PrState::Merged, None, merge_commit),
+        );
+        self.complete_merged_task(task_id, &observation, state).await;
+    }
+}
+
+#[cfg(test)]
+fn test_pr_status(
+    state: crate::pr_status::PrState,
+    head_oid: Option<&str>,
+    merge_commit: Option<&str>,
+) -> crate::pr_status::PrStatus {
+    crate::pr_status::PrStatus {
+        state,
+        checks: crate::pr_status::ChecksState::Passing,
+        failing_checks: vec![],
+        failing_check_count: 0,
+        review_decision: None,
+        mergeable: None,
+        merge_commit: merge_commit.map(str::to_string),
+        head_oid: head_oid.map(str::to_string),
     }
 }
 
@@ -10417,7 +10636,7 @@ mod tests {
         let merged = "1111111111111111111111111111111111111111";
 
         executor
-            .complete_merged_task(
+            .complete_test_merge(
                 id,
                 &crate::pr_status::PrKey::new("owner/repo", 7),
                 "MERGED",
@@ -10446,7 +10665,7 @@ mod tests {
         let merged = "1111111111111111111111111111111111111111";
 
         executor
-            .apply_polled_pr_state(
+            .apply_test_state(
                 id,
                 &crate::pr_status::PrKey::new("owner/repo", 7),
                 crate::pr_status::PrState::Merged, None,
@@ -10476,7 +10695,7 @@ mod tests {
             pr_ref("owner/repo", 7, Some("MERGED"))).await;
         let before = executor.tasks.read().await[&id].clone();
         let _fault = fault::fail_at(Stage::SyncTemp, std::io::ErrorKind::Other);
-        let error = executor.apply_polled_pr_state(id,
+        let error = executor.apply_test_state(id,
             &crate::pr_status::PrKey::new("owner/repo", 7),
             crate::pr_status::PrState::Merged, None,
             Some("1111111111111111111111111111111111111111"))
@@ -10495,7 +10714,7 @@ mod tests {
             pr_ref("owner/repo", 7, Some("MERGED"))).await;
         let commit = "1111111111111111111111111111111111111111";
         let _fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
-        let error = executor.apply_polled_pr_state(id,
+        let error = executor.apply_test_state(id,
             &crate::pr_status::PrKey::new("owner/repo", 7),
             crate::pr_status::PrState::Merged, None, Some(commit))
             .await.expect_err("unconfirmed durability is not success");
@@ -10512,17 +10731,17 @@ mod tests {
         let key = crate::pr_status::PrKey::new("owner/repo", 7);
         let commit = "1111111111111111111111111111111111111111";
         let lease = executor.lifecycle.try_acquire(id).await.unwrap();
-        let error = executor.apply_polled_pr_state(id, &key,
+        let error = executor.apply_test_state(id, &key,
             crate::pr_status::PrState::Merged, None, Some(commit)).await.unwrap_err();
         assert!(error.contains("busy"), "{error}");
         assert_eq!(recorded_merge_commits(&executor.tasks.read().await[&id]), vec![None]);
         drop(lease);
-        executor.apply_polled_pr_state(id, &key, crate::pr_status::PrState::Merged, None, Some(commit))
+        executor.apply_test_state(id, &key, crate::pr_status::PrState::Merged, None, Some(commit))
             .await.unwrap();
         let before = executor.tasks.read().await[&id].updated_at;
         let _lease = executor.lifecycle.try_acquire(id).await.unwrap();
         block_persistence(&temps[0]);
-        executor.apply_polled_pr_state(id, &key, crate::pr_status::PrState::Merged, None, None)
+        executor.apply_test_state(id, &key, crate::pr_status::PrState::Merged, None, None)
             .await.expect("valid evidence requires neither a lease nor a write");
         assert_eq!(executor.tasks.read().await[&id].updated_at, before);
     }
@@ -10534,12 +10753,12 @@ mod tests {
             pr_ref("owner/repo", 7, Some("MERGED"))).await;
         let key = crate::pr_status::PrKey::new("owner/repo", 7);
         for commit in [None, Some("main")] {
-            let error = executor.apply_polled_pr_state(id, &key,
+            let error = executor.apply_test_state(id, &key,
                 crate::pr_status::PrState::Merged, None, commit).await.unwrap_err();
             assert!(error.contains("no usable merge commit"), "{error}");
         }
         executor.tasks.write().await.get_mut(&id).unwrap().cleanup_in_flight = true;
-        let error = executor.apply_polled_pr_state(id, &key,
+        let error = executor.apply_test_state(id, &key,
             crate::pr_status::PrState::Merged, None,
             Some("1111111111111111111111111111111111111111")).await.unwrap_err();
         assert!(error.contains("cleanup"), "{error}");
@@ -10558,7 +10777,7 @@ mod tests {
         let (id, project_id) = task_with_open_pr(&executor, Some("/nonexistent/checkout")).await;
 
         executor
-            .complete_merged_task(id, &crate::pr_status::PrKey::new("owner/repo", 7), "MERGED", None)
+            .complete_test_merge(id, &crate::pr_status::PrKey::new("owner/repo", 7), "MERGED", None)
             .await;
 
         let after = executor.tasks.read().await.get(&id).cloned().expect("task");
@@ -10629,7 +10848,7 @@ mod tests {
         }
 
         executor
-            .complete_merged_task(id, &crate::pr_status::PrKey::new("owner/repo", 7), "MERGED", None)
+            .complete_test_merge(id, &crate::pr_status::PrKey::new("owner/repo", 7), "MERGED", None)
             .await;
 
         let after = executor.tasks.read().await.get(&id).cloned().expect("task");
@@ -10682,7 +10901,7 @@ mod tests {
             .expect("the lease must be free to take");
 
         executor
-            .complete_merged_task(id, &crate::pr_status::PrKey::new("owner/repo", 7), "MERGED", None)
+            .complete_test_merge(id, &crate::pr_status::PrKey::new("owner/repo", 7), "MERGED", None)
             .await;
 
         let after = executor.tasks.read().await.get(&id).cloned().expect("task");
@@ -11302,7 +11521,7 @@ mod tests {
         block_persistence(&temps[0]);
 
         executor
-            .record_pr_poll_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), "CLOSED", None)
+            .record_test_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), "CLOSED", None)
             .await;
 
         let after = executor.tasks.read().await.get(&id).cloned().expect("task");
@@ -11345,7 +11564,7 @@ mod tests {
         let before = executor.tasks.read().await.get(&id).cloned().expect("task");
 
         let removal = executor.lifecycle.try_acquire(id).await.expect("the removal takes the lease");
-        executor.record_pr_poll_state(id, &key, "CLOSED", None).await;
+        executor.record_test_state(id, &key, "CLOSED", None).await;
         assert_eq!(
             format!("{:?}", executor.tasks.read().await[&id].external_refs),
             format!("{:?}", before.external_refs),
@@ -11355,7 +11574,7 @@ mod tests {
             Some(chrono::Utc::now());
         drop(removal);
 
-        executor.record_pr_poll_state(id, &key, "CLOSED", None).await;
+        executor.record_test_state(id, &key, "CLOSED", None).await;
         let after = executor.tasks.read().await.get(&id).cloned().expect("task");
         assert_eq!(
             format!("{:?}", after.external_refs),
@@ -11385,7 +11604,7 @@ mod tests {
             std::io::ErrorKind::Other,
         );
         executor
-            .record_pr_poll_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), "CLOSED", None)
+            .record_test_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), "CLOSED", None)
             .await;
         drop(fault);
 
@@ -11421,7 +11640,7 @@ mod tests {
         let (id, project_id) = task_with_open_pr(&executor, None).await;
 
         executor
-            .record_pr_poll_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), "CLOSED", None)
+            .record_test_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), "CLOSED", None)
             .await;
 
         let after = executor.tasks.read().await.get(&id).cloned().expect("task");
@@ -11642,7 +11861,7 @@ mod tests {
 
         let key = crate::pr_status::PrKey::new("owner/repo", 7);
         for _ in 0..3 {
-            executor.record_pr_poll_state(id, &key, "OPEN", None).await;
+            executor.record_test_state(id, &key, "OPEN", None).await;
         }
 
         let after = executor.tasks.read().await.get(&id).cloned().unwrap();
@@ -11670,7 +11889,7 @@ mod tests {
             let before = executor.tasks.read().await[&id].updated_at;
 
             executor
-                .record_pr_poll_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), "OPEN", None)
+                .record_test_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), "OPEN", None)
                 .await;
 
             let after = executor.tasks.read().await[&id].clone();
@@ -11694,7 +11913,7 @@ mod tests {
         .await;
 
         executor
-            .complete_merged_task(id, &crate::pr_status::PrKey::new("owner/repo", 7), "MERGED", None)
+            .complete_test_merge(id, &crate::pr_status::PrKey::new("owner/repo", 7), "MERGED", None)
             .await;
 
         let after = executor.tasks.read().await[&id].clone();
@@ -11717,7 +11936,7 @@ mod tests {
         let merged = "1111111111111111111111111111111111111111";
 
         executor
-            .apply_polled_pr_state(
+            .apply_test_state(
                 id,
                 &crate::pr_status::PrKey::new("owner/repo", 7),
                 crate::pr_status::PrState::Merged, None,
@@ -11752,7 +11971,7 @@ mod tests {
         .await;
 
         executor
-            .apply_polled_pr_state(
+            .apply_test_state(
                 id,
                 &crate::pr_status::PrKey::new("owner/repo", 7),
                 crate::pr_status::PrState::Merged, None,
@@ -11804,7 +12023,7 @@ mod tests {
             .expect("fixture record persists");
 
         executor
-            .apply_polled_pr_state(
+            .apply_test_state(
                 id,
                 &crate::pr_status::PrKey::new("owner/repo", 7),
                 crate::pr_status::PrState::Merged, None,
@@ -11894,7 +12113,7 @@ mod tests {
         let before = executor.tasks.read().await[&id].clone();
 
         executor
-            .apply_polled_pr_state(
+            .apply_test_state(
                 id,
                 &crate::pr_status::PrKey::new("owner/repo", 7),
                 crate::pr_status::PrState::Merged, None,
@@ -12007,7 +12226,7 @@ mod tests {
             crate::pr_status::PrState::Closed,
             crate::pr_status::PrState::Open,
         ] {
-            executor.apply_polled_pr_state(id, &key, answer, None, None).await.expect("observation applies");
+            executor.apply_test_state(id, &key, answer, None, None).await.expect("observation applies");
         }
 
         for (seen, task) in [
@@ -12054,7 +12273,7 @@ mod tests {
         .await;
 
         executor
-            .apply_polled_pr_state(
+            .apply_test_state(
                 id,
                 &crate::pr_status::PrKey::new("owner/repo", 7),
                 crate::pr_status::PrState::Merged, None,
@@ -12109,7 +12328,7 @@ mod tests {
         let before = executor.tasks.read().await[&id].clone();
 
         executor
-            .apply_polled_pr_state(
+            .apply_test_state(
                 id,
                 &crate::pr_status::PrKey::new("owner/repo", 7),
                 crate::pr_status::PrState::Merged, None,
@@ -12189,7 +12408,7 @@ mod tests {
         let (id, project_id) = task_with_open_pr(&executor, Some("/nonexistent/checkout")).await;
         let key = crate::pr_status::PrKey::new("owner/repo", 7);
 
-        executor.complete_merged_task(id, &key, "MERGED", None).await;
+        executor.complete_test_merge(id, &key, "MERGED", None).await;
         assert_eq!(
             recorded_pr_state(&executor.tasks.read().await[&id]).as_deref(),
             Some("MERGED")
@@ -12347,7 +12566,7 @@ mod tests {
         );
 
         executor
-            .apply_polled_pr_state(
+            .apply_test_state(
                 id,
                 &crate::pr_status::PrKey::new("owner/repo", 7),
                 crate::pr_status::PrState::Merged, None,
@@ -12414,7 +12633,7 @@ mod tests {
         let before = executor.tasks.read().await.get(&id).unwrap().updated_at;
 
         executor
-            .record_pr_poll_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), "OPEN", None)
+            .record_test_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), "OPEN", None)
             .await;
 
         let after = executor.tasks.read().await.get(&id).cloned().unwrap();
@@ -12426,7 +12645,7 @@ mod tests {
         );
         // Another repository's pull request with the same number is not this one.
         executor
-            .record_pr_poll_state(id, &crate::pr_status::PrKey::new("other/repo", 7), "CLOSED", None)
+            .record_test_state(id, &crate::pr_status::PrKey::new("other/repo", 7), "CLOSED", None)
             .await;
         assert_eq!(
             recorded_pr_state(&executor.tasks.read().await[&id]).as_deref(),
@@ -12867,7 +13086,7 @@ mod tests {
             .await;
 
             executor
-                .apply_polled_pr_state(id, &key, crate::pr_status::PrState::Closed, None, None)
+                .apply_test_state(id, &key, crate::pr_status::PrState::Closed, None, None)
                 .await.expect("observation applies");
 
             let after = executor.tasks.read().await[&id].clone();
@@ -12922,7 +13141,7 @@ mod tests {
             }
 
             executor
-                .apply_polled_pr_state(id, &key, crate::pr_status::PrState::Open, head, None)
+                .apply_test_state(id, &key, crate::pr_status::PrState::Open, head, None)
                 .await
                 .expect("observation applies");
 
@@ -12960,7 +13179,7 @@ mod tests {
                 .approve(Some(approved.to_string()), chrono::Utc::now());
         }
         executor
-            .apply_polled_pr_state(
+            .apply_test_state(
                 id,
                 &key,
                 crate::pr_status::PrState::Open,
@@ -12986,7 +13205,7 @@ mod tests {
             .register_fake_running_execution_for_test(run_id)
             .await;
         executor
-            .apply_polled_pr_state(
+            .apply_test_state(
                 run_id,
                 &key,
                 crate::pr_status::PrState::Closed,
@@ -13079,24 +13298,20 @@ mod tests {
 
     #[tokio::test]
     async fn an_older_open_applied_after_a_newer_open_at_another_head_is_not_acted_on() {
+        // The older reading, at the approved head, is observed first; a newer
+        // OPEN at another head is then published before it is applied. Same
+        // state, so a state-only check would let the older head authorize the
+        // move. It is refused at admission, before any owner is ended.
         let (executor, _temps) = test_executor();
         let key = crate::pr_status::PrKey::new("owner/repo", 7);
         let id = published_correction(&executor, TaskStatus::HumanReview).await;
         let owner = executor.register_fake_running_execution_for_test(id).await;
-        // The newer OPEN reading at NEWER_AT is recorded before the older OPEN
-        // at APPROVED_AT is applied. Same state, so a state-only check would
-        // let the older head authorize the move.
-        executor.pr_statuses.remember(&key, open_reading(Some(NEWER_AT)));
+        let older = executor.pr_statuses.observe(&key, open_reading(Some(APPROVED_AT)));
+        executor.pr_statuses.observe(&key, open_reading(Some(NEWER_AT)));
         let before = executor.tasks.read().await[&id].clone();
 
         executor
-            .apply_polled_pr_state(
-                id,
-                &key,
-                crate::pr_status::PrState::Open,
-                Some(APPROVED_AT),
-                None,
-            )
+            .apply_polled_pr_state(id, &older)
             .await
             .expect("observation applies");
 
@@ -13104,21 +13319,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_lease_boundary_refuses_an_observation_a_newer_reading_replaced() {
-        // The early check in `apply_polled_pr_state` has already passed when
-        // the newer reading lands; this call is the one taken under the lease.
+    async fn a_superseded_observation_is_refused_by_the_record_path_before_any_owner_ends() {
+        // The same ordering through `record_pr_poll_state`, the path a poll
+        // takes once it has chosen a Human Review correction to move.
         let (executor, _temps) = test_executor();
         let key = crate::pr_status::PrKey::new("owner/repo", 7);
         let id = published_correction(&executor, TaskStatus::HumanReview).await;
         let owner = executor.register_fake_running_execution_for_test(id).await;
-        executor.pr_statuses.remember(&key, open_reading(Some(NEWER_AT)));
+        let older = executor.pr_statuses.observe(&key, open_reading(Some(APPROVED_AT)));
+        executor.pr_statuses.observe(&key, open_reading(Some(NEWER_AT)));
         let before = executor.tasks.read().await[&id].clone();
 
-        executor
-            .record_pr_poll_state(id, &key, "OPEN", Some(APPROVED_AT))
-            .await;
+        executor.record_pr_poll_state(id, &older).await;
 
-        assert_correction_kept(&executor, id, &before, &owner, "stale OPEN under the lease").await;
+        assert_correction_kept(&executor, id, &before, &owner, "superseded OPEN under the lease").await;
+    }
+
+    #[tokio::test]
+    async fn a_repeated_open_at_the_same_head_is_a_new_observation_and_only_the_latest_is_admitted() {
+        // Two readings with the same state and the same full head are two
+        // observations. The earlier one is refused once the later is published;
+        // the later one moves the correction.
+        let (executor, _temps) = test_executor();
+        let key = crate::pr_status::PrKey::new("owner/repo", 7);
+        let id = published_correction(&executor, TaskStatus::HumanReview).await;
+        let owner = executor.register_fake_running_execution_for_test(id).await;
+        let earlier = executor.pr_statuses.observe(&key, open_reading(Some(APPROVED_AT)));
+        let later = executor.pr_statuses.observe(&key, open_reading(Some(APPROVED_AT)));
+        assert_ne!(earlier.generation, later.generation);
+        let before = executor.tasks.read().await[&id].clone();
+
+        executor.apply_polled_pr_state(id, &earlier).await.expect("observation applies");
+        assert_correction_kept(&executor, id, &before, &owner, "earlier of two equal OPENs").await;
+
+        executor.apply_polled_pr_state(id, &later).await.expect("observation applies");
+        assert_eq!(executor.tasks.read().await[&id].status, TaskStatus::PrCreated);
+        assert!(owner.load(std::sync::atomic::Ordering::SeqCst), "the admitted move ends the owner");
     }
 
     #[tokio::test]
@@ -13130,7 +13366,7 @@ mod tests {
         executor.pr_statuses.remember(&key, open_reading(Some(APPROVED_AT)));
 
         executor
-            .apply_polled_pr_state(
+            .apply_test_state(
                 id,
                 &key,
                 crate::pr_status::PrState::Open,
@@ -13162,7 +13398,7 @@ mod tests {
             let before = executor.tasks.read().await[&id].clone();
 
             executor
-                .apply_polled_pr_state(id, &key, crate::pr_status::PrState::Open, head, None)
+                .apply_test_state(id, &key, crate::pr_status::PrState::Open, head, None)
                 .await
                 .expect("observation applies");
 
@@ -13171,39 +13407,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_newer_open_landing_while_the_owner_ends_refuses_the_background_move() {
-        // The background poll's first check passes against the OPEN reading at
-        // the approved head. The owner's cancellation is the next effect, and a
-        // newer OPEN at another head lands while it is being ended. The commit
-        // boundary judges the observation again and refuses it, so the Task
-        // keeps its status, approval, publication and Checkout.
+    async fn an_admitted_open_is_not_revoked_by_a_newer_reading_published_while_the_owner_ends() {
+        // The approved reading is admitted under the lease. While its owner is
+        // being ended, a newer OPEN at another head is published. Admission is
+        // the single decision, so the admitted move stands: the owner is ended,
+        // the Task reaches PR Created, and the approval and publication are kept.
         let (executor, _temps) = test_executor();
         let key = crate::pr_status::PrKey::new("owner/repo", 7);
         let id = published_correction(&executor, TaskStatus::HumanReview).await;
         let gated = executor.register_gated_running_execution_for_test(id).await;
-        executor.pr_statuses.remember(&key, open_reading(Some(APPROVED_AT)));
+        let approved = executor.pr_statuses.observe(&key, open_reading(Some(APPROVED_AT)));
         let before = executor.tasks.read().await[&id].clone();
 
         let (applied, ()) = tokio::join!(
-            executor.apply_polled_pr_state(
-                id,
-                &key,
-                crate::pr_status::PrState::Open,
-                Some(APPROVED_AT),
-                None,
-            ),
+            executor.apply_polled_pr_state(id, &approved),
             async {
                 while !gated.cancel_seen.load(std::sync::atomic::Ordering::SeqCst) {
                     tokio::task::yield_now().await;
                 }
-                executor.pr_statuses.remember(&key, open_reading(Some(NEWER_AT)));
+                executor.pr_statuses.observe(&key, open_reading(Some(NEWER_AT)));
                 gated.release.send(true).expect("the owner is waiting for release");
             },
         );
         applied.expect("observation applies");
 
         let after = executor.tasks.read().await[&id].clone();
-        assert_eq!(after.status, before.status, "status");
+        assert_eq!(after.status, TaskStatus::PrCreated, "the admitted decision is not revoked");
         assert_eq!(after.human_review.entries, before.human_review.entries, "approval history");
         assert!(
             after.human_review.is_approved() && after.human_review.approved_tip() == Some(APPROVED_AT),
@@ -13211,7 +13440,6 @@ mod tests {
         );
         assert_eq!(after.pr_publication, before.pr_publication, "publication record");
         assert_eq!(after.worktree_path, before.worktree_path, "checkout path");
-        assert_eq!(recorded_pr_state(&after), recorded_pr_state(&before), "nothing recorded");
     }
 
     #[cfg(unix)]
@@ -13238,7 +13466,14 @@ mod tests {
             )
             .await;
 
-            executor.apply_polled_pr_state(id, &key, stale, None, None).await.expect("observation applies");
+            // The stale reading is observed first, then the newer OPEN lands
+            // before it is applied: it is refused at admission.
+            let stale_observation = statuses.observe(&key, polled_status(stale));
+            statuses.remember(&key, polled_status(PrState::Open));
+            executor
+                .apply_polled_pr_state(id, &stale_observation)
+                .await
+                .expect("observation applies");
 
             let after = executor.tasks.read().await[&id].clone();
             assert_eq!(
@@ -14664,7 +14899,7 @@ mod tests {
             .reviewing_handles
             .write()
             .await
-            .insert(task_id, ReviewOwner { handle, cancel });
+            .insert(task_id, ReviewOwner { handle: OwnerJoin::new(handle), cancel });
 
         executor.check_and_execute().await;
 
@@ -14715,7 +14950,7 @@ mod tests {
         executor.running_handles.write().await.insert(
             task_id,
             RunningTask {
-                handle,
+                handle: OwnerJoin::new(handle),
                 cancel,
                 execution_id: None,
             },
@@ -18343,6 +18578,173 @@ mod tests {
         );
     }
 
+    // ---- Cancellation-safe owner shutdown ----------------------------------------
+
+    /// An owner the test releases by hand, on a single-threaded runtime: it
+    /// signals `observed` once it has seen cancellation, then finishes only
+    /// when `release` is sent (or dropped).
+    struct BarrierOwner {
+        observed: tokio::sync::oneshot::Receiver<()>,
+        release: tokio::sync::oneshot::Sender<()>,
+    }
+
+    fn barrier_owner() -> (BarrierOwner, OwnerJoin, tokio::sync::watch::Sender<bool>) {
+        let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+        let (observed_tx, observed) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            let _ = cancelled.wait_for(|stop| *stop).await;
+            let _ = observed_tx.send(());
+            let _ = release_rx.await;
+        });
+        (BarrierOwner { observed, release }, OwnerJoin::new(handle), cancel)
+    }
+
+    async fn register_barrier_execution(executor: &TaskExecutor, task_id: Uuid) -> BarrierOwner {
+        let (owner, handle, cancel) = barrier_owner();
+        executor
+            .running_handles
+            .write()
+            .await
+            .insert(task_id, RunningTask { handle, cancel, execution_id: None });
+        owner
+    }
+
+    async fn register_barrier_review(executor: &TaskExecutor, task_id: Uuid) -> BarrierOwner {
+        let (owner, handle, cancel) = barrier_owner();
+        executor
+            .reviewing_handles
+            .write()
+            .await
+            .insert(task_id, ReviewOwner { handle, cancel });
+        owner
+    }
+
+    /// A stop dropped after it has removed nothing and signalled the owner,
+    /// but before the owner finished, must leave the owner registered and the
+    /// Task still live, and must release its lifecycle lease. A later stop then
+    /// finishes the owner once it is released.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_dropped_mid_join_keeps_the_execution_registered_and_joinable() {
+        let (executor, _temps) = test_executor();
+        let task = running_task(Uuid::new_v4());
+        let task_id = task.id;
+        executor.tasks.write().await.insert(task_id, task);
+        let owner = register_barrier_execution(&executor, task_id).await;
+
+        // One poll runs the stop through its admission and cancellation, then
+        // parks it on the join. Nothing can finish the owner in that poll, so
+        // the poll is pending and the future is dropped while the owner runs.
+        let mut stop = Box::pin(executor.stop_task(task_id));
+        assert!(
+            futures::FutureExt::now_or_never(stop.as_mut()).is_none(),
+            "the stop is parked on the owner's join"
+        );
+        owner.observed.await.expect("the owner observed the cancellation");
+        drop(stop);
+
+        assert!(
+            executor.running_handles.read().await.contains_key(&task_id),
+            "a dropped stop must not remove the owner it has not joined"
+        );
+        assert!(
+            executor.is_task_running(task_id).await,
+            "the checkout is still owned by a live agent, so it is not reported released"
+        );
+        assert!(
+            executor.lifecycle.try_acquire(task_id).await.is_some(),
+            "a dropped stop releases its lifecycle lease"
+        );
+
+        owner.release.send(()).expect("the owner is still waiting for release");
+        let _lease = executor.lifecycle.acquire(task_id).await.expect("the lease is free again");
+        let ended = executor.end_task_owners_under_lease(task_id).await;
+        assert_eq!(ended, Ok(Some(TaskStatus::InProgress)));
+        assert!(!executor.running_handles.read().await.contains_key(&task_id));
+        assert!(!executor.is_task_running(task_id).await);
+    }
+
+    /// The same drop-then-retry ordering for an AI review/fix owner, which has
+    /// its own map and is joined by the same code path.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_dropped_mid_join_keeps_the_review_registered_and_joinable() {
+        let (executor, _temps) = test_executor();
+        let task = running_task(Uuid::new_v4());
+        let task_id = task.id;
+        executor.tasks.write().await.insert(task_id, task);
+        let owner = register_barrier_review(&executor, task_id).await;
+
+        let mut stop = Box::pin(executor.end_task_owners_under_lease(task_id));
+        assert!(futures::FutureExt::now_or_never(stop.as_mut()).is_none());
+        owner.observed.await.expect("the review observed the cancellation");
+        drop(stop);
+
+        assert!(
+            executor.reviewing_handles.read().await.contains_key(&task_id),
+            "a dropped stop must not remove the review it has not joined"
+        );
+        assert!(
+            executor.is_task_running(task_id).await,
+            "the review is still live, so the checkout is not reported released"
+        );
+
+        owner.release.send(()).expect("the review is still waiting for release");
+        let _lease = executor.lifecycle.acquire(task_id).await.expect("the lease is free again");
+        let ended = executor.end_task_owners_under_lease(task_id).await;
+        assert_eq!(ended, Ok(Some(TaskStatus::AiReview)));
+        assert!(!executor.reviewing_handles.read().await.contains_key(&task_id));
+    }
+
+    /// A review that outlives the bound is put back where it was found, as the
+    /// execution already is, and a later stop joins it once it finishes.
+    #[tokio::test(start_paused = true)]
+    async fn a_review_that_times_out_stays_registered_and_is_joined_later() {
+        let (executor, _temps) = test_executor();
+        let task = running_task(Uuid::new_v4());
+        let task_id = task.id;
+        executor.tasks.write().await.insert(task_id, task);
+        let owner = register_barrier_review(&executor, task_id).await;
+
+        let _lease = executor.lifecycle.acquire(task_id).await.expect("the lease is free");
+        let timed_out = executor.end_task_owners_under_lease(task_id).await;
+        assert!(timed_out.is_err(), "an unfinished review must not report ended");
+        assert!(
+            executor.reviewing_handles.read().await.contains_key(&task_id),
+            "the review is put back exactly where it was found"
+        );
+
+        owner.release.send(()).expect("the review is still waiting for release");
+        assert_eq!(
+            executor.end_task_owners_under_lease(task_id).await,
+            Ok(Some(TaskStatus::AiReview))
+        );
+        assert!(!executor.reviewing_handles.read().await.contains_key(&task_id));
+    }
+
+    /// A cancelled stop can finish after the owner was joined but before it
+    /// removed the entry. The entry is then `Joined`: it is not live, and the
+    /// next stop removes it rather than refusing or waiting on a handle that
+    /// is already gone.
+    #[tokio::test(start_paused = true)]
+    async fn a_joined_entry_left_by_a_cancelled_removal_is_removed_by_the_next_stop() {
+        let (executor, _temps) = test_executor();
+        let task = running_task(Uuid::new_v4());
+        let task_id = task.id;
+        executor.tasks.write().await.insert(task_id, task);
+        let owner = register_barrier_execution(&executor, task_id).await;
+        let joined = executor.running_handles.read().await.get(&task_id).unwrap().handle.clone();
+        *joined.lock() = JoinState::Joined;
+        owner.release.send(()).ok();
+
+        assert!(!executor.is_task_running(task_id).await, "a joined owner is not live");
+        let _lease = executor.lifecycle.acquire(task_id).await.expect("the lease is free");
+        assert_eq!(
+            executor.end_task_owners_under_lease(task_id).await,
+            Ok(Some(TaskStatus::InProgress))
+        );
+        assert!(!executor.running_handles.read().await.contains_key(&task_id));
+    }
+
     // ---- The lease-hold bound --------------------------------------------------
 
     /// Register an execution the way [`register_cancellable_execution`] does,
@@ -18363,7 +18765,7 @@ mod tests {
         executor.running_handles.write().await.insert(
             task_id,
             RunningTask {
-                handle,
+                handle: OwnerJoin::new(handle),
                 cancel,
                 execution_id: None,
             },
@@ -18465,7 +18867,7 @@ mod tests {
         executor.running_handles.write().await.insert(
             task_id,
             RunningTask {
-                handle,
+                handle: OwnerJoin::new(handle),
                 cancel,
                 execution_id: None,
             },
@@ -18669,7 +19071,7 @@ mod tests {
         executor.running_handles.write().await.insert(
             task_id,
             RunningTask {
-                handle,
+                handle: OwnerJoin::new(handle),
                 cancel,
                 execution_id: None,
             },
@@ -21681,7 +22083,7 @@ VERDICT: APPROVED"
                 .reviewing_handles
                 .write()
                 .await
-                .insert(task_id, ReviewOwner { handle, cancel });
+                .insert(task_id, ReviewOwner { handle: OwnerJoin::new(handle), cancel });
 
             let result = executor.stop_task(task_id).await;
             assert!(
@@ -23395,8 +23797,10 @@ VERDICT: APPROVED"
                     .remove(&self.task_id);
                 if let Some(run) = run {
                     let _ = run.cancel.send(true);
-                    let _ =
-                        tokio::time::timeout(std::time::Duration::from_secs(10), run.handle).await;
+                    if let Some(handle) = run.handle.take_handle() {
+                        let _ =
+                            tokio::time::timeout(std::time::Duration::from_secs(10), handle).await;
+                    }
                 }
             }
         }
@@ -26934,7 +27338,7 @@ VERDICT: APPROVED"
             executor.running_handles.write().await.insert(
                 task_id,
                 RunningTask {
-                    handle,
+                    handle: OwnerJoin::new(handle),
                     cancel,
                     execution_id: Some(execution_id),
                 },
@@ -27015,7 +27419,7 @@ VERDICT: APPROVED"
             executor.running_handles.write().await.insert(
                 task_id,
                 RunningTask {
-                    handle,
+                    handle: OwnerJoin::new(handle),
                     cancel,
                     execution_id: Some(Uuid::new_v4()),
                 },
@@ -27097,7 +27501,7 @@ VERDICT: APPROVED"
                 .reviewing_handles
                 .write()
                 .await
-                .insert(task_id, ReviewOwner { handle, cancel });
+                .insert(task_id, ReviewOwner { handle: OwnerJoin::new(handle), cancel });
 
             let run = executor.task_run(task_id).await;
             assert!(run.live);
@@ -27216,7 +27620,7 @@ VERDICT: APPROVED"
             executor.running_handles.write().await.insert(
                 task_id,
                 RunningTask {
-                    handle,
+                    handle: OwnerJoin::new(handle),
                     cancel,
                     execution_id: Some(execution_id),
                 },
@@ -27252,7 +27656,7 @@ VERDICT: APPROVED"
 
             drop(mark);
             owner.cancel.send(true).unwrap();
-            owner.handle.await.unwrap();
+            owner.handle.take_handle().expect("the owner's handle is not yet joined").await.unwrap();
         }
 
         #[tokio::test]
@@ -27310,7 +27714,7 @@ VERDICT: APPROVED"
             executor.running_handles.write().await.insert(
                 task_id,
                 RunningTask {
-                    handle,
+                    handle: OwnerJoin::new(handle),
                     cancel,
                     execution_id: None,
                 },
@@ -27348,7 +27752,7 @@ VERDICT: APPROVED"
             executor.running_handles.write().await.insert(
                 task_id,
                 RunningTask {
-                    handle,
+                    handle: OwnerJoin::new(handle),
                     cancel,
                     execution_id: Some(execution_id),
                 },

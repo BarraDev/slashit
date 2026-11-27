@@ -9364,6 +9364,18 @@ async fn link_pr_to_task_reserved(
     if !state.task.tasks.read().await.contains_key(&task_uuid) {
         return Ok(());
     }
+    // The admission boundary, under the lease and before any owner is ended or
+    // anything is written. A reading a newer one replaced authorizes nothing,
+    // so nothing is recorded, not even the link: the pull request is asked
+    // about again, and the link is recorded from that reading.
+    if let Some(observation) = answer.as_ref() {
+        if !state.pr_statuses.admit(observation).await {
+            return Err(PrLinkFailure::NotRecorded(format!(
+                "a newer reading of {pr_url} arrived while GitHub was being asked, so the pull \
+                 request was not linked to the task. Refresh again."
+            )));
+        }
+    }
 
     // Every PR side-effect caller of this function has already ended active
     // ownership and held the task reserved since before its own first
@@ -9400,10 +9412,8 @@ async fn link_pr_to_task_reserved(
     // G1: a published Task in a post-PR correction is moved only by an open
     // pull request that G2 verifies. Otherwise the pull request's state alone
     // is recorded: the owner is not ended and the status is kept. Decided on
-    // the Task before the owner is ended, under the same lease. A reading a
-    // newer one replaced is not evidence for that gate: judged here, under
-    // the lease, against the cache as it now stands.
-    let latest = !reading_superseded(&state.pr_statuses, pr_url, answer.as_ref());
+    // the Task before the owner is ended, under the same lease. The reading
+    // was admitted above, so it is the latest one (`true`).
     let held = !merged
         && state
             .task
@@ -9419,7 +9429,7 @@ async fn link_pr_to_task_reserved(
                     linked_before,
                     remote_state.as_deref().unwrap_or(""),
                     observed_head.as_deref(),
-                    latest,
+                    true,
                 ) == PrObservationEffect::RecordsStateOnly
             });
     if !pinned && !held {
@@ -9434,22 +9444,19 @@ async fn link_pr_to_task_reserved(
 
     let remote = remote_state.clone();
     let head = observed_head.clone();
-    // The commit boundary: `latest` is judged again inside the write guard,
-    // because the owner end above is an await a newer reading may land during.
-    let statuses = &state.pr_statuses;
-    let observed = answer.clone();
+    // No freshness check here: the admission above is the decision, and a
+    // later publication does not revoke it.
     let apply = move |staged: &mut std::collections::HashMap<Uuid, Task>| {
         if let Some(task) = staged.get_mut(&task_uuid) {
             // Judged on the staged Task, before this write links it.
             let linked_before = task.authoritative_pr_url() == Some(pr_url);
-            let latest_now = latest && !reading_superseded(statuses, pr_url, observed.as_ref());
             let moves = pr_observation_effect(
                 task,
                 pr_url,
                 linked_before,
                 remote.as_deref().unwrap_or(""),
                 head.as_deref(),
-                latest_now,
+                true,
             ) == PrObservationEffect::MovesToPrCreated;
             apply_pr_link(task, pr_url, remote.as_deref());
             // The branch's pull request is now known, so a request to open
@@ -9589,26 +9596,10 @@ fn pr_key_for_url(pr_url: &str) -> Option<crate::pr_status::PrKey> {
 async fn refresh_pr_url(
     statuses: &crate::pr_status::PrStatuses,
     pr_url: &str,
-) -> Result<crate::pr_status::PrStatus, String> {
+) -> Result<crate::pr_status::PrObservation, String> {
     let key = pr_key_for_url(pr_url)
         .ok_or_else(|| format!("{pr_url} is not a GitHub pull request URL"))?;
     statuses.refresh(&key).await.map_err(|e| e.message)
-}
-
-/// Whether the cache now holds a newer reading of `pr_url` than `observed`, the
-/// answer a command read: another state, or another full head. Such an answer
-/// must not act. A reading with no recognized state is not compared.
-fn reading_superseded(
-    statuses: &crate::pr_status::PrStatuses,
-    pr_url: &str,
-    observed: Option<&crate::pr_status::PrStatus>,
-) -> bool {
-    let (Some(key), Some(observed)) = (pr_key_for_url(pr_url), observed) else {
-        return false;
-    };
-    observed.state.as_recorded().is_some_and(|recorded| {
-        statuses.latest_reading_differs(&key, recorded, observed.head_oid.as_deref())
-    })
 }
 
 /// The state ("OPEN" | "CLOSED" | "MERGED") GitHub reports for `pr_url`, or
@@ -9697,17 +9688,11 @@ pub async fn refresh_pr_status(
     // on its own answer, so a timeout on one never drops another's.
     let mut errors = Vec::new();
     for (key, answer) in state.pr_statuses.refresh_each(keys.clone()).await {
-        if let Ok(status) = answer {
+        if let Ok(observation) = answer {
             match state.executor.get() {
                 Some(executor) => {
                     if let Err(error) = executor
-                        .apply_polled_pr_state(
-                            task_uuid,
-                            &key,
-                            status.state,
-                            status.head_oid.as_deref(),
-                            status.merge_commit.as_deref(),
-                        )
+                        .apply_polled_pr_state(task_uuid, &observation)
                         .await
                     {
                         errors.push(error);
@@ -9840,11 +9825,11 @@ pub async fn refresh_task_pr_state(
         Some(true) => {}
     }
 
-    // The authoritative freshness check, under the lease and before any owner
-    // is ended or any state written: a reading a newer one replaced authorizes
+    // The admission boundary, under the lease and before any owner is ended or
+    // any state written: a reading a newer publication replaced authorizes
     // nothing, not even its state. The newer reading is observed on its own
     // refresh, so asking again is the remedy.
-    if reading_superseded(&state.pr_statuses, &pr_url, Some(&status)) {
+    if !state.pr_statuses.admit(&status).await {
         return Err(format!(
             "A newer reading of {pr_url} arrived while GitHub was being asked, so nothing \
              was changed. Refresh again."
@@ -9911,18 +9896,9 @@ pub async fn refresh_task_pr_state(
     // the commit was kept gets its evidence.
     let merge_commit = status.merge_commit.clone();
     let head = observed_head.clone();
-    // The commit boundary: repeated inside the write guard, because the owner
-    // end above is an await a newer reading may land during. A superseded
-    // answer writes nothing.
-    let statuses = &state.pr_statuses;
-    let answer = status.clone();
-    let superseded_flag = std::sync::atomic::AtomicBool::new(false);
-    let superseded = &superseded_flag;
+    // No freshness check in the write: the admission above is the decision,
+    // and a later publication does not revoke it.
     let apply = move |staged: &mut std::collections::HashMap<Uuid, Task>| {
-        if reading_superseded(statuses, &target, Some(&answer)) {
-            superseded.store(true, std::sync::atomic::Ordering::SeqCst);
-            return;
-        }
         if let Some(task) = staged.get_mut(&task_uuid) {
             let mut numbers = Vec::new();
             for r in task.external_refs.iter_mut() {
@@ -9969,12 +9945,6 @@ pub async fn refresh_task_pr_state(
     crate::lifecycle::record(&state.task.tasks, &state.storage, task_uuid, &apply)
         .await
         .map_err(|e| format!("recording the pull request state failed: {e}"))?;
-    if superseded.load(std::sync::atomic::Ordering::SeqCst) {
-        return Err(format!(
-            "A newer reading of {pr_url} arrived while GitHub was being asked, so the Task was \
-             not moved. Refresh again."
-        ));
-    }
 
     let updated = {
         let tasks = state.task.tasks.read().await;
@@ -24942,12 +24912,11 @@ mod tests {
                 gated.release.send(true).expect("the owner is waiting for release");
             }
 
-            /// The correction is as it was before the observation: status,
-            /// approval history and currency, publication record, Checkout, and
-            /// the reference's recorded state.
+            /// An admitted move to PR Created, with the approval, publication
+            /// record and Checkout the same as before it.
             #[cfg(unix)]
-            fn assert_correction_unchanged(after: &Task, before: &Task, why: &str) {
-                assert_eq!(after.status, TaskStatus::HumanReview, "{why}: status");
+            fn assert_admitted_move_kept(after: &Task, before: &Task, why: &str) {
+                assert_eq!(after.status, TaskStatus::PrCreated, "{why}: admitted move");
                 assert!(
                     after.human_review.is_approved()
                         && after.human_review.approved_tip() == Some(APPROVED_HEAD),
@@ -24955,14 +24924,12 @@ mod tests {
                 );
                 assert_eq!(after.human_review.entries, before.human_review.entries, "{why}: approval history");
                 assert_eq!(after.pr_publication, before.pr_publication, "{why}: publication record");
-                assert_eq!(after.branch_name, before.branch_name, "{why}: checkout branch");
                 assert_eq!(after.worktree_path, before.worktree_path, "{why}: checkout path");
-                assert_eq!(recorded_pr_state(after), recorded_pr_state(before), "{why}: nothing recorded");
             }
 
             #[cfg(unix)]
             #[tokio::test(flavor = "multi_thread")]
-            async fn check_now_refuses_an_open_answer_a_newer_reading_replaced_before_its_commit() {
+            async fn check_now_keeps_an_admitted_move_when_a_newer_reading_lands_while_the_owner_ends() {
                 use tauri::Manager;
                 let _guard = PATH_LOCK.lock().await;
                 let (state, task_id, executor, _tmp, _mock) = correction_at_approved_head().await;
@@ -24978,13 +24945,16 @@ mod tests {
                 );
                 answer.expect("check now answers");
 
+                // Admitted before the owner ended: the newer reading that landed
+                // during the shutdown does not revoke the move.
                 let after = app.state::<crate::AppState>().task.tasks.read().await[&task_id].clone();
-                assert_correction_unchanged(&after, &before, "check now");
+                assert!(gated.cancel_seen.load(std::sync::atomic::Ordering::SeqCst), "the owner was ended");
+                assert_admitted_move_kept(&after, &before, "check now");
             }
 
             #[cfg(unix)]
             #[tokio::test(flavor = "multi_thread")]
-            async fn refresh_task_pr_state_refuses_an_open_answer_a_newer_reading_replaced_before_its_commit() {
+            async fn refresh_task_pr_state_keeps_an_admitted_move_when_a_newer_reading_lands_while_the_owner_ends() {
                 use tauri::Manager;
                 let _guard = PATH_LOCK.lock().await;
                 let (state, task_id, executor, _tmp, _mock) = correction_at_approved_head().await;
@@ -24998,10 +24968,11 @@ mod tests {
                     refresh_task_pr_state(GuiMutation::untracked(), app.state(), task_id.to_string()),
                     land_newer_open_while_owner_ends(&gated, &statuses),
                 );
-                assert!(result.is_err(), "a reading replaced before its commit is refused: {result:?}");
+                result.expect("refresh answers");
 
                 let after = app.state::<crate::AppState>().task.tasks.read().await[&task_id].clone();
-                assert_correction_unchanged(&after, &before, "refresh_task_pr_state");
+                assert!(gated.cancel_seen.load(std::sync::atomic::Ordering::SeqCst), "the owner was ended");
+                assert_admitted_move_kept(&after, &before, "refresh_task_pr_state");
             }
 
             /// The first link of a pull request (Approve & Create PR) keeps the
