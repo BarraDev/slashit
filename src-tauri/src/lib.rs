@@ -12,6 +12,7 @@ pub mod review_fix_residue;
 pub mod review_fix_apply;
 mod pty;
 mod host_process;
+mod process_tree;
 mod worktree;
 mod main_window;
 mod storage_accounting;

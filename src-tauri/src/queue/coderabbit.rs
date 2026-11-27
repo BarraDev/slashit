@@ -11,9 +11,12 @@
 //!
 //! Written against CodeRabbit CLI 0.9.7.
 
+use crate::process_tree;
 use serde::Deserialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
+use tokio::process::Child;
 
 /// The CLI documents reviews of up to 15 minutes; past this it is stopped.
 pub(crate) const REVIEW_TIMEOUT: Duration = Duration::from_secs(20 * 60);
@@ -125,11 +128,63 @@ fn review_args<'a>(working_dir: &'a str, base_commit: &'a str) -> [&'a str; 8] {
     ]
 }
 
+/// The CodeRabbit process group a run spawned. Its group is signalled only
+/// while the leader is unreaped, so the group id still names this run's group.
+/// Dropping it ends the group on any path the run does not finish normally,
+/// including a dropped future.
+struct Group {
+    leader: Option<u32>,
+    unreaped: AtomicBool,
+}
+
+impl Group {
+    fn new(leader: Option<u32>) -> Self {
+        Self {
+            leader,
+            unreaped: AtomicBool::new(true),
+        }
+    }
+
+    /// Ends every process in the group. A no-op once the leader is reaped.
+    fn signal(&self) {
+        if !self.unreaped.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Some(pid) = self.leader {
+            #[cfg(unix)]
+            process_tree::kill_process_group(pid);
+            #[cfg(windows)]
+            process_tree::kill_process_tree(pid);
+            #[cfg(not(any(unix, windows)))]
+            let _ = pid;
+        }
+    }
+
+    /// Ends the group, then kills and reaps the leader.
+    async fn stop(&self, child: &mut Child) {
+        self.signal();
+        let _ = child.kill().await; // kills and reaps
+        self.reaped();
+    }
+
+    /// Recorded right after the leader's reap, after which its pid may be reissued.
+    fn reaped(&self) {
+        self.unreaped.store(false, Ordering::SeqCst);
+    }
+}
+
+impl Drop for Group {
+    fn drop(&mut self) {
+        self.signal();
+    }
+}
+
 /// Run the CodeRabbit CLI found on `PATH` and read its result.
 ///
-/// The subprocess is owned by this function for its whole life: a cancellation
-/// or the `timeout` kills and reaps it, and dropping the future kills it. A
-/// cancelled run returns an empty result, which the caller discards.
+/// The run leads its own process group, and every process in it is ended when
+/// the run completes (so a descendant cannot outlive the review), times out,
+/// is cancelled, or the future is dropped. A cancelled run returns an empty
+/// result, which the caller discards.
 pub(crate) async fn run_review(
     working_dir: &str,
     base_commit: &str,
@@ -145,7 +200,8 @@ pub(crate) async fn run_review(
     if !path_resolves_to_a_fixture() {
         return CodeRabbitReview::failed("unit tests run only a fixture CodeRabbit CLI");
     }
-    let mut child = match tokio::process::Command::new("coderabbit")
+    let mut command = tokio::process::Command::new("coderabbit");
+    command
         .args(review_args(working_dir, base_commit))
         .current_dir(working_dir)
         // A prompt for input must fail, not wait.
@@ -153,18 +209,23 @@ pub(crate) async fn run_review(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         // Covers the paths where this future is simply dropped (an aborted
-        // task, a runtime shutdown).
-        .kill_on_drop(true)
-        .spawn()
-    {
+        // task, a runtime shutdown) for the leader itself.
+        .kill_on_drop(true);
+    // Unix: the leader and whatever it starts share a group, so the group can
+    // be ended as a whole (see `Group`).
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
             return CodeRabbitReview::failed(format!("the CodeRabbit CLI could not start: {e}"))
         }
     };
+    // Declared after `child`, so it drops first, while the leader is unreaped.
+    let group = Group::new(child.id());
 
     let (Some(mut out), Some(mut err)) = (child.stdout.take(), child.stderr.take()) else {
-        let _ = child.kill().await;
+        group.stop(&mut child).await;
         return CodeRabbitReview::failed("the CodeRabbit CLI's output could not be captured");
     };
     let mut stdout = Vec::new();
@@ -173,13 +234,19 @@ pub(crate) async fn run_review(
     // The pipes are drained while waiting: a CLI that fills one would
     // otherwise never exit.
     let finished = {
-        let run = async {
-            tokio::join!(
-                child.wait(),
-                out.read_to_end(&mut stdout),
-                err.read_to_end(&mut stderr),
-            )
+        let drain =
+            async { tokio::join!(out.read_to_end(&mut stdout), err.read_to_end(&mut stderr)) };
+        // Once the leader has exited, whatever it left running is ended too.
+        // That also closes the pipes a descendant would otherwise hold open.
+        // The exit is awaited without reaping, so the group id is still valid.
+        let end_group = async {
+            #[cfg(unix)]
+            if let Some(pid) = group.leader {
+                process_tree::wait_for_exit_without_reaping(pid).await;
+                group.signal();
+            }
         };
+        let run = async { tokio::join!(drain, end_group) };
         tokio::select! {
             biased;
             _ = cancelled.changed() => None,
@@ -188,14 +255,16 @@ pub(crate) async fn run_review(
     };
 
     let Some(finished) = finished else {
-        let _ = child.kill().await; // kills and reaps
+        group.stop(&mut child).await;
         return CodeRabbitReview::default();
     };
     let stdout = String::from_utf8_lossy(&stdout);
     let stderr = String::from_utf8_lossy(&stderr);
 
     match finished {
-        Ok((status, out_read, err_read)) => {
+        Ok(((out_read, err_read), ())) => {
+            let status = child.wait().await;
+            group.reaped();
             let mut review = match status {
                 Ok(status) => parse_output(&stdout, &stderr, status.success(), status.code()),
                 Err(e) => CodeRabbitReview::failed(format!(
@@ -210,7 +279,7 @@ pub(crate) async fn run_review(
             review
         }
         Err(_) => {
-            let _ = child.kill().await;
+            group.stop(&mut child).await;
             // Whatever it reported before stalling is still worth keeping.
             let mut review = parse_output(&stdout, &stderr, false, None);
             review.failure = Some(format!(
@@ -436,14 +505,19 @@ mod tests {
             std::fs::read_to_string(self.dir.path().join(name)).unwrap_or_default()
         }
 
-        async fn pid(&self) -> u32 {
+        /// The pid the fixture recorded in `name` once it started.
+        async fn recorded(&self, name: &str) -> u32 {
             for _ in 0..400 {
-                if let Ok(pid) = self.read("pid").trim().parse() {
+                if let Ok(pid) = self.read(name).trim().parse() {
                     return pid;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            panic!("the fixture never started");
+            panic!("the fixture never recorded {name}");
+        }
+
+        async fn pid(&self) -> u32 {
+            self.recorded("pid").await
         }
     }
 
@@ -647,6 +721,116 @@ mod tests {
 
         assert_eq!(review, CodeRabbitReview::default());
         assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    /// Shell that leaves a `sleep` running in the background, records its pid
+    /// as `descendant`, then becomes the leader's own foreground `sleep`.
+    const WITH_DESCENDANT: &str = "sleep 300 &\necho $! > \"$here/descendant\"\nsleep 300";
+
+    /// A process the run never started. It must survive every cleanup below.
+    struct Unrelated(std::process::Child);
+
+    impl Unrelated {
+        fn start() -> Self {
+            Unrelated(
+                std::process::Command::new("sleep")
+                    .arg("300")
+                    .spawn()
+                    .expect("sleep"),
+            )
+        }
+    }
+
+    impl Drop for Unrelated {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_run_ends_the_descendants_it_started() {
+        let fixture = Fixture::install(WITH_DESCENDANT).await;
+        let unrelated = Unrelated::start();
+        let (_cancel, mut cancelled) = tokio::sync::watch::channel(false);
+        let review = fixture
+            .run_with(&mut cancelled, Duration::from_secs(2))
+            .await;
+
+        assert!(failure(&review).contains("did not finish within 2 seconds"));
+        assert!(!is_running(fixture.pid().await));
+        assert!(!is_running(fixture.recorded("descendant").await));
+        assert!(
+            is_running(unrelated.0.id()),
+            "an unrelated process was ended"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_ends_the_descendants_it_started() {
+        let fixture = Fixture::install(WITH_DESCENDANT).await;
+        let unrelated = Unrelated::start();
+        let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+        let (review, (leader, descendant)) = tokio::join!(
+            fixture.run_with(&mut cancelled, Duration::from_secs(60)),
+            async {
+                let leader = fixture.pid().await;
+                let descendant = fixture.recorded("descendant").await;
+                cancel.send(true).unwrap();
+                (leader, descendant)
+            }
+        );
+
+        assert_eq!(review, CodeRabbitReview::default());
+        assert!(!is_running(leader));
+        assert!(!is_running(descendant));
+        assert!(
+            is_running(unrelated.0.id()),
+            "an unrelated process was ended"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_run_ends_the_descendants_it_started() {
+        let fixture = Fixture::install(WITH_DESCENDANT).await;
+        let unrelated = Unrelated::start();
+        let (_cancel, mut cancelled) = tokio::sync::watch::channel(false);
+        let (leader, descendant) = {
+            let run = fixture.run_with(&mut cancelled, Duration::from_secs(60));
+            tokio::pin!(run);
+            tokio::select! {
+                _ = &mut run => panic!("the fixture never exits"),
+                ids = async {
+                    (fixture.pid().await, fixture.recorded("descendant").await)
+                } => ids,
+            }
+        };
+
+        for _ in 0..400 {
+            if !is_running(leader) && !is_running(descendant) {
+                assert!(
+                    is_running(unrelated.0.id()),
+                    "an unrelated process was ended"
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the dropped run left its group running");
+    }
+
+    #[tokio::test]
+    async fn a_descendant_outliving_a_completed_review_is_ended() {
+        let fixture = Fixture::install(&format!(
+            "sleep 300 &\necho $! > \"$here/descendant\"\ncat <<'EVENT'\n{DONE_NONE}\nEVENT\nexit 0"
+        ))
+        .await;
+        let review = tokio::time::timeout(Duration::from_secs(20), fixture.run())
+            .await
+            .expect("a descendant held the review open");
+
+        assert_eq!(review, CodeRabbitReview::default());
+        assert!(!is_running(fixture.recorded("descendant").await));
     }
 
     #[tokio::test]
