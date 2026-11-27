@@ -51,11 +51,23 @@ fn unresolved_members(
     unresolved
 }
 
+/// What the panel says when it lists no Workspaces. An empty list after a
+/// failed registry read does not mean that none exist.
+fn empty_workspaces_text(load_failed: bool) -> &'static str {
+    if load_failed {
+        "Workspaces could not be loaded"
+    } else {
+        "No workspaces configured"
+    }
+}
+
 #[component]
 pub fn WorkspacePanel(
     workspaces: ReadSignal<Vec<Workspace>>,
     /// Whether `workspaces` holds the registry as loaded, not a placeholder.
     workspaces_loaded: ReadSignal<bool>,
+    /// Whether the last registry read failed, leaving `workspaces` empty.
+    workspaces_failed: ReadSignal<bool>,
     projects: ReadSignal<Vec<Project>>,
     /// Fired after every attach or detach attempt, successful or refused, so
     /// the Workspaces page can reload the project list it owns and passes in
@@ -91,7 +103,7 @@ pub fn WorkspacePanel(
 
             <Show when=move || workspaces.with(Vec::is_empty)>
                 <div class="p-8 text-center">
-                    <p class="text-white/40 text-sm">"No workspaces configured"</p>
+                    <p class="text-white/40 text-sm">{move || empty_workspaces_text(workspaces_failed.get())}</p>
                 </div>
             </Show>
 
@@ -659,7 +671,9 @@ fn WorkspaceItem(
                                 <p class="text-xs text-white/30">"No standalone projects available to attach"</p>
                             }
                         >
-                            <div class="flex gap-2" data-testid="workspace-attach">
+                            // items-start: the select's options open in flow below it, and a
+                            // stretched Attach button would grow with them.
+                            <div class="flex items-start gap-2" data-testid="workspace-attach">
                                 <div class="flex-1">
                                     <CustomSelect
                                         options=eligible_options
@@ -689,13 +703,19 @@ fn WorkspaceItem(
 #[cfg(test)]
 mod tests {
     use super::{
-        folder_detail, folder_label, move_attach_failure, move_detach_failure, submitted_folder,
+        empty_workspaces_text, folder_detail, folder_label, move_attach_failure, move_detach_failure, submitted_folder,
         unresolved_members, TASK_BOUNDARY_NOTE,
     };
     use crate::models::workspace::WorkspaceRootInfo;
 
     fn present(path: &str) -> Option<WorkspaceRootInfo> {
         Some(WorkspaceRootInfo { path: path.to_string(), exists: true, custom: true })
+    }
+
+    #[test]
+    fn an_empty_list_after_a_failed_read_is_not_reported_as_no_workspaces() {
+        assert_eq!(empty_workspaces_text(true), "Workspaces could not be loaded");
+        assert_eq!(empty_workspaces_text(false), "No workspaces configured");
     }
 
     #[test]
