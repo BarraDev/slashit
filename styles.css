@@ -151,13 +151,16 @@ button:focus:not(:focus-visible) {
 
 /* ── Project Rail ────────────────────────────────────────── */
 
+/* z-index must exceed the Kanban selection checkbox (z-20, not inside its own
+   stacking context). At an equal z-index the later board node paints over the
+   rail and takes its clicks. */
 .project-rail-slot {
   position: relative;
   flex: 0 0 48px;
   width: 48px;
   min-width: 48px;
   height: 100%;
-  z-index: 20;
+  z-index: 22;
 }
 
 .project-rail {
