@@ -52,6 +52,26 @@ fn persist_selected_workspace(workspace_id: &str) {
     }
 }
 
+/// The error `get_workspace` returns when the registry has no Workspace with
+/// that id. It is the backend command's message, matched exactly.
+const WORKSPACE_NOT_FOUND: &str = "Workspace not found";
+
+/// The Workspace selection after checking the persisted one, `checked`, on
+/// startup. The check's `result` clears the selection only when it reports
+/// that the Workspace does not exist; any other error may be temporary and
+/// keeps it. A selection the user changed while the check was pending is
+/// left as they set it.
+fn workspace_selection_after_check(
+    current: String,
+    checked: &str,
+    result: Result<(), &str>,
+) -> String {
+    match result {
+        Err(WORKSPACE_NOT_FOUND) if current == checked => String::new(),
+        _ => current,
+    }
+}
+
 fn get_persisted_selected_project() -> String {
     if let Some(window) = web_sys::window() {
         if let Ok(Some(storage)) = window.local_storage() {
@@ -143,7 +163,39 @@ pub fn App() -> impl IntoView {
         
         true
     });
-    
+
+    // Validate the persisted Workspace on startup, once. Without this a
+    // Workspace removed from the registry reopens as "Workspace unavailable"
+    // on every launch.
+    Effect::new(move |prev: Option<()>| {
+        if prev.is_some() {
+            return;
+        }
+        let workspace_id = selected_workspace.get_untracked();
+        if workspace_id.is_empty() {
+            return;
+        }
+        spawn_local(async move {
+            let result = crate::services::workspace_service::get_workspace(&workspace_id)
+                .await
+                .map(|_| ());
+            if let Err(e) = &result {
+                leptos::logging::warn!("[App] Error validating workspace {}: {}", workspace_id, e);
+            }
+            let Some(current) = selected_workspace.try_get_untracked() else {
+                return;
+            };
+            let next = workspace_selection_after_check(
+                current.clone(),
+                &workspace_id,
+                result.as_ref().copied().map_err(String::as_str),
+            );
+            if next != current {
+                set_selected_workspace.set(next);
+            }
+        });
+    });
+
     // Persist selected project whenever it changes
     Effect::new(move |_| {
         let project = selected_project.get();
@@ -247,5 +299,42 @@ pub fn App() -> impl IntoView {
                 }
             </div>
         </AppLayout>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{workspace_selection_after_check, WORKSPACE_NOT_FOUND};
+
+    #[test]
+    fn stale_persisted_workspace_is_cleared() {
+        let id = "8d3c0f4e-0000-4000-8000-000000000001";
+        assert_eq!(
+            workspace_selection_after_check(id.to_string(), id, Err(WORKSPACE_NOT_FOUND)),
+            ""
+        );
+    }
+
+    #[test]
+    fn transient_error_keeps_persisted_workspace() {
+        let id = "8d3c0f4e-0000-4000-8000-000000000001";
+        for error in ["Failed to read workspaces.toml: Resource busy", "IPC timeout"] {
+            assert_eq!(workspace_selection_after_check(id.to_string(), id, Err(error)), id);
+        }
+        assert_eq!(workspace_selection_after_check(id.to_string(), id, Ok(())), id);
+    }
+
+    #[test]
+    fn selection_changed_during_check_is_kept() {
+        let stale = "8d3c0f4e-0000-4000-8000-000000000001";
+        let chosen = "8d3c0f4e-0000-4000-8000-000000000002";
+        assert_eq!(
+            workspace_selection_after_check(chosen.to_string(), stale, Err(WORKSPACE_NOT_FOUND)),
+            chosen
+        );
+        assert_eq!(
+            workspace_selection_after_check(String::new(), stale, Err(WORKSPACE_NOT_FOUND)),
+            ""
+        );
     }
 }

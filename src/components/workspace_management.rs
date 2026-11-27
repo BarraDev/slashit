@@ -17,6 +17,9 @@ pub fn WorkspaceManagement(on_changed: Callback<()>) -> impl IntoView {
     // empty list the view starts with or falls back to on a load error. Only
     // a loaded list can prove a Project's Workspace is missing.
     let (workspaces_loaded, set_workspaces_loaded) = signal(false);
+    // Whether the last registry read failed, as opposed to not having
+    // finished yet. Only a failed read is reported as one.
+    let (workspaces_failed, set_workspaces_failed) = signal(false);
     let (projects, set_projects) = signal::<Vec<Project>>(Vec::new());
     let (new_name, set_new_name) = signal(String::new());
     let (new_path, set_new_path) = signal(String::new());
@@ -51,10 +54,12 @@ pub fn WorkspaceManagement(on_changed: Callback<()>) -> impl IntoView {
             Ok(ws) => {
                 set_workspaces.set(ws);
                 set_workspaces_loaded.set(true);
+                set_workspaces_failed.set(false);
             }
             Err(e) => {
                 set_workspaces.set(Vec::new());
                 set_workspaces_loaded.set(false);
+                set_workspaces_failed.set(true);
                 toast::error(format!("Could not load workspaces: {}", e));
             }
         }
@@ -192,6 +197,7 @@ pub fn WorkspaceManagement(on_changed: Callback<()>) -> impl IntoView {
             <WorkspacePanel
                 workspaces=workspaces
                 workspaces_loaded=workspaces_loaded
+                workspaces_failed=workspaces_failed
                 projects=projects
                 on_membership_change=on_membership_change
             />
