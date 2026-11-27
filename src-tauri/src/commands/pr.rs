@@ -24859,6 +24859,88 @@ mod tests {
                 assert_eq!(recorded_pr_state(&after), recorded_pr_state(&before), "nothing recorded");
             }
 
+            /// PR link, refused before any owner ends: the link's answer is
+            /// published, then a newer OPEN at another head lands while the
+            /// Task lifecycle lease is still held by the test. The link waits
+            /// for that lease at admission, so the answer is stale when it is
+            /// checked and nothing is recorded.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn pr_link_refuses_an_answer_a_newer_reading_replaced_before_admission() {
+                use crate::pr_status::{PrKey, PrState, PrStatus, ChecksState};
+                use std::sync::atomic::Ordering;
+                let _guard = PATH_LOCK.lock().await;
+                let (state, task_id, executor, _tmp, _mock) = correction_at_approved_head().await;
+                let owner = executor.register_fake_running_execution_for_test(task_id).await;
+                let before = state.task.tasks.read().await[&task_id].clone();
+                let key = PrKey::new("testorg/testrepo", 9);
+                let statuses = state.pr_statuses.clone();
+                let lease = state
+                    .task_lifecycle_locks
+                    .acquire(task_id)
+                    .await
+                    .expect("the lease is free");
+
+                let (answer, ()) = tokio::join!(
+                    link_pr_to_task_reserved(&state, task_id, CORRECTION_PR, None),
+                    async move {
+                        while statuses.get(&key).and_then(|e| e.status).is_none() {
+                            tokio::task::yield_now().await;
+                        }
+                        statuses.remember(
+                            &key,
+                            PrStatus {
+                                state: PrState::Open,
+                                checks: ChecksState::Passing,
+                                failing_checks: vec![],
+                                failing_check_count: 0,
+                                review_decision: None,
+                                mergeable: None,
+                                merge_commit: None,
+                                head_oid: Some(OTHER_HEAD.to_string()),
+                            },
+                        );
+                        drop(lease);
+                    },
+                );
+                assert!(answer.is_err(), "a superseded answer is refused: {answer:?}");
+
+                let after = state.task.tasks.read().await[&task_id].clone();
+                assert!(!owner.load(Ordering::SeqCst), "the correction run is not ended");
+                assert_eq!(after.status, TaskStatus::HumanReview);
+                assert!(
+                    after.human_review.is_approved()
+                        && after.human_review.approved_tip() == Some(APPROVED_HEAD),
+                    "the approval of the approved commit stays current"
+                );
+                assert_eq!(after.human_review.entries, before.human_review.entries);
+                assert_eq!(after.pr_publication, before.pr_publication, "publication record");
+                assert_eq!(after.worktree_path, before.worktree_path, "checkout path");
+                assert_eq!(recorded_pr_state(&after), recorded_pr_state(&before), "nothing recorded");
+            }
+
+            /// PR link, a newer reading published while an admitted move waits
+            /// on its owner: the admitted move stands, as it does for Check now.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn pr_link_keeps_an_admitted_move_when_a_newer_reading_lands_while_the_owner_ends() {
+                let _guard = PATH_LOCK.lock().await;
+                let (state, task_id, executor, _tmp, _mock) = correction_at_approved_head().await;
+                let gated = executor.register_gated_running_execution_for_test(task_id).await;
+                let before = state.task.tasks.read().await[&task_id].clone();
+                let statuses = state.pr_statuses.clone();
+
+                let (answer, ()) = tokio::join!(
+                    link_pr_to_task_reserved(&state, task_id, CORRECTION_PR, None),
+                    land_newer_open_while_owner_ends(&gated, &statuses),
+                );
+                answer.expect("the link records the admitted move");
+
+                let after = state.task.tasks.read().await[&task_id].clone();
+                assert!(gated.cancel_seen.load(std::sync::atomic::Ordering::SeqCst), "the owner was ended");
+                assert_admitted_move_kept(&after, &before, "pr link");
+            }
+
             /// A published correction approved at APPROVED_HEAD, with no newer
             /// reading cached, so the first freshness check passes and the
             /// owner end is the next effect.

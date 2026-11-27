@@ -13442,6 +13442,179 @@ mod tests {
         assert_eq!(after.worktree_path, before.worktree_path, "checkout path");
     }
 
+    fn closed_reading() -> crate::pr_status::PrStatus {
+        crate::pr_status::PrStatus {
+            state: crate::pr_status::PrState::Closed,
+            checks: crate::pr_status::ChecksState::Passing,
+            failing_checks: vec![],
+            failing_check_count: 0,
+            review_decision: None,
+            mergeable: None,
+            merge_commit: None,
+            head_oid: None,
+        }
+    }
+
+    /// A correction move whose publishing write fails before it is published
+    /// records nothing. The owner end precedes that write and stays done, the
+    /// Task stays in Human Review with its approval, publication and Checkout,
+    /// and the failure says it will be retried. A new reading of the same state
+    /// and head is a new observation: it completes the move, and the owner that
+    /// is already gone is not ended again.
+    #[tokio::test]
+    async fn an_unpublished_correction_move_is_completed_by_a_new_reading_of_the_same_state_and_head() {
+        let recording = Arc::new(crate::events::RecordingEventSink::new());
+        let (executor, _temps) = test_executor_with_events(recording.clone());
+        let key = crate::pr_status::PrKey::new("owner/repo", 7);
+        let id = published_correction(&executor, TaskStatus::HumanReview).await;
+        let owner = executor.register_fake_running_execution_for_test(id).await;
+        let before = executor.tasks.read().await[&id].clone();
+        let first = executor.pr_statuses.observe(&key, open_reading(Some(APPROVED_AT)));
+
+        let fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::SyncTemp,
+            std::io::ErrorKind::Other,
+        );
+        executor.apply_polled_pr_state(id, &first).await.expect("observation applies");
+        drop(fault);
+
+        let after = executor.tasks.read().await[&id].clone();
+        assert_eq!(after.status, TaskStatus::HumanReview, "the move was not published");
+        assert!(
+            warn_message_containing(&recording, "will be retried"),
+            "an unpublished move says it will be retried: {:?}",
+            recording.recorded()
+        );
+        assert!(owner.load(std::sync::atomic::Ordering::SeqCst), "the owner end was already done");
+        assert_eq!(after.human_review.entries, before.human_review.entries, "approval history");
+        assert!(
+            after.human_review.is_approved() && after.human_review.approved_tip() == Some(APPROVED_AT),
+            "the approval of the approved commit stays current"
+        );
+        assert_eq!(after.pr_publication, before.pr_publication, "publication record");
+        assert_eq!(after.worktree_path, before.worktree_path, "checkout path");
+
+        let second = executor.pr_statuses.observe(&key, open_reading(Some(APPROVED_AT)));
+        assert_ne!(first.generation, second.generation, "a new publication is a new observation");
+        executor.apply_polled_pr_state(id, &second).await.expect("observation applies");
+
+        let done = executor.tasks.read().await[&id].clone();
+        assert_eq!(done.status, TaskStatus::PrCreated, "the retry completes the move");
+        assert!(
+            done.human_review.is_approved() && done.human_review.approved_tip() == Some(APPROVED_AT),
+            "the approval of the approved commit stays current"
+        );
+        assert_eq!(done.pr_publication, before.pr_publication, "publication record");
+        assert_eq!(done.worktree_path, before.worktree_path, "checkout path");
+        assert!(!executor.is_task_running(id).await, "the owner stays ended, not restarted");
+    }
+
+    /// The publishing write reached the file but was not confirmed durable. The
+    /// board holds the move in memory, the failure says its durability is
+    /// unconfirmed, and nothing is undone. A fresh reading of the same state
+    /// and head finds the move already made and records nothing new.
+    #[tokio::test]
+    async fn a_correction_move_published_but_not_confirmed_durable_is_adopted_and_not_repeated() {
+        let recording = Arc::new(crate::events::RecordingEventSink::new());
+        let (executor, _temps) = test_executor_with_events(recording.clone());
+        let key = crate::pr_status::PrKey::new("owner/repo", 7);
+        let id = published_correction(&executor, TaskStatus::HumanReview).await;
+        let owner = executor.register_fake_running_execution_for_test(id).await;
+        let before = executor.tasks.read().await[&id].clone();
+        let first = executor.pr_statuses.observe(&key, open_reading(Some(APPROVED_AT)));
+
+        let fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Other,
+        );
+        executor.apply_polled_pr_state(id, &first).await.expect("observation applies");
+        drop(fault);
+
+        let after = executor.tasks.read().await[&id].clone();
+        assert_eq!(after.status, TaskStatus::PrCreated, "memory follows the published file");
+        assert!(
+            warn_message_containing(&recording, "durability is unconfirmed"),
+            "the failure says the durability is unconfirmed: {:?}",
+            recording.recorded()
+        );
+        assert!(owner.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            after.human_review.is_approved() && after.human_review.approved_tip() == Some(APPROVED_AT),
+            "the approval of the approved commit stays current"
+        );
+        assert_eq!(after.pr_publication, before.pr_publication, "publication record");
+
+        let second = executor.pr_statuses.observe(&key, open_reading(Some(APPROVED_AT)));
+        executor.apply_polled_pr_state(id, &second).await.expect("observation applies");
+        let again = executor.tasks.read().await[&id].clone();
+        assert_eq!(again.status, TaskStatus::PrCreated, "idempotent: no second move");
+        assert_eq!(again.human_review.entries, after.human_review.entries, "no new approval entry");
+        assert_eq!(again.pr_publication, after.pr_publication, "publication record");
+    }
+
+    /// An observation published while an admitted move waits on its owner is
+    /// not revoked, and it is not lost: once the move is done, the next pass
+    /// applies it. Here it is a closure, which the Task in PR Created records.
+    #[tokio::test]
+    async fn a_newer_reading_published_during_an_accepted_move_is_processed_on_the_next_pass() {
+        let (executor, _temps) = test_executor();
+        let key = crate::pr_status::PrKey::new("owner/repo", 7);
+        let id = published_correction(&executor, TaskStatus::HumanReview).await;
+        let gated = executor.register_gated_running_execution_for_test(id).await;
+        let approved = executor.pr_statuses.observe(&key, open_reading(Some(APPROVED_AT)));
+
+        let (applied, closed) = tokio::join!(
+            executor.apply_polled_pr_state(id, &approved),
+            async {
+                while !gated.cancel_seen.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+                let closed = executor.pr_statuses.observe(&key, closed_reading());
+                gated.release.send(true).expect("the owner is waiting for release");
+                closed
+            },
+        );
+        applied.expect("observation applies");
+        assert_eq!(executor.tasks.read().await[&id].status, TaskStatus::PrCreated);
+
+        executor.apply_polled_pr_state(id, &closed).await.expect("observation applies");
+        let after = executor.tasks.read().await[&id].clone();
+        assert_eq!(recorded_pr_state(&after).as_deref(), Some("CLOSED"), "the next pass applies it");
+        assert_eq!(after.status, TaskStatus::PrCreated, "a closure never moves the task");
+    }
+
+    /// A cancelled shutdown and a timed-out retry each leave the owner
+    /// registered, so `is_task_running` keeps refusing a second execution for
+    /// the Task. Only the retry that joins the owner removes it.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_or_timed_out_owner_end_never_leaves_a_second_live_owner() {
+        let (executor, _temps) = test_executor();
+        let task = running_task(Uuid::new_v4());
+        let task_id = task.id;
+        executor.tasks.write().await.insert(task_id, task);
+        let owner = register_barrier_execution(&executor, task_id).await;
+
+        // Cancelled after the cancellation was sent, before the owner finished.
+        let mut stop = Box::pin(executor.end_task_owners_under_lease(task_id));
+        assert!(futures::FutureExt::now_or_never(stop.as_mut()).is_none());
+        owner.observed.await.expect("the owner observed the cancellation");
+        drop(stop);
+        assert!(executor.is_task_running(task_id).await, "the live owner blocks a second one");
+
+        // The retry times out while the owner still runs: it is put back.
+        let _lease = executor.lifecycle.acquire(task_id).await.expect("the lease is free");
+        assert!(executor.end_task_owners_under_lease(task_id).await.is_err());
+        assert!(executor.is_task_running(task_id).await, "still owned after a timeout");
+        assert!(executor.running_handles.read().await.contains_key(&task_id));
+
+        owner.release.send(()).expect("the owner is still waiting for release");
+        assert_eq!(
+            executor.end_task_owners_under_lease(task_id).await,
+            Ok(Some(TaskStatus::InProgress))
+        );
+        assert!(!executor.is_task_running(task_id).await, "the joined owner is gone");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn an_answer_a_newer_reading_replaced_is_not_acted_on() {
