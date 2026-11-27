@@ -2468,6 +2468,16 @@ impl HumanReviewRecord {
             .and_then(|e| e.approved_tip.as_deref())
     }
 
+    /// The commit of the most recent approval that recorded one, whether or not
+    /// that approval is still current.
+    pub fn latest_approved_tip(&self) -> Option<&str> {
+        self.entries
+            .iter()
+            .rev()
+            .filter(|e| e.decision == HumanReviewDecision::Approved)
+            .find_map(|e| e.approved_tip.as_deref())
+    }
+
     /// Whether the current approval still covers `branch_tip`, the tip of the
     /// Task branch now (`None` when the branch cannot be found). An approval
     /// authorizes the one commit it recorded and nothing built on or in place

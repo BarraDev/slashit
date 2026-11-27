@@ -53,6 +53,7 @@ Commands are registered in `lib.rs` using `tauri::generate_handler!`. All comman
 - `get_task_diff` - The patch of a Task's Git worktree against its base commit, in `commands/jj.rs`
 - `get_task_diff_stat` - The diffstat of the same range, in `commands/jj.rs`. In Human Review both answer with the branch tip's content (the commit an approval records), not the checkout's
 - `get_task_review_changes` - In Human Review: that tip, its diff, and the checkout's uncommitted edits as a separate diff against it, in `commands/jj.rs`. Answers nothing outside Human Review
+- `inspect_task_publication` - Before Publish to PR: the candidate commit, with its diffs against its first parent, the latest recorded approval and the remote branch head, in `commands/pr/publication.rs`. `publish_task_to_pr` requires that inspected remote head and refuses a moved one
 - `list_task_board_diagnostics` - The Task boards the startup load could not read, with the Project each belongs to and whether it is loaded, in `commands/task_boards.rs`. Read from that load's record, never from disk
 
 ## Two front ends, one backend

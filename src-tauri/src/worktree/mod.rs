@@ -24,7 +24,9 @@ pub use commit::{
     checkout_has_work, checkout_head_commit, checkout_snapshot, commit_checkout,
     commit_checkout_verified, CheckoutCommit,
 };
-pub use diff::{committed_task_diff, pending_task_diff, task_diff, TaskDiff, TaskDiffError};
+pub use diff::{
+    commit_parents, committed_task_diff, pending_task_diff, task_diff, TaskDiff, TaskDiffError,
+};
 pub use manager::{
     carries_locked_registration_notice, locked_registration_notice, CheckoutRegistration,
     CheckoutState, WorktreeInfo, WorktreeManager, WorktreeRecovery,

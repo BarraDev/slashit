@@ -120,7 +120,12 @@ pub struct StartObservation {
 
 /// Why a publication was refused before any push. Each message names the
 /// condition a person can act on.
-pub fn start_refusal(commit: &str, branch: &str, observed: &StartObservation) -> Option<String> {
+pub fn start_refusal(
+    commit: &str,
+    branch: &str,
+    inspected_remote_head: &str,
+    observed: &StartObservation,
+) -> Option<String> {
     let pr = &observed.pull_request;
     if !pr.open {
         return Some(
@@ -147,6 +152,11 @@ pub fn start_refusal(commit: &str, branch: &str, observed: &StartObservation) ->
         None => Some(
             "The pull request's branch is missing on the remote, so nothing was pushed. Restore \
              the branch on GitHub first."
+                .to_string(),
+        ),
+        Some(head) if head != inspected_remote_head => Some(
+            "The pull request's branch on the remote moved after you inspected it, so nothing was \
+             pushed. Choose Publish to PR again to compare the commit with the new remote head."
                 .to_string(),
         ),
         Some(_) if !observed.remote_head_is_ancestor => Some(
@@ -288,50 +298,58 @@ mod tests {
 
     #[test]
     fn a_ready_fast_forward_on_an_open_pull_request_may_start() {
-        assert_eq!(start_refusal(NEW, BRANCH, &ready()), None);
+        assert_eq!(start_refusal(NEW, BRANCH, OLD, &ready()), None);
     }
 
     #[test]
     fn a_closed_or_merged_pull_request_is_refused() {
         let mut observed = ready();
         observed.pull_request.open = false;
-        assert!(start_refusal(NEW, BRANCH, &observed).unwrap().contains("closed or merged"));
+        assert!(start_refusal(NEW, BRANCH, OLD, &observed).unwrap().contains("closed or merged"));
     }
 
     #[test]
     fn a_pull_request_for_another_head_or_not_this_branch_is_refused() {
         let mut other_head = ready();
         other_head.pull_request.head_branch = "someone-else".to_string();
-        assert!(start_refusal(NEW, BRANCH, &other_head).is_some());
+        assert!(start_refusal(NEW, BRANCH, OLD, &other_head).is_some());
 
         let mut not_own = ready();
         not_own.pull_request.is_branch_pull_request = false;
-        assert!(start_refusal(NEW, BRANCH, &not_own).is_some());
+        assert!(start_refusal(NEW, BRANCH, OLD, &not_own).is_some());
     }
 
     #[test]
     fn a_branch_that_moved_since_the_person_chose_the_commit_is_refused() {
         let mut moved = ready();
         moved.local_tip = Some(OLD.to_string());
-        assert!(start_refusal(NEW, BRANCH, &moved).unwrap().contains("no longer at the commit"));
+        assert!(start_refusal(NEW, BRANCH, OLD, &moved).unwrap().contains("no longer at the commit"));
 
         let mut missing = ready();
         missing.local_tip = None;
-        assert!(start_refusal(NEW, BRANCH, &missing).is_some());
+        assert!(start_refusal(NEW, BRANCH, OLD, &missing).is_some());
     }
 
     #[test]
     fn a_missing_remote_branch_is_refused() {
         let mut gone = ready();
         gone.remote_head = None;
-        assert!(start_refusal(NEW, BRANCH, &gone).unwrap().contains("missing on the remote"));
+        assert!(start_refusal(NEW, BRANCH, OLD, &gone).unwrap().contains("missing on the remote"));
+    }
+
+    #[test]
+    fn a_remote_head_other_than_the_inspected_one_is_refused_even_as_a_fast_forward() {
+        let mut moved = ready();
+        moved.remote_head = Some("3".repeat(40));
+        let message = start_refusal(NEW, BRANCH, OLD, &moved).unwrap();
+        assert!(message.contains("moved after you inspected it"));
     }
 
     #[test]
     fn a_non_fast_forward_is_refused_before_any_push() {
         let mut diverged = ready();
         diverged.remote_head_is_ancestor = false;
-        let message = start_refusal(NEW, BRANCH, &diverged).unwrap();
+        let message = start_refusal(NEW, BRANCH, OLD, &diverged).unwrap();
         assert!(message.contains("not be a fast-forward"));
         assert!(message.contains("nothing was forced"));
     }

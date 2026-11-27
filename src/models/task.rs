@@ -782,6 +782,37 @@ pub struct PrPublication {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Mirrors the backend `RevisionComparison`: what changes going from `from` to
+/// the publication candidate.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct RevisionComparison {
+    pub from: String,
+    #[serde(default)]
+    pub from_is_ancestor: Option<bool>,
+    pub patch: String,
+    pub stat: String,
+    /// Why the diff could not be read; an empty `patch` then means nothing.
+    #[serde(default)]
+    pub unavailable: Option<String>,
+}
+
+/// Mirrors the backend `PublicationInspection`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct PublicationInspection {
+    pub commit: String,
+    pub branch: String,
+    pub pr_url: String,
+    pub own_changes: RevisionComparison,
+    pub is_merge: bool,
+    #[serde(default)]
+    pub since_approval: Option<RevisionComparison>,
+    pub approval_is_current: bool,
+    #[serde(default)]
+    pub since_remote: Option<RevisionComparison>,
+    #[serde(default)]
+    pub remote_unavailable: Option<String>,
+}
+
 /// Mirrors the backend `UnconfirmedPrCreate`: the request to open a pull
 /// request whose outcome was never learned. It is also the token a recovery
 /// names, so the backend refuses a confirmation made for another attempt.
@@ -880,6 +911,16 @@ impl HumanReviewRecord {
         self.current_decision()
             .filter(|e| e.decision == HumanReviewDecision::Approved)
             .and_then(|e| e.approved_tip.as_deref())
+    }
+
+    /// The commit of the most recent approval that recorded one, current or
+    /// not. Same rule as the backend.
+    pub fn latest_approved_tip(&self) -> Option<&str> {
+        self.entries
+            .iter()
+            .rev()
+            .filter(|e| e.decision == HumanReviewDecision::Approved)
+            .find_map(|e| e.approved_tip.as_deref())
     }
 
     /// Changes requested in earlier reviews, oldest first: the feedback the

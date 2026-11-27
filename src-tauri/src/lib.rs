@@ -527,6 +527,7 @@ pub fn run() {
             get_qa_history,
             check_recurring_issues,
             approve_task,
+            inspect_task_publication,
             publish_task_to_pr,
             resolve_unconfirmed_pr_create,
             get_unconfirmed_pr_repository,

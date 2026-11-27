@@ -2,14 +2,14 @@
 //! The decisions behind the Publish to PR panel, free of signals and services
 //! so the host can test each rule.
 //!
-//! The panel shows a confirmation for one commit, one branch and one pull
-//! request. These functions decide whether that confirmation still describes
+//! The panel shows a confirmation for one inspected commit, branch, pull request
+//! and approved revision. These functions decide whether that confirmation still describes
 //! the live task, whether a publication answer belongs to the request that was
 //! sent, and which publication record the panel should show. The backend
 //! revalidates everything; these rules stop the panel from showing or sending
 //! a commit the person did not confirm.
 
-use crate::models::PrPublication;
+use crate::models::{PrPublication, PublicationInspection};
 
 /// What the person was shown when the confirmation opened. The publish action
 /// sends exactly these values and nothing read later.
@@ -18,6 +18,41 @@ pub struct PublishConfirmation {
     pub commit: String,
     pub branch: String,
     pub pr_url: String,
+    /// The approved revision the commit was compared with, and whether that
+    /// approval was current.
+    pub approval: Option<Approval>,
+}
+
+/// The latest approved commit, and whether its approval is the current one.
+pub type Approval = (String, bool);
+
+impl PublishConfirmation {
+    /// The confirmation an inspection describes.
+    pub fn of(inspection: &PublicationInspection) -> Self {
+        Self {
+            commit: inspection.commit.clone(),
+            branch: inspection.branch.clone(),
+            pr_url: inspection.pr_url.clone(),
+            approval: inspection
+                .since_approval
+                .as_ref()
+                .map(|c| (c.from.clone(), inspection.approval_is_current)),
+        }
+    }
+}
+
+/// The remote head a publication may be confirmed against. `None`, which keeps
+/// Publish unavailable, unless the candidate's own changes and its difference
+/// from that head were both read and can be inspected.
+pub fn inspected_remote_head(inspection: &PublicationInspection) -> Option<&str> {
+    if inspection.own_changes.unavailable.is_some() {
+        return None;
+    }
+    inspection
+        .since_remote
+        .as_ref()
+        .filter(|c| c.unavailable.is_none())
+        .map(|c| c.from.as_str())
 }
 
 /// The live task state a confirmation is checked against. `None` means the
@@ -27,15 +62,17 @@ pub struct LiveTarget<'a> {
     pub tip: Option<&'a str>,
     pub branch: Option<&'a str>,
     pub pr_url: Option<&'a str>,
+    pub approval: Option<(&'a str, bool)>,
 }
 
 /// Whether the confirmation still describes what a publish would send. Any
-/// change to the branch tip, the branch name or the pull request URL, and any
-/// missing value, means the person has not confirmed what would be published.
+/// change to the branch tip, the branch name, the pull request URL or the
+/// approval, and any missing value, means the person has not confirmed what would be published.
 pub fn confirmation_still_matches(shown: &PublishConfirmation, live: LiveTarget<'_>) -> bool {
     live.tip == Some(shown.commit.as_str())
         && live.branch == Some(shown.branch.as_str())
         && live.pr_url == Some(shown.pr_url.as_str())
+        && live.approval == shown.approval.as_ref().map(|(tip, current)| (tip.as_str(), *current))
 }
 
 /// Whether a publication answer is for the commit, branch and pull request the
@@ -70,7 +107,7 @@ pub fn shown_record<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::PublicationState;
+    use crate::models::{PublicationState, RevisionComparison};
     use chrono::{DateTime, Utc};
 
     const TIP: &str = "1111111111111111111111111111111111111111";
@@ -83,6 +120,7 @@ mod tests {
             commit: TIP.into(),
             branch: BRANCH.into(),
             pr_url: PR.into(),
+            approval: None,
         }
     }
 
@@ -95,6 +133,7 @@ mod tests {
             tip,
             branch,
             pr_url,
+            approval: None,
         }
     }
 
@@ -161,6 +200,50 @@ mod tests {
             &shown(),
             live(Some(TIP), Some(BRANCH), None)
         ));
+    }
+
+    #[test]
+    fn a_changed_approval_invalidates_the_confirmation() {
+        let approved = PublishConfirmation { approval: Some((NEXT.into(), true)), ..shown() };
+        let with = |approval| LiveTarget { approval, ..live(Some(TIP), Some(BRANCH), Some(PR)) };
+        assert!(confirmation_still_matches(&approved, with(Some((NEXT, true)))));
+        assert!(!confirmation_still_matches(&approved, with(Some((NEXT, false)))));
+        assert!(!confirmation_still_matches(&approved, with(Some((TIP, true)))));
+        assert!(!confirmation_still_matches(&approved, with(None)));
+        assert!(!confirmation_still_matches(&shown(), with(Some((NEXT, true)))));
+    }
+
+    fn comparison(from: &str, unavailable: Option<&str>) -> RevisionComparison {
+        RevisionComparison {
+            from: from.into(),
+            from_is_ancestor: Some(true),
+            patch: String::new(),
+            stat: String::new(),
+            unavailable: unavailable.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn publishing_needs_the_candidate_and_remote_diffs_to_have_been_read() {
+        let ready = PublicationInspection {
+            commit: TIP.into(),
+            branch: BRANCH.into(),
+            pr_url: PR.into(),
+            own_changes: comparison(NEXT, None),
+            is_merge: false,
+            since_approval: None,
+            approval_is_current: false,
+            since_remote: Some(comparison(NEXT, None)),
+            remote_unavailable: None,
+        };
+        assert_eq!(inspected_remote_head(&ready), Some(NEXT));
+        for blocked in [
+            PublicationInspection { since_remote: None, ..ready.clone() },
+            PublicationInspection { since_remote: Some(comparison(NEXT, Some("x"))), ..ready.clone() },
+            PublicationInspection { own_changes: comparison(NEXT, Some("x")), ..ready.clone() },
+        ] {
+            assert_eq!(inspected_remote_head(&blocked), None);
+        }
     }
 
     #[test]

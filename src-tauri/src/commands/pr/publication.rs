@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 //! Publish one reviewed commit to a Task's existing pull request.
 //!
-//! The person chooses Publish to PR after seeing the commit, the branch and
-//! the pull request. This command revalidates that choice against the
+//! The person chooses Publish to PR after inspecting the commit, its diffs, the
+//! branch and the pull request ([`inspect_task_publication`]). This command revalidates that choice against the
 //! repository and GitHub, records it durably, pushes exactly that commit
 //! through the pinned push, reads the remote branch back, and records the
 //! result. The decisions are in [`crate::domain::publication`]; this module
@@ -25,10 +25,13 @@
 //! `Published`. A repeat answered from an existing record reads nothing and
 //! settles nothing.
 //!
-//! Residual limits. The pull request is read again after the record is
-//! written and before the push, but GitHub can still merge or close it in the
-//! moments between that read and the push, and the push then reaches the
-//! branch. A repeated request for a commit already recorded as published
+//! Residual limits. The pull request and the remote branch are read again after
+//! the record is written and before the push, but GitHub can still merge or
+//! close the pull request in the moments between those reads and the push, and
+//! the push then reaches the branch. A remote head that moves in that window to
+//! another ancestor of the commit is pushed over as a fast-forward, although it
+//! is not the head the person inspected; any other move is refused by the
+//! remote. A repeated request for a commit already recorded as published
 //! from the same branch to the same pull request is answered from the record,
 //! without reading the remote again. A record of another branch or pull request
 //! never answers it: a pending one is settled for its own operation first, and
@@ -52,15 +55,124 @@ use crate::domain::publication::{
 use crate::domain::{Task, TaskStatus};
 use crate::lifecycle::{self, RecordWriteError};
 use crate::worktree::delivery::RemoteBranch;
-use crate::worktree::restack;
+use crate::worktree::{commit_parents, committed_task_diff, restack, TaskDiff};
+
+/// One revision compared with the publication candidate: what changes going
+/// from `from` to the candidate, read from Git objects.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RevisionComparison {
+    /// The full object ID compared against.
+    pub from: String,
+    /// Whether `from` is the candidate or one of its ancestors. `None` when Git
+    /// could not say. When it is not, the diff is still the content difference
+    /// between the two commits, not a list of changes the candidate adds.
+    pub from_is_ancestor: Option<bool>,
+    pub patch: String,
+    pub stat: String,
+    /// Why the diff could not be read. `patch` and `stat` are then empty, which
+    /// must not be read as "no changes".
+    pub unavailable: Option<String>,
+}
+
+/// What a person inspects before confirming a publication.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PublicationInspection {
+    /// The full object ID that would be published.
+    pub commit: String,
+    pub branch: String,
+    pub pr_url: String,
+    /// The candidate's own changes, against its first parent.
+    pub own_changes: RevisionComparison,
+    pub is_merge: bool,
+    /// Against the commit of the most recent approval that recorded one.
+    pub since_approval: Option<RevisionComparison>,
+    /// Whether that approval is the Task's current one.
+    pub approval_is_current: bool,
+    /// Against the pull request branch's head on `origin` as read now.
+    pub since_remote: Option<RevisionComparison>,
+    /// Why `since_remote` is absent: the remote branch is missing or unreadable.
+    pub remote_unavailable: Option<String>,
+}
+
+/// Read what publishing the task's branch would deliver. It pushes nothing and
+/// records nothing; it does ask `origin` for the branch, which updates that
+/// remote-tracking ref.
+#[tauri::command]
+pub async fn inspect_task_publication(
+    _gui: GuiMutation,
+    state: tauri::State<'_, crate::AppState>,
+    task_id: String,
+) -> Result<PublicationInspection, String> {
+    let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    inspect(&state, task_id).await
+}
+
+async fn compare(repo: &str, from: &str, commit: &str) -> RevisionComparison {
+    let from_is_ancestor = restack::is_ancestor(std::path::Path::new(repo), from, commit).await.ok();
+    let (diff, unavailable) = match committed_task_diff(repo, from, commit).await {
+        Ok(diff) => (diff, None),
+        Err(error) => (TaskDiff::default(), Some(error.to_string())),
+    };
+    RevisionComparison {
+        from: from.to_string(),
+        from_is_ancestor,
+        patch: diff.patch,
+        stat: diff.stat,
+        unavailable,
+    }
+}
+
+async fn inspect(state: &crate::AppState, task_id: Uuid) -> Result<PublicationInspection, String> {
+    let task = state.task.tasks.read().await.get(&task_id).cloned().ok_or("Task not found")?;
+    let branch = task
+        .branch_name
+        .clone()
+        .ok_or("This task has no branch recorded, so there is nothing to publish.")?;
+    let pr_url = pr_url_for_task(&task)?;
+    let repo = resolve_repository_dir(state, task_id).await?;
+    let commit = task_branch_tip(state, task_id)
+        .await?
+        .ok_or("The task's branch does not exist, so there is nothing to publish.")?;
+
+    let parents = commit_parents(&repo, &commit).await.map_err(|e| e.to_string())?;
+    let parent = parents.first().ok_or("The commit has no parent, so its own changes cannot be shown.")?;
+    let own_changes = compare(&repo, parent, &commit).await;
+
+    let approved = task.human_review.latest_approved_tip();
+    let since_approval = match approved {
+        Some(approved) => Some(compare(&repo, approved, &commit).await),
+        None => None,
+    };
+    let approval_is_current = approved.is_some() && task.human_review.approved_tip() == approved;
+
+    let remote = RemoteBranch::refresh(&repo, Some(branch.as_str())).await;
+    let (since_remote, remote_unavailable) = match remote_head_of(&remote) {
+        Ok(Some(head)) => (Some(compare(&repo, &head, &commit).await), None),
+        Ok(None) => (None, Some("The pull request's branch is missing on the remote.".to_string())),
+        Err(error) => (None, Some(error)),
+    };
+
+    Ok(PublicationInspection {
+        commit,
+        branch,
+        pr_url,
+        own_changes,
+        is_merge: parents.len() > 1,
+        since_approval,
+        approval_is_current,
+        since_remote,
+        remote_unavailable,
+    })
+}
 
 /// Publish `commit` to the task's pull request. Returns the durable record of
 /// the request, whatever its state: the caller shows `Published`, `Refused`
 /// and `Unknown` alike, and only for the commit it asked for.
 ///
 /// Authorization. A person's confirmation covers the commit, branch and pull
-/// request it showed. The request checks the branch and the pull request when it
-/// starts, and pushes the commit by object ID, so it never pushes a different
+/// request it showed, and the remote head it compared the commit with
+/// (`remote_head`). The request checks the branch, the pull request and that
+/// remote head before it pushes, and pushes the commit by object ID, so it never pushes a different
 /// commit. The Task's status and its Human Review approval are not part of that
 /// consent: publishing does not approve the Task. A move that ends the request's
 /// owner is honored at the request's checkpoints: before the pending record is
@@ -87,9 +199,10 @@ pub async fn publish_task_to_pr(
     branch: String,
     commit: String,
     pr_url: String,
+    remote_head: String,
 ) -> Result<PrPublication, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    publish(&state, task_id, &branch, &commit, &pr_url).await
+    publish(&state, task_id, &branch, &commit, &pr_url, &remote_head).await
 }
 
 /// Whether `commit` has the shape of a full object ID. A short ID is not
@@ -327,9 +440,13 @@ async fn publish(
     confirmed_branch: &str,
     commit: &str,
     pr_url: &str,
+    inspected_remote_head: &str,
 ) -> Result<PrPublication, String> {
     if !is_full_object_id(commit) {
         return Err("The commit to publish must be a full object ID.".to_string());
+    }
+    if !is_full_object_id(inspected_remote_head) {
+        return Err("The inspected remote head must be a full object ID.".to_string());
     }
     refuse_while_running(state, task_id).await?;
     // Serialized with every other lifecycle change and PR side effect for this
@@ -450,7 +567,7 @@ async fn publish(
         remote_head.clone(),
         now,
     );
-    if let Some(reason) = start_refusal(commit, &branch, &observed) {
+    if let Some(reason) = start_refusal(commit, &branch, inspected_remote_head, &observed) {
         // Nothing reached the remote. The refusal is recorded so the outcome
         // stays visible, and a new request may start afterwards.
         record.state = PublicationState::Refused { reason };
@@ -466,23 +583,32 @@ async fn publish(
         .map_err(|e| format!("{}. Nothing was pushed.", record_write_failure(e)))?;
 
     let pending = record.clone();
-    // The pull request is read again once the record is durable, so that a
-    // merge or close since the first read is not pushed into. This narrows the
-    // window to one GitHub read; it does not close it (see the module docs).
-    let recheck = match observe_pull_request(&working_dir, &branch, pr_url).await {
-        Ok((open, head_branch, own)) => StartObservation {
+    // The pull request and the remote branch are read again once the record is
+    // durable, so that a merge, close or new remote commit since the first read
+    // is not pushed into. This narrows the window; it does not close it (see the
+    // module docs).
+    let reread = async {
+        let (open, head_branch, own) = observe_pull_request(&working_dir, &branch, pr_url)
+            .await
+            .map_err(|e| format!("the pull request could not be read again before the push, so nothing was pushed: {e}"))?;
+        let remote = RemoteBranch::refresh(&working_dir, Some(branch.as_str())).await;
+        let head = remote_head_of(&remote)
+            .map_err(|e| format!("the remote branch could not be read again before the push, so nothing was pushed: {e}"))?;
+        Ok::<_, String>(StartObservation {
+            remote_head: head,
             pull_request: PullRequestObservation { open, head_branch, is_branch_pull_request: own },
             ..observed.clone()
-        },
-        Err(error) => {
-            record.state = PublicationState::Refused {
-                reason: format!("the pull request could not be read again before the push, so nothing was pushed: {error}"),
-            };
+        })
+    };
+    let recheck = match reread.await {
+        Ok(observation) => observation,
+        Err(reason) => {
+            record.state = PublicationState::Refused { reason };
             write_publication(state, task_id, Some(&pending), &record).await.map_err(record_write_failure)?;
             return Ok(record);
         }
     };
-    if let Some(reason) = start_refusal(commit, &branch, &recheck) {
+    if let Some(reason) = start_refusal(commit, &branch, inspected_remote_head, &recheck) {
         record.state = PublicationState::Refused { reason };
         write_publication(state, task_id, Some(&pending), &record).await.map_err(record_write_failure)?;
         return Ok(record);
@@ -569,7 +695,7 @@ mod orchestration {
     //! The publish command against a real bare remote. GitHub's answer is the
     //! only stand-in ([`super::test_seam`]); every Git effect is real.
 
-    use super::{publish, test_seam};
+    use super::{inspect, remote_head_of, test_seam};
     use crate::domain::publication::{PrPublication, PublicationState};
     use crate::domain::task::{FixEffect, HumanReviewRecord, PrReviewDecision, PrReviewItem, PrReviewPlan};
     use crate::domain::{AgentConfig, AgentType, Project, ProjectScope, Repository, Task, TaskStatus};
@@ -581,6 +707,22 @@ mod orchestration {
 
     const PR: &str = "https://github.com/BarraDev/slashit/pull/9";
     const BRANCH: &str = "task-branch";
+
+    /// A request confirmed against the remote head as it is now, as by a person
+    /// who has just inspected it. When the remote cannot be read, a head that
+    /// matches nothing stands in.
+    async fn publish(
+        state: &crate::AppState,
+        task_id: Uuid,
+        branch: &str,
+        commit: &str,
+        pr_url: &str,
+    ) -> Result<PrPublication, String> {
+        let dir = state.repository.repositories.read().await.values().next().unwrap().local_path.clone();
+        let remote = delivery::RemoteBranch::refresh(&dir, Some(BRANCH)).await;
+        let head = remote_head_of(&remote).ok().flatten().unwrap_or_else(|| "0".repeat(40));
+        super::publish(state, task_id, branch, commit, pr_url, &head).await
+    }
 
     fn git(dir: &Path, args: &[&str]) -> String {
         let output = std::process::Command::new("git")
@@ -1560,5 +1702,98 @@ mod orchestration {
 
         assert_eq!(record.state, PublicationState::Published {});
         assert!(fx.task().await.pr_review_plan.is_none());
+    }
+
+    #[tokio::test]
+    async fn inspection_labels_the_candidate_and_its_three_comparisons_without_pushing() {
+        let fx = fixture().await;
+        let approved = fx.commit("approved");
+        let parent = fx.commit("middle");
+        let candidate = fx.commit("candidate");
+        {
+            let mut tasks = fx.state.task.tasks.write().await;
+            let review = &mut tasks.get_mut(&fx.task_id).unwrap().human_review;
+            review.approve(Some(approved.clone()), chrono::Utc::now());
+            review.record_arrival();
+        }
+
+        let seen = inspect(&fx.state, fx.task_id).await.unwrap();
+
+        assert_eq!((seen.commit.as_str(), seen.branch.as_str(), seen.pr_url.as_str()), (candidate.as_str(), BRANCH, PR));
+        assert_eq!(seen.own_changes.from, parent);
+        assert!(seen.own_changes.patch.contains("b/candidate"));
+        assert!(!seen.own_changes.patch.contains("b/middle"));
+        assert!(!seen.is_merge);
+        let since_approval = seen.since_approval.expect("an earlier approval is compared");
+        assert_eq!(since_approval.from, approved);
+        assert!(since_approval.patch.contains("b/middle") && since_approval.patch.contains("b/candidate"));
+        assert!(!since_approval.patch.contains("b/approved"));
+        assert!(!seen.approval_is_current, "an approval from an earlier review round is not current");
+        let since_remote = seen.since_remote.expect("the remote head is compared");
+        assert_eq!(since_remote.from, fx.base);
+        assert_eq!(since_remote.from_is_ancestor, Some(true));
+        assert!(since_remote.patch.contains("b/approved") && since_remote.patch.contains("b/candidate"));
+        assert_eq!(fx.remote_head().as_deref(), Some(fx.base.as_str()));
+        assert!(fx.record().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn inspection_reports_an_unreadable_remote_and_a_missing_approved_commit_as_unavailable() {
+        let fx = fixture().await;
+        fx.commit("one");
+        fx.state
+            .task
+            .tasks
+            .write()
+            .await
+            .get_mut(&fx.task_id)
+            .unwrap()
+            .human_review
+            .approve(Some("f".repeat(40)), chrono::Utc::now());
+        git(&fx.checkout, &["remote", "set-url", "origin", "/nonexistent/remote.git"]);
+
+        let seen = inspect(&fx.state, fx.task_id).await.unwrap();
+
+        let since_approval = seen.since_approval.expect("the approval is still named");
+        assert!(since_approval.unavailable.is_some());
+        assert!(seen.approval_is_current);
+        assert!(seen.since_remote.is_none());
+        assert!(seen.remote_unavailable.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_remote_head_that_moved_after_inspection_is_refused_without_a_push() {
+        let fx = fixture().await;
+        let c1 = fx.commit("one");
+        let c2 = fx.commit("two");
+        test_seam::fix_observation(true, BRANCH, true);
+        // The person inspected `base`; the remote has since advanced to `c1`,
+        // from which `c2` would still be a fast-forward.
+        git(&fx.checkout, &["push", "-q", "origin", &format!("{c1}:refs/heads/{BRANCH}")]);
+
+        let record = super::publish(&fx.state, fx.task_id, BRANCH, &c2, PR, &fx.base).await.unwrap();
+
+        assert!(matches!(&record.state, PublicationState::Refused { reason } if reason.contains("moved after you inspected")));
+        assert_eq!(fx.remote_head().as_deref(), Some(c1.as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_remote_head_that_moves_while_the_request_prepares_stops_the_push() {
+        let fx = fixture().await;
+        let c1 = fx.commit("one");
+        let c2 = fx.commit("two");
+        test_seam::fix_observation(true, BRANCH, true);
+        let (checkout, moved) = (fx.checkout.clone(), format!("{c1}:refs/heads/{BRANCH}"));
+        test_seam::hook_observation_after(
+            1,
+            Box::new(move || {
+                git(&checkout, &["push", "-q", "origin", &moved]);
+            }),
+        );
+
+        let record = super::publish(&fx.state, fx.task_id, BRANCH, &c2, PR, &fx.base).await.unwrap();
+
+        assert!(matches!(&record.state, PublicationState::Refused { reason } if reason.contains("moved after you inspected")));
+        assert_eq!(fx.remote_head().as_deref(), Some(c1.as_str()));
     }
 }

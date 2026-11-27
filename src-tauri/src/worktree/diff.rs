@@ -111,6 +111,13 @@ pub async fn committed_task_diff(
     Ok(TaskDiff { patch, stat })
 }
 
+/// The parents of `commit`, first parent first. Empty for a root commit.
+pub async fn commit_parents(repo: &str, commit: &str) -> Result<Vec<String>, TaskDiffError> {
+    require_full_oid(commit)?;
+    let listed = run_git(repo, &["rev-list", "--parents", "-n", "1", commit, "--"]).await?;
+    Ok(listed.split_whitespace().skip(1).map(str::to_string).collect())
+}
+
 /// What a Task Checkout holds that `commit` does not: staged, unstaged and
 /// untracked edits. While a person decides on `commit`, these are shown apart
 /// from it, because approving covers the commit and not them.
