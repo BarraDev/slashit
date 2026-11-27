@@ -335,6 +335,39 @@ pull request exists, the approval is not renewed; the pull request's review and
 merge decide later changes. A Task without a recorded GitHub pull request is
 judged by its branch alone.
 
+### Corrections after a pull request exists
+
+Status: design, not yet implemented. Until the implementation Tasks in
+[post-pr-corrections.md](post-pr-corrections.md#implementation-tasks) land,
+the behavior above is what ships: a Task in PR Created cannot be sent back for
+correction, and its approval is not renewed. The full contract, its
+transitions, failure cases and tests are in that document; this section
+states the product decisions both documents share.
+
+- **Two instruction sources, one lifecycle.** Native Request Changes and PR
+  Comment Review are separate sources of correction instructions. Both feed
+  the same correction lifecycle, which owns execution, persistence, recovery,
+  approval provenance and publication. There is no separate correction engine
+  per source.
+- **Approval and publication are separate.** Approving the corrected commit
+  records a decision and does not update the pull request. Publishing the
+  approved commit to the existing pull request is its own step (the Approve &
+  Update PR action, or Publish to PR), and the earlier approval stays in the
+  history as a separate, stale entry.
+- **G1 is scoped to an active correction.** While a post-PR correction is
+  active, a CLOSED pull request answer records only the pull request's state;
+  the correction's status, Run and Task Checkout are kept. CLOSED behavior for
+  any other Task is unchanged.
+- **G2 needs full remote-head provenance.** A published correction is
+  delivered, and a Task moves back to PR Created, only when the approval is
+  current, the open pull request reports a full head equal to the approved
+  commit, and `pr_publication` records that commit as published to that pull
+  request. Anything less is "not yet observed": the Task stays in Human Review
+  and the approval stays current.
+- **Rule D is unchanged.** A merged pull request completes a Task only when
+  the exact approved revision is the one merged. Otherwise the Task is held for
+  a person to decide.
+
 ### Local delivery
 
 A Task whose changes a person approved can be finished without a pull request:
