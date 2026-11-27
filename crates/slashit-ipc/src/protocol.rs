@@ -60,6 +60,11 @@ pub enum IpcRequest {
     /// Read one Task's delivery: its pull request, failures and agent requests
     /// to open one. Never writes.
     GetDeliveryState { task_id: String },
+    /// Read one Task's PR Comment Review: its stored analysis, each finding
+    /// with the Human's override, decision and approval, and what was fixed
+    /// and published. Answered from the Task record alone: never analyzes,
+    /// starts an agent, changes an approval or edits the plan.
+    GetPrCommentReview { task_id: String },
     /// File a request for a person to decide in the desktop app. `operation` is
     /// `approve` or `open_pr`, `commit` the full object ID it is about, and
     /// `actor` the name the agent gives itself. Approves, authorizes and
@@ -179,6 +184,7 @@ impl IpcRequest {
                 | Self::GetTaskEvidence { .. }
                 | Self::GetReviewState { .. }
                 | Self::GetDeliveryState { .. }
+                | Self::GetPrCommentReview { .. }
                 | Self::QueueStatus
                 | Self::ListTerminals
                 | Self::Features
@@ -237,6 +243,7 @@ impl IpcRequest {
             Self::GetTaskEvidence { .. } => "get_task_evidence",
             Self::GetReviewState { .. } => "get_review_state",
             Self::GetDeliveryState { .. } => "get_delivery_state",
+            Self::GetPrCommentReview { .. } => "get_pr_comment_review",
             Self::RequestOperation { .. } => "request_operation",
             Self::OpenPr { .. } => "open_pr",
             Self::CreateTask { .. } => "create_task",
@@ -630,8 +637,10 @@ mod tests {
         for read in [
             IpcRequest::GetReviewState { task_id: task_id.clone() },
             IpcRequest::GetDeliveryState { task_id: task_id.clone() },
+            IpcRequest::GetPrCommentReview { task_id: task_id.clone() },
         ] {
             assert!(!read.is_mutating(), "{} changes nothing", read.verb());
+            assert!(!read.spawns_agent(), "{}", read.verb());
             assert!(!read.needs_verified_peer());
         }
         for write in [

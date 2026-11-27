@@ -7,6 +7,7 @@
 //!
 //! - [`protocol`] — the command set, the envelope, the response.
 //! - [`framing`] — how one message is delimited and bounded.
+//! - [`pr_comment_review`] — the shape of a read PR Comment Review.
 //! - [`transport`] — how bytes move, and what the OS proves about the peer.
 //! - [`auth`] — bearer tokens, for transports the OS does not access-control.
 //! - [`config`] — which listeners exist and where clients look.
@@ -24,6 +25,7 @@ pub mod client;
 pub mod config;
 pub mod endpoint;
 pub mod framing;
+pub mod pr_comment_review;
 pub mod protocol;
 pub mod transport;
 
@@ -38,6 +40,7 @@ pub const APPLICATION: &str = "slashit-app";
 pub use auth::{AuthToken, Credentials};
 pub use config::{IpcConfig, TcpConfig};
 pub use endpoint::{socket_path, Endpoint};
+pub use pr_comment_review::PrCommentReview;
 pub use protocol::{
     is_valid_operation_id, AppStatus, FeatureFlagInfo, InstanceInfo, IpcEnvelope, IpcRequest,
     IpcResponse, ProjectSummary, QueueStatusInfo, QuiesceInfo, TaskSummary, TerminalSummary,

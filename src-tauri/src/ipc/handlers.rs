@@ -66,6 +66,9 @@ pub async fn dispatch(req: IpcRequest, ctx: &IpcContext, peer: &PeerContext) -> 
         IpcRequest::GetDeliveryState { task_id } => {
             Dispatch::reply(handle_get_delivery_state(ctx, task_id).await)
         }
+        IpcRequest::GetPrCommentReview { task_id } => {
+            Dispatch::reply(handle_get_pr_comment_review(ctx, task_id).await)
+        }
         IpcRequest::RequestOperation {
             task_id,
             operation,
@@ -311,6 +314,20 @@ async fn handle_get_task(ctx: &IpcContext, task_id: String) -> IpcResponse {
         },
         None => IpcResponse::error(format!("Task {task_id} not found")),
     }
+}
+
+/// One Task's PR Comment Review, read from a copy of the Task record taken
+/// under the board's read lock. The builder is a pure function of that copy:
+/// it reaches no analyzer, agent runner, approval writer or storage.
+async fn handle_get_pr_comment_review(ctx: &IpcContext, task_id: String) -> IpcResponse {
+    let task_uuid = match Uuid::parse_str(&task_id) {
+        Ok(id) => id,
+        Err(_) => return IpcResponse::error("Invalid task_id: expected a UUID"),
+    };
+    let Some(task) = ctx.tasks.read().await.get(&task_uuid).cloned() else {
+        return IpcResponse::error(format!("Task {task_id} not found"));
+    };
+    json_reply(Ok(crate::commands::pr::pr_comment_review(&task)))
 }
 
 // --- Agent review and delivery -----------------------------------------------
@@ -6062,5 +6079,95 @@ mod evidence_bounds_and_redaction {
             reason.contains(slashit_activity::MASK),
             "the credential is masked on the echo: {reason}"
         );
+    }
+}
+
+/// `GetPrCommentReview` is a read: it answers from the Task record and
+/// reaches nothing that analyzes, runs an agent or records a decision.
+#[cfg(all(test, unix))]
+mod pr_comment_review_read {
+    use super::*;
+    use crate::test_helpers::{
+        create_test_pr_review_setup, files_under, ipc_test_context, FakeProgram,
+    };
+    use slashit_ipc::Endpoint;
+    use std::sync::Arc;
+
+    /// The analyzer and the fix agents run `claude` (or `opencode`), and
+    /// publication runs `gh`; each is replaced by a fake that logs a launch.
+    /// The context has no application state, so no approval writer is
+    /// reachable, and no executor, so no run can start. The read must leave
+    /// the Task, the files under the instance's roots, the event sink and the
+    /// executor exactly as they were, and launch none of the programs.
+    #[tokio::test]
+    async fn the_read_calls_no_analyzer_agent_runner_or_approval_writer() {
+        let fake = FakeProgram::install("claude", "exit 1").await;
+        fake.add("opencode", "exit 1");
+        fake.add("gh", "exit 1");
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let mut ctx = ipc_test_context(paths);
+        let sink = Arc::new(crate::events::RecordingEventSink::new());
+        ctx.events = sink.clone();
+
+        let (mut task, plan) = create_test_pr_review_setup();
+        task.pr_review_plan = Some(plan);
+        let task_id = task.id;
+        ctx.tasks.write().await.insert(task_id, task.clone());
+        let files_before = files_under(tmp.path());
+
+        let peer = PeerContext {
+            endpoint: Endpoint::Unix {
+                path: std::path::PathBuf::from("/nonexistent-for-tests"),
+            },
+            os_verified: true,
+        };
+        let request = IpcRequest::GetPrCommentReview {
+            task_id: task_id.to_string(),
+        };
+        assert!(!request.is_mutating() && !request.spawns_agent());
+        let reply = dispatch(request, &ctx, &peer).await.response;
+        assert!(reply.ok, "{:?}", reply.error);
+        let view: slashit_ipc::PrCommentReview =
+            serde_json::from_value(reply.data).expect("the answer is a PR Comment Review");
+        assert_eq!(view.plan.expect("the plan is shown").findings.len(), 2);
+
+        let after = serde_json::to_value(ctx.tasks.read().await.get(&task_id).unwrap()).unwrap();
+        assert_eq!(after, serde_json::to_value(&task).unwrap(), "the Task is unchanged");
+        assert_eq!(files_under(tmp.path()), files_before, "nothing was written");
+        assert!(sink.recorded().is_empty(), "no event was emitted");
+        assert!(ctx.executor.get().is_none(), "no executor was reached");
+        for program in ["claude", "opencode", "gh"] {
+            assert_eq!(fake.launches(program), 0, "{program} was launched");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_or_malformed_task_is_refused() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let ctx = ipc_test_context(Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        )));
+        let peer = PeerContext {
+            endpoint: Endpoint::Unix {
+                path: std::path::PathBuf::from("/nonexistent-for-tests"),
+            },
+            os_verified: true,
+        };
+        for task_id in ["not-a-uuid".to_string(), Uuid::new_v4().to_string()] {
+            let reply = dispatch(IpcRequest::GetPrCommentReview { task_id }, &ctx, &peer)
+                .await
+                .response;
+            assert!(!reply.ok);
+        }
     }
 }
