@@ -401,6 +401,7 @@ pub async fn create_task_from_issue(
         reviewer_model: None,
         new_attempt: None,
         new_attempt_confirmed: false,
+        continuation_instructions: Vec::new(),
         approved_execution: None,
         executed_approvals: Vec::new(),
         agent_requests: Vec::new(),

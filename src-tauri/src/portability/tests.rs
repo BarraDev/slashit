@@ -438,6 +438,7 @@ fn live_runtime_and_execution_authority_fields_are_not_portable() {
         "local_integration",
         "cleanup_in_flight",
         "new_attempt",
+        "continuation_instructions",
         "pr_review_plan",
         "pr_error",
         "state_location",

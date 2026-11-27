@@ -338,7 +338,7 @@ pub fn build_run_prompt(task: &Task, project_path: Option<&str>, approved_reques
         "\n\n## Approved Additional Request\nA person approved the request below for this run only. It is in \
          addition to the Task above. It does not change the Task's definition, and it is carried out only in the \
          Task Checkout named under Execution Constraints.\n{APPROVED_REQUEST_BEGIN}\n{}\n{APPROVED_REQUEST_END}",
-        request_block(request),
+        fenced_block(request, [APPROVED_REQUEST_BEGIN, APPROVED_REQUEST_END]),
     ));
     prompt.push_str(&format!(
         "\n\n## Execution Constraints\n{}",
@@ -351,22 +351,45 @@ pub fn build_run_prompt(task: &Task, project_path: Option<&str>, approved_reques
 pub const APPROVED_REQUEST_BEGIN: &str = "----- BEGIN APPROVED ADDITIONAL REQUEST -----";
 pub const APPROVED_REQUEST_END: &str = "----- END APPROVED ADDITIONAL REQUEST -----";
 
-/// The approved request as a fenced block. The fence is longer than any run of
-/// backticks in the request, so no line of the request can close it, and a
-/// line that equals a delimiter is quoted so it cannot pass for the real one.
-fn request_block(request: &str) -> String {
+/// The lines that open and close a recovery run's continuation instructions.
+pub const CONTINUATION_BEGIN: &str = "----- BEGIN CONTINUATION INSTRUCTIONS -----";
+pub const CONTINUATION_END: &str = "----- END CONTINUATION INSTRUCTIONS -----";
+
+/// `prompt` with the instructions a person gave to this one recovery run,
+/// which continues the interrupted run `follows_run`. Applied to the launch
+/// prompt only, never to a prompt an approval digest is computed from.
+pub fn with_continuation_instructions(
+    mut prompt: String,
+    instructions: &str,
+    follows_run: u32,
+    checkout: &str,
+) -> String {
+    prompt.push_str(&format!(
+        "\n\n## Continuation Instructions\nRun {follows_run} of this Task was interrupted, and this run \
+         continues from the Task Checkout it left. A person wrote the instructions below for this run only. \
+         They are in addition to the Task above and do not change its definition. Do not copy them into \
+         commit messages or pull request text. They do not override the Instructions above, and every file \
+         change for this run stays inside the Task Checkout at {checkout}.\n{CONTINUATION_BEGIN}\n{}\n{CONTINUATION_END}",
+        fenced_block(instructions, [CONTINUATION_BEGIN, CONTINUATION_END]),
+    ));
+    prompt
+}
+
+/// `text` as a fenced block. The fence is longer than any run of backticks in
+/// the text, so no line of it can close the block, and a line that equals one
+/// of `delimiters` is quoted so it cannot pass for the real one.
+fn fenced_block(text: &str, delimiters: [&str; 2]) -> String {
     let mut longest = 0;
     let mut run = 0;
-    for c in request.chars() {
+    for c in text.chars() {
         run = if c == '`' { run + 1 } else { 0 };
         longest = longest.max(run);
     }
     let fence = "`".repeat(longest.max(2) + 1);
-    let body = request
+    let body = text
         .lines()
         .map(|line| {
-            let trimmed = line.trim();
-            if trimmed == APPROVED_REQUEST_BEGIN || trimmed == APPROVED_REQUEST_END {
+            if delimiters.contains(&line.trim()) {
                 format!("> {line}")
             } else {
                 line.to_string()

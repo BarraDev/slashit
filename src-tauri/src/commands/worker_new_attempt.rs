@@ -24,7 +24,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::commands::gui_admission::GuiMutation;
-use crate::domain::task::{ActivityKind, NewAttemptDecision, Task, TaskStatus, WorkerHandoffStage};
+use crate::domain::task::{
+    ActivityKind, NewAttemptDecision, Task, TaskStatus, WorkerHandoffStage,
+    MAX_CONTINUATION_INSTRUCTIONS_CHARS,
+};
 
 /// The decision a person made on what the recovery view showed. Every field is
 /// a compare-and-set expectation: the decision applies only if it still holds.
@@ -49,6 +52,10 @@ pub struct AuthorizeNewAttemptRequest {
     pub expected_head: String,
     /// The fingerprint of the uncommitted work the person inspected.
     pub dirty_fingerprint: String,
+    /// What the new run should be told, in addition to the Task. Surrounding
+    /// whitespace is dropped, and blank text means none.
+    #[serde(default)]
+    pub instructions: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -181,6 +188,7 @@ pub(crate) async fn new_attempt_evidence(
         checkout,
         expected_head: inspection.head,
         dirty_fingerprint: inspection.dirty_fingerprint,
+        instructions: None,
     };
     match prepare(state, &task, &request).await {
         Ok(_) => evidence.eligible = true,
@@ -225,6 +233,7 @@ fn same_request(decision: &NewAttemptDecision, request: &AuthorizeNewAttemptRequ
         && decision.checkout_path == request.checkout
         && decision.expected_head == request.expected_head
         && decision.dirty_fingerprint == request.dirty_fingerprint
+        && decision.instructions == request.instructions
 }
 
 /// Whether the Task still shows the recovery the person was shown.
@@ -388,6 +397,7 @@ async fn prepare(
                     expected_head: request.expected_head.clone(),
                     dirty_fingerprint: request.dirty_fingerprint.clone(),
                     dirty_paths: inspection.dirty_paths.clone(),
+                    instructions: request.instructions.clone(),
                     authorized_at: chrono::Utc::now(),
                 };
                 if let Err(message) = crate::worktree::new_attempt::confirm(&candidate, &inspection)
@@ -408,8 +418,21 @@ async fn prepare(
 /// they were shown. It runs no provider.
 pub(crate) async fn record_decision(
     state: &crate::AppState,
-    request: AuthorizeNewAttemptRequest,
+    mut request: AuthorizeNewAttemptRequest,
 ) -> Result<AuthorizeNewAttemptOutcome, String> {
+    request.instructions = request
+        .instructions
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    if request
+        .instructions
+        .as_ref()
+        .is_some_and(|text| text.chars().count() > MAX_CONTINUATION_INSTRUCTIONS_CHARS)
+    {
+        return refused(format!(
+            "The continuation instructions are longer than {MAX_CONTINUATION_INSTRUCTIONS_CHARS} characters. Shorten them and try again."
+        ));
+    }
     if !is_object_id(&request.expected_head) {
         return refused("The branch HEAD you inspected is not a full object id.");
     }
@@ -646,6 +669,7 @@ mod tests {
                 checkout: self.checkout_path(),
                 expected_head: self.head(),
                 dirty_fingerprint,
+                instructions: None,
             }
         }
 
@@ -1728,5 +1752,212 @@ mod tests {
             "{:?}",
             evidence.refusals
         );
+    }
+
+    fn instructed(
+        mut request: AuthorizeNewAttemptRequest,
+        text: &str,
+    ) -> AuthorizeNewAttemptRequest {
+        request.instructions = Some(text.to_string());
+        request
+    }
+
+    /// A provider that keeps the prompt it was given in `prompt` and keeps running.
+    async fn capturing_agent(prompt: &Path) -> FakeProgram {
+        let script = format!("cat >'{}'; sleep 20", prompt.display());
+        FakeProgram::install("claude", &script).await
+    }
+
+    async fn captured(prompt: &Path, expected: &str) -> String {
+        for _ in 0..100 {
+            let text = std::fs::read_to_string(prompt).unwrap_or_default();
+            if text.contains(expected) {
+                return text;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the provider never received {expected:?}");
+    }
+
+    #[tokio::test]
+    async fn instructions_reach_the_attempt_and_are_recorded_for_its_run_only() {
+        let fx = fixture().await;
+        let prompt_file = fx._tmp.path().join("prompt");
+        let _agent = capturing_agent(&prompt_file).await;
+        fx.edit(|t| t.description = Some("the original description".into()))
+            .await;
+        let id = Uuid::new_v4();
+        record_decision(
+            &fx.state,
+            instructed(fx.request(id).await, "  finish the parser tests \n"),
+        )
+        .await
+        .unwrap();
+        assert!(fx.task().await.continuation_instructions.is_empty(), "no run has them yet");
+        let executor = fx.state.executor.get().unwrap().clone();
+
+        executor.start_new_attempt(fx.task_id, id).await.unwrap();
+
+        let prompt = captured(&prompt_file, "finish the parser tests").await;
+        assert!(prompt.contains(crate::queue::prompt::CONTINUATION_BEGIN));
+        assert!(prompt.contains("Run 1 of this Task was interrupted"));
+        for task in [fx.task().await, fx.on_disk()] {
+            let [recorded] = task.continuation_instructions.as_slice() else {
+                panic!("{:?}", task.continuation_instructions);
+            };
+            assert_eq!((recorded.run, recorded.follows_run), (2, 1));
+            assert_eq!(recorded.decision_id, id);
+            assert_eq!(recorded.instructions, "finish the parser tests");
+            assert_eq!(task.description.as_deref(), Some("the original description"));
+            assert_eq!(task.worktree_path.as_deref().map(Path::new).map(|p| p.canonicalize().unwrap()),
+                Some(fx.checkout.canonicalize().unwrap()));
+            assert!(task.activity.iter().any(|e| matches!(e.kind, ActivityKind::RunStarted { run: 1, .. })));
+        }
+        executor.stop_task(fx.task_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_decision_id_cannot_be_reused_with_other_instructions() {
+        let fx = fixture().await;
+        let id = Uuid::new_v4();
+        let request = instructed(fx.request(id).await, "first");
+        record_decision(&fx.state, request.clone()).await.unwrap();
+        let before = fx.board().await;
+
+        let repeat = record_decision(&fx.state, instructed(request.clone(), " first "))
+            .await
+            .unwrap();
+        assert!(
+            matches!(repeat, AuthorizeNewAttemptOutcome::AlreadyAuthorized { .. }),
+            "{repeat:?}"
+        );
+        for other in [Some("second".to_string()), None] {
+            let mut changed = request.clone();
+            changed.instructions = other;
+            let reason = refusal(record_decision(&fx.state, changed).await);
+            assert!(reason.contains("different request"), "{reason}");
+        }
+        assert_eq!(fx.board().await, before);
+    }
+
+    #[tokio::test]
+    async fn blank_instructions_are_none_and_oversized_ones_are_refused_without_a_write() {
+        let fx = fixture().await;
+        let before = fx.board().await;
+        let long = "x".repeat(MAX_CONTINUATION_INSTRUCTIONS_CHARS + 1);
+        let request = instructed(fx.request(Uuid::new_v4()).await, &long);
+
+        let reason = refusal(record_decision(&fx.state, request).await);
+
+        assert!(reason.contains("longer than"), "{reason}");
+        assert_eq!(fx.board().await, before);
+        let blank = instructed(fx.request(Uuid::new_v4()).await, " \n\t ");
+        record_decision(&fx.state, blank).await.unwrap();
+        assert_eq!(fx.task().await.new_attempt.unwrap().instructions, None);
+    }
+
+    #[tokio::test]
+    async fn a_refused_start_records_no_instructions_for_any_run() {
+        let fx = fixture().await;
+        let agent = FakeProgram::install("claude", "cat >/dev/null; sleep 20").await;
+        let id = Uuid::new_v4();
+        record_decision(&fx.state, instructed(fx.request(id).await, "continue"))
+            .await
+            .unwrap();
+        fx.write("notes.txt", "changed after the decision");
+        let before = fx.board().await;
+        let executor = fx.state.executor.get().unwrap().clone();
+
+        executor.start_new_attempt(fx.task_id, id).await.unwrap_err();
+
+        assert_eq!(fx.board().await, before);
+        assert!(fx.task().await.continuation_instructions.is_empty());
+        assert_eq!(agent.invocations(), "");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_restart_before_the_start_drops_the_instructions_with_the_authorization() {
+        let fx = fixture().await;
+        let agent = FakeProgram::install("claude", "cat >/dev/null; sleep 20").await;
+        let id = Uuid::new_v4();
+        record_decision(&fx.state, instructed(fx.request(id).await, "continue"))
+            .await
+            .unwrap();
+
+        let (state, executor) = restart(&fx).await;
+
+        let task = task_in(&state, fx.task_id).await;
+        assert!(task.new_attempt.is_none());
+        assert!(task.continuation_instructions.is_empty());
+        executor.start_new_attempt(fx.task_id, id).await.unwrap_err();
+        assert_eq!(agent.invocations(), "");
+    }
+
+    /// Run 2 started with instructions and SlashIt restarted while it ran. Its
+    /// history survives, and the next recovery's attempt is given only its own
+    /// instructions.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeated_recovery_keeps_each_runs_instructions_and_sends_only_the_new_ones() {
+        let fx = fixture().await;
+        let prompt_file = fx._tmp.path().join("prompt");
+        let _agent = capturing_agent(&prompt_file).await;
+        let first_id = Uuid::new_v4();
+        record_decision(
+            &fx.state,
+            instructed(fx.request(first_id).await, "guidance for run two"),
+        )
+        .await
+        .unwrap();
+        let first = fx.state.executor.get().unwrap().clone();
+        first.start_new_attempt(fx.task_id, first_id).await.unwrap();
+        captured(&prompt_file, "guidance for run two").await;
+        let history = fx.task().await.continuation_instructions;
+        first.stop_task(fx.task_id).await.unwrap();
+        // Stand in for the interruption: run 2 left recorded as started.
+        fx.edit(|t| {
+            t.status = TaskStatus::InProgress;
+            t.error_message = None;
+            t.worker_handoff.as_mut().unwrap().stage = WorkerHandoffStage::Started {};
+        })
+        .await;
+
+        let (state, executor) = restart(&fx).await;
+        wait_until_absent(&executor, fx.task_id).await;
+
+        let task = task_in(&state, fx.task_id).await;
+        assert_eq!(task.continuation_instructions, history);
+        let Some(WorkerHandoffStage::RecoveryRequired { reason, observed_commit }) =
+            task.worker_handoff.as_ref().map(|h| h.stage.clone())
+        else {
+            panic!("{:?}", task.worker_handoff);
+        };
+        let second_id = Uuid::new_v4();
+        let mut request = instructed(fx.request(second_id).await, "guidance for run three");
+        request.run = 2;
+        request.recovery_reason = reason;
+        request.observed_commit = observed_commit;
+        // A decision naming the earlier recovery cannot carry instructions forward.
+        let mut stale = request.clone();
+        stale.decision_id = Uuid::new_v4();
+        stale.run = 1;
+        refusal(record_decision(&state, stale).await);
+        let outcome = record_decision(&state, request).await.unwrap();
+        assert!(
+            matches!(outcome, AuthorizeNewAttemptOutcome::Authorized { .. }),
+            "{outcome:?}"
+        );
+        std::fs::remove_file(&prompt_file).unwrap();
+
+        executor.start_new_attempt(fx.task_id, second_id).await.unwrap();
+
+        let prompt = captured(&prompt_file, "guidance for run three").await;
+        assert!(!prompt.contains("guidance for run two"), "{prompt}");
+        let recorded = task_in(&state, fx.task_id).await.continuation_instructions;
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0], history[0]);
+        assert_eq!((recorded[1].run, recorded[1].follows_run), (3, 2));
+        executor.stop_task(fx.task_id).await.unwrap();
     }
 }

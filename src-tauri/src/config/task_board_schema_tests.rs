@@ -377,8 +377,16 @@ fn full_task(project_id: Uuid) -> Task {
         expected_head: commit('e'),
         dirty_fingerprint: "print".into(),
         dirty_paths: vec!["a.rs".into()],
+        instructions: Some("keep the notes".into()),
         authorized_at: at(12),
     });
+    task.continuation_instructions = vec![crate::domain::task::ContinuationInstructions {
+        run: 2,
+        follows_run: 1,
+        decision_id: Uuid::new_v4(),
+        instructions: "keep the notes".into(),
+        authorized_at: at(12),
+    }];
     let evidence = checkout_evidence(&task);
     task.approved_execution = Some(ApprovedExecution {
         approval_id: Uuid::new_v4(),
