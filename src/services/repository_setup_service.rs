@@ -59,6 +59,16 @@ pub async fn set_project_base_source(project_id: String, prefer_local: bool) -> 
     .await
 }
 
+/// Choose whether new Task Checkouts start from origin's default branch,
+/// fetched when each is created (`fetch_remote`), or from the refs as they are.
+pub async fn set_project_base_sync(project_id: String, fetch_remote: bool) -> Result<Readiness, String> {
+    call(
+        "set_project_base_sync",
+        serde_json::json!({ "projectId": project_id, "fetchRemote": fetch_remote }),
+    )
+    .await
+}
+
 pub async fn detect_remote_default_branch(project_id: String) -> Result<Readiness, String> {
     call(
         "detect_remote_default_branch",

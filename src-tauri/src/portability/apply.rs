@@ -494,6 +494,7 @@ fn materialize(payload: Payload) -> Result<Materialized, BundleError> {
         // Matches a new Project: its board stays in SlashIt's own state directory.
         state_location: StateLocation::External,
         base: p.base,
+        base_sync: p.base_sync,
         agent_type: p.agent_type,
         agent_config,
         created_at: p.created_at,

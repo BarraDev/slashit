@@ -112,6 +112,7 @@ pub fn build_payload(
             agent_type: project.agent_type.clone(),
             model: project.agent_config.model.clone(),
             base: project.base.clone(),
+            base_sync: project.base_sync,
             created_at: project.created_at,
             updated_at: project.updated_at,
         },

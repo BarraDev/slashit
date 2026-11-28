@@ -8,11 +8,12 @@
 
 use crate::components::toast;
 use crate::models::repository_setup::{
-    BaseSource, Head, InitPreview, Readiness, RemoteState, Vcs, VcsInitKind,
+    sync_refusal_message, BaseSource, BaseSync, Head, InitPreview, Readiness, RemoteState, Vcs,
+    VcsInitKind,
 };
 use crate::services::repository_setup_service::{
     detect_remote_default_branch, get_project_readiness, initialize_project_vcs,
-    preview_vcs_initialization, set_project_base, set_project_base_source,
+    preview_vcs_initialization, set_project_base, set_project_base_source, set_project_base_sync,
 };
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -89,6 +90,40 @@ pub fn RepositorySetup(project_id: String) -> impl IntoView {
             apply(answer);
         });
     };
+    let choose_sync = move |fetch_remote: bool| {
+        busy.set(true);
+        let id = pid.get_value();
+        spawn_local(async move {
+            match set_project_base_sync(id.clone(), fetch_remote).await {
+                Ok(report) => {
+                    toast::success(if fetch_remote {
+                        "Each new task will fetch origin's default branch first and start from origin's revision; unpushed local commits are not included. If the fetch fails, the task is not started.".to_string()
+                    } else {
+                        "New tasks will start from the repository's branches as they are, without fetching.".to_string()
+                    });
+                    apply(Ok(report));
+                }
+                Err(refusal) => {
+                    // A refusal can come after the save. What is shown is read
+                    // back from the project, never the value that was clicked.
+                    match get_project_readiness(id).await {
+                        Ok(report) => {
+                            let message = sync_refusal_message(&refusal, Ok(&report));
+                            apply(Ok(report));
+                            error.set(Some(message));
+                        }
+                        Err(reload) => {
+                            // Unknown until it can be read again: no stale checkbox.
+                            readiness.set(None);
+                            preview.set(None);
+                            error.set(Some(sync_refusal_message(&refusal, Err(&reload))));
+                            busy.set(false);
+                        }
+                    }
+                }
+            }
+        });
+    };
     let detect = move |_| {
         busy.set(true);
         let id = pid.get_value();
@@ -118,11 +153,18 @@ pub fn RepositorySetup(project_id: String) -> impl IntoView {
                 <p class="text-sm text-white/50">"Select a project to see its repository setup."</p>
             })}
             {move || error.get().map(|e| view! {
-                <div class="p-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-sm" data-testid="repository-setup-error">{e}</div>
+                <div class="p-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-sm whitespace-pre-line" data-testid="repository-setup-error">{e}</div>
+            })}
+            // Nothing authoritative is shown until the saved state is read again.
+            {move || (readiness.get().is_none() && error.get().is_some() && !pid.get_value().is_empty()).then(|| view! {
+                <button type="button" data-testid="repository-reload"
+                    class="px-3 py-1.5 rounded-lg text-sm bg-white/10 text-white/80 hover:bg-white/20"
+                    on:click=move |_| refresh()>"Read the saved setting again"</button>
             })}
             {move || readiness.get().map(|r| {
                 let ready = r.base.clone();
                 let blocked = r.blocked.clone();
+                let pending_fetch = r.pending_fetch.clone();
                 view! {
                     <div class="space-y-4">
                         <div class="p-4 rounded-xl bg-white/5 border border-white/10">
@@ -143,6 +185,7 @@ pub fn RepositorySetup(project_id: String) -> impl IntoView {
                                 (Some(base), _) => view! {
                                     <p class="text-sm text-green-400" data-testid="repository-ready">
                                         {match base.source {
+                                            BaseSource::Remote if r.base_sync == BaseSync::FetchRemote => format!("Ready. Each new task fetches origin's default branch {} first and starts from the commit that fetch brings (last fetched: {}), not from unpushed local commits.", base.branch, short(&base.commit)),
                                             BaseSource::Remote => format!("Ready. New tasks start from origin's default branch {} ({}).", base.branch, short(&base.commit)),
                                             BaseSource::Local if r.prefers_local => format!("Ready. New tasks start from the local branch {} ({}), as you chose. Origin is not consulted.", base.branch, short(&base.commit)),
                                             BaseSource::Local => format!("Ready. New tasks start from the local branch {} ({}).", base.branch, short(&base.commit)),
@@ -152,7 +195,14 @@ pub fn RepositorySetup(project_id: String) -> impl IntoView {
                                 (None, Some(why)) => view! {
                                     <p class="text-sm text-amber-400" data-testid="repository-blocked">{why}</p>
                                 }.into_any(),
-                                (None, None) => ().into_any(),
+                                (None, None) => match pending_fetch {
+                                    Some(branch) => view! {
+                                        <p class="text-sm text-sky-400" data-testid="repository-pending-fetch">
+                                            {format!("Ready, pending synchronization. Origin's default branch {branch} has not been fetched here yet; the next new task fetches it first and starts from the commit that fetch brings. If the fetch fails, the task is not started.")}
+                                        </p>
+                                    }.into_any(),
+                                    None => ().into_any(),
+                                },
                             }}
                         </div>
 
@@ -203,13 +253,14 @@ pub fn RepositorySetup(project_id: String) -> impl IntoView {
                             let base_branch = r.project_base.clone();
                             let has_remote = r.remote != RemoteState::NoOrigin;
                             let prefers_local = r.prefers_local;
+                            let base_sync = r.base_sync;
                             let standing = r.standing.clone();
                             base_branch.map(|branch| view! {
                                 <div class="p-4 rounded-xl bg-white/5 border border-white/10 space-y-3" data-testid="repository-source" data-prefers-local=prefers_local.to_string()>
                                     <p class="font-medium text-white/90">"Where new tasks start"</p>
                                     {if has_remote || prefers_local {
                                         view! {
-                                            <p class="text-xs text-white/40">"Your choice, saved with the project. Adding, fetching or changing a remote never changes it, and neither choice pushes or fetches anything."</p>
+                                            <p class="text-xs text-white/40">"Your choice, saved with the project. Adding, fetching or changing a remote never changes it, and neither choice pushes anything. Origin is fetched only if you turn that on below."</p>
                                             <div class="space-y-2">
                                                 <button type="button" data-testid="repository-source-remote" data-active=(!prefers_local).to_string()
                                                     class=if prefers_local { "w-full text-left p-3 rounded-lg border border-white/10 bg-white/[0.03] hover:bg-white/10" } else { "w-full text-left p-3 rounded-lg border border-blue-400/40 bg-blue-500/10" }
@@ -227,6 +278,18 @@ pub fn RepositorySetup(project_id: String) -> impl IntoView {
                                                 </button>
                                             </div>
                                             {standing.map(|st| view! { <p class="text-xs text-white/60" data-testid="repository-source-standing">{st.describe()}</p> })}
+                                            {has_remote.then(|| {
+                                                let fetches = base_sync == BaseSync::FetchRemote;
+                                                view! {
+                                                    <label class="flex items-start gap-2 text-xs text-white/70" data-testid="repository-base-sync">
+                                                        <input type="checkbox" class="mt-0.5" data-testid="repository-base-sync-fetch"
+                                                            prop:checked=fetches
+                                                            disabled=move || busy.get()
+                                                            on:change=move |_| choose_sync(!fetches) />
+                                                        <span>"Fetch origin's default branch before each new task and start from the latest remote base. The task starts from origin's revision as fetched, so commits on your local branches that you have not pushed are not in it. A failed fetch stops the task instead of starting it elsewhere. Your local branches and existing task checkouts are never moved."</span>
+                                                    </label>
+                                                }
+                                            })}
                                         }.into_any()
                                     } else {
                                         view! {

@@ -1264,6 +1264,7 @@ mod tests {
                 scope: domain::ProjectScope::Standalone,
                 state_location: config::paths::StateLocation::External,
                 base: None,
+                base_sync: Default::default(),
                 agent_type: domain::AgentType::ClaudeCode,
                 agent_config: domain::AgentConfig {
                     agent_type: domain::AgentType::ClaudeCode,
@@ -1383,6 +1384,7 @@ mod tests {
             scope: domain::ProjectScope::Standalone,
             state_location: config::paths::StateLocation::External,
             base: None,
+            base_sync: Default::default(),
             agent_type: domain::AgentType::ClaudeCode,
             agent_config: domain::AgentConfig {
                 agent_type: domain::AgentType::ClaudeCode,
@@ -1522,6 +1524,7 @@ mod tests {
             scope: domain::ProjectScope::Standalone,
             state_location: config::paths::StateLocation::External,
             base: None,
+            base_sync: Default::default(),
             agent_type: domain::AgentType::ClaudeCode,
             agent_config: domain::AgentConfig {
                 agent_type: domain::AgentType::ClaudeCode,
@@ -1944,6 +1947,7 @@ mod tests {
             scope: domain::ProjectScope::Standalone,
             state_location: config::paths::StateLocation::External,
             base: None,
+            base_sync: Default::default(),
             agent_type: domain::AgentType::ClaudeCode,
             agent_config: domain::AgentConfig {
                 agent_type: domain::AgentType::ClaudeCode,
@@ -2079,6 +2083,7 @@ mod tests {
             scope: domain::ProjectScope::Standalone,
             state_location: config::paths::StateLocation::External,
             base: None,
+            base_sync: Default::default(),
             agent_type: domain::AgentType::ClaudeCode,
             agent_config: domain::AgentConfig {
                 agent_type: domain::AgentType::ClaudeCode,
@@ -2189,6 +2194,7 @@ mod tests {
             scope: domain::ProjectScope::Standalone,
             state_location: config::paths::StateLocation::External,
             base: None,
+            base_sync: Default::default(),
             agent_type: domain::AgentType::ClaudeCode,
             agent_config: domain::AgentConfig {
                 agent_type: domain::AgentType::ClaudeCode,
@@ -2320,6 +2326,7 @@ mod tests {
             scope: domain::ProjectScope::Standalone,
             state_location: config::paths::StateLocation::External,
             base: None,
+            base_sync: Default::default(),
             agent_type: domain::AgentType::ClaudeCode,
             agent_config: domain::AgentConfig {
                 agent_type: domain::AgentType::ClaudeCode,
@@ -2592,6 +2599,7 @@ mod tests {
             scope: domain::ProjectScope::Standalone,
             state_location: config::paths::StateLocation::External,
             base: None,
+            base_sync: Default::default(),
             agent_type: domain::AgentType::ClaudeCode,
             agent_config: domain::AgentConfig {
                 agent_type: domain::AgentType::ClaudeCode,
@@ -2718,6 +2726,7 @@ mod tests {
             scope: domain::ProjectScope::Standalone,
             state_location: config::paths::StateLocation::External,
             base: None,
+            base_sync: Default::default(),
             agent_type: domain::AgentType::ClaudeCode,
             agent_config: domain::AgentConfig {
                 agent_type: domain::AgentType::ClaudeCode,
@@ -3225,6 +3234,7 @@ mod tests {
             },
             state_location: config::paths::StateLocation::External,
             base: None,
+            base_sync: Default::default(),
             agent_type: domain::AgentType::ClaudeCode,
             agent_config: domain::AgentConfig {
                 agent_type: domain::AgentType::ClaudeCode,

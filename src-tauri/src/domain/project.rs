@@ -73,6 +73,33 @@ impl ProjectBase {
     }
 }
 
+/// Whether a new Task Checkout's base is read from the refs already in the
+/// repository, or from origin's default branch fetched just before.
+///
+/// Only a new Task Checkout is affected: an existing one is never moved,
+/// and a Task stacked on a dependency starts from that dependency's branch
+/// whatever this says (see `worktree::default_base::resolve_new_task_base`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BaseSync {
+    /// The local base revision: the base is resolved from the refs as they
+    /// are, by the order [`ProjectBase`] sets, and nothing is fetched. What
+    /// every project stored before the choice existed has.
+    #[default]
+    Local,
+    /// The latest remote base: origin's default branch is fetched
+    /// explicitly, and the Task Checkout starts at exactly the commit that
+    /// fetch brought. A failed fetch refuses the Task; no other base is used
+    /// in its place.
+    FetchRemote,
+}
+
+impl BaseSync {
+    pub fn is_local(&self) -> bool {
+        matches!(self, Self::Local)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: Uuid,
@@ -103,6 +130,13 @@ pub struct Project {
     /// whose base could not be told, load as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<ProjectBase>,
+    /// Whether a new Task Checkout fetches origin's default branch and
+    /// starts there, or starts from the refs as they are. Projects stored
+    /// before this field existed load as [`BaseSync::Local`], which is how
+    /// they behaved; the default is not written, so a build that predates
+    /// the field still reads the file.
+    #[serde(default, skip_serializing_if = "BaseSync::is_local")]
+    pub base_sync: BaseSync,
     pub agent_type: AgentType,
     pub agent_config: AgentConfig,
     pub created_at: chrono::DateTime<chrono::Utc>,

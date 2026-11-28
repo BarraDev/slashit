@@ -7,12 +7,14 @@
 //! and is reported beside it, never as a condition of it. Everything here
 //! only reads.
 
-use super::default_base::{local_branch_commit, resolve_default_base, resolve_remote_base, ResolvedBase};
+use super::default_base::{
+    local_branch_commit, remote_base_awaiting_fetch, resolve_base_as_fetched, resolve_remote_base, ResolvedBase,
+};
 use super::restack::exact_ref;
 use super::project_base::{self, Proposal};
 use super::remote_head::{remote_state, RemoteState};
 use super::vcs::{self, Head, Vcs};
-use crate::domain::ProjectBase;
+use crate::domain::{BaseSync, ProjectBase};
 use serde::Serialize;
 use std::path::Path;
 
@@ -58,12 +60,21 @@ pub struct Readiness {
     /// branch. When false, origin's default branch is used wherever the
     /// repository names one, as it always was.
     pub prefers_local: bool,
+    /// Whether new Task Checkouts start from origin's default branch fetched
+    /// just before (`FetchRemote`), or from the refs as they are (`Local`).
+    pub base_sync: BaseSync,
     /// The local base branch against origin's, when both exist.
     pub standing: Option<BaseStanding>,
     /// Where a task started now would start. `None` exactly when
-    /// [`Self::blocked`] says why not.
+    /// [`Self::blocked`] says why not, or [`Self::pending_fetch`] names the
+    /// branch the start will fetch.
     pub base: Option<ResolvedBase>,
     pub blocked: Option<String>,
+    /// Under the latest remote base: origin's default branch, named but not
+    /// fetched yet. A task can still start (its start fetches it), so this
+    /// is pending synchronization, not [`Self::blocked`]; [`Self::base`] is
+    /// `None` until it has been fetched.
+    pub pending_fetch: Option<String>,
     /// For a project with no recorded base: the branch that can be told
     /// (or only suggested, see [`Self::proposal_reason`]), offered for an
     /// explicit confirmation.
@@ -81,6 +92,7 @@ pub struct Readiness {
 pub async fn readiness(
     repo_path: &str,
     project_base: Option<&ProjectBase>,
+    base_sync: BaseSync,
 ) -> Result<Readiness, String> {
     let repo = Path::new(repo_path);
     let vcs = vcs::detect(repo).await?;
@@ -95,9 +107,20 @@ pub async fn readiness(
     } else {
         (false, Head::Unknown, RemoteState::NoOrigin, Vec::new())
     };
-    let (base, blocked) = match resolve_default_base(repo_path, project_base).await {
-        Ok(base) => (Some(base), None),
-        Err(why) => (None, Some(why)),
+    // Nothing is fetched to report this: under `FetchRemote` it is origin's
+    // default branch as last fetched.
+    let (base, blocked, pending_fetch) = match resolve_base_as_fetched(repo_path, project_base, base_sync).await {
+        Ok(base) => (Some(base), None, None),
+        Err(why) => match base_sync {
+            BaseSync::FetchRemote => match remote_base_awaiting_fetch(repo_path).await {
+                Ok(Some(branch)) => (None, None, Some(branch)),
+                // Pending-ness could not be read (or the branch is there
+                // and something else refused it): the refusal stands as
+                // reported, never hidden behind a pending answer.
+                Ok(None) | Err(_) => (None, Some(why), None),
+            },
+            BaseSync::Local => (None, Some(why), None),
+        },
     };
     let (proposal, proposal_reason) = match (project_base, supported) {
         (None, true) => match project_base::propose(repo_path).await? {
@@ -115,9 +138,11 @@ pub async fn readiness(
         remote,
         project_base: project_base.map(|b| b.branch().to_string()),
         prefers_local: project_base.is_some_and(ProjectBase::prefers_local),
+        base_sync,
         standing: if supported { standing(repo, repo_path, project_base).await } else { None },
         base,
         blocked,
+        pending_fetch,
         proposal,
         proposal_reason,
         local_branches,

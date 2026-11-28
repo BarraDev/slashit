@@ -10,7 +10,7 @@
 //! reported.
 
 use crate::commands::gui_admission::GuiMutation;
-use crate::domain::{Project, ProjectBase};
+use crate::domain::{BaseSync, Project, ProjectBase};
 use crate::worktree::resolve_default_base;
 use crate::worktree::readiness::{readiness, Readiness};
 use crate::worktree::vcs_init::{self, InitPreview, VcsInitKind};
@@ -55,6 +55,17 @@ pub(crate) async fn record_project_base(
     project_id: Uuid,
     base: Option<ProjectBase>,
 ) -> Result<(), String> {
+    record_project(state, project_id, "save the project's base branch", |project| project.base = base).await
+}
+
+/// Record `change` to the project, durably before memory, as
+/// [`record_project_base`] does; `what` names it in a failure.
+async fn record_project(
+    state: &crate::AppState,
+    project_id: Uuid,
+    what: &str,
+    change: impl FnOnce(&mut Project),
+) -> Result<(), String> {
     let mut projects = state.project.projects.write().await;
     let mut proposed = projects.clone();
     let project = proposed
@@ -65,17 +76,16 @@ pub(crate) async fn record_project_base(
     if project.is_removed() {
         return Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string());
     }
-    project.base = base;
+    change(project);
     project.updated_at = chrono::Utc::now();
     let outcome = crate::commands::project::try_persist_projects(&state.storage, &proposed);
-    crate::config::adopt_published(&mut *projects, proposed, outcome)
-        .map_err(|e| e.describe("save the project's base branch"))?;
+    crate::config::adopt_published(&mut *projects, proposed, outcome).map_err(|e| e.describe(what))?;
     Ok(())
 }
 
 async fn report(state: &crate::AppState, project_id: Uuid) -> Result<Readiness, String> {
     let (project, path) = project_and_path(state, project_id).await?;
-    readiness(&path, project.base.as_ref()).await
+    readiness(&path, project.base.as_ref(), project.base_sync).await
 }
 
 /// Whether the project can run tasks and deliver them, and why not.
@@ -150,7 +160,59 @@ pub(crate) async fn set_project_base_source_core(
     resolve_default_base(&path, Some(&chosen))
         .await
         .map_err(|why| format!("The choice was not saved: {why}"))?;
-    record_project_base(state, project_id, Some(chosen)).await?;
+    // Choosing the local branch over any remote is also choosing the local
+    // base revision: a project does not keep fetching a remote it ignores.
+    record_project(state, project_id, "save where the project's tasks start", |project| {
+        project.base = Some(chosen);
+        if prefer_local {
+            project.base_sync = BaseSync::Local;
+        }
+    })
+    .await?;
+    report(state, project_id).await
+}
+
+/// Choose whether the project's new Task Checkouts start from the latest
+/// remote base (`fetch_remote`: origin's default branch, fetched explicitly
+/// when each new Task Checkout is created) or from the local base revision,
+/// the refs as they are. On explicit request only. Choosing nothing here
+/// fetches, and no existing Task Checkout is moved.
+#[tauri::command]
+pub async fn set_project_base_sync(
+    _gui: GuiMutation,
+    state: tauri::State<'_, crate::AppState>,
+    project_id: String,
+    fetch_remote: bool,
+) -> Result<Readiness, String> {
+    let project_id = Uuid::parse_str(&project_id).map_err(|e| e.to_string())?;
+    set_project_base_sync_core(&state, project_id, fetch_remote).await
+}
+
+pub(crate) async fn set_project_base_sync_core(
+    state: &crate::AppState,
+    project_id: Uuid,
+    fetch_remote: bool,
+) -> Result<Readiness, String> {
+    let (project, path) = project_and_path(state, project_id).await?;
+    let sync = if fetch_remote { BaseSync::FetchRemote } else { BaseSync::Local };
+    // The latest remote base needs origin to name a default branch; a choice
+    // that could only refuse every task is refused here instead. It need
+    // not have been fetched yet. The local base revision must resolve as it
+    // would for the next task.
+    let check = if fetch_remote {
+        crate::worktree::check_latest_remote_base(&path).await
+    } else {
+        crate::worktree::resolve_base_as_fetched(&path, project.base.as_ref(), sync).await.map(drop)
+    };
+    check.map_err(|why| format!("The choice was not saved: {why}"))?;
+    record_project(state, project_id, "save where the project's tasks start", |project| {
+        project.base_sync = sync;
+        // Starting from origin is not also preferring the local branch.
+        if fetch_remote {
+            project.base = project.base.as_ref().map(|base| base.choosing(false));
+        }
+    })
+    .await?;
     report(state, project_id).await
 }
 
@@ -311,6 +373,7 @@ mod tests {
                 scope: crate::domain::project::ProjectScope::Standalone,
                 state_location: crate::config::paths::StateLocation::External,
                 base: Some(ProjectBase::LocalBranch { branch: "trunk".to_string() }),
+                base_sync: Default::default(),
                 agent_type: crate::domain::AgentType::ClaudeCode,
                 agent_config: crate::domain::AgentConfig {
                     agent_type: crate::domain::AgentType::ClaudeCode,

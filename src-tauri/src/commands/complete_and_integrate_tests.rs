@@ -118,6 +118,7 @@ async fn fixture_with(detach: bool, remote: Option<&str>) -> Fx {
             scope: crate::domain::project::ProjectScope::Standalone,
             state_location: crate::config::paths::StateLocation::External,
             base: Some(base.clone()),
+            base_sync: Default::default(),
             agent_type: crate::domain::AgentType::ClaudeCode,
             agent_config: crate::domain::AgentConfig {
                 agent_type: crate::domain::AgentType::ClaudeCode,
@@ -136,7 +137,7 @@ async fn fixture_with(detach: bool, remote: Option<&str>) -> Fx {
     let branch = "task-one".to_string();
     let (info, _) = state
         .worktree_manager
-        .create_or_adopt(repo.to_str().unwrap(), &branch, Some(&base))
+        .create_or_adopt(repo.to_str().unwrap(), &branch, Some(&base), crate::domain::BaseSync::Local)
         .await
         .expect("a Task Checkout");
     let worktree = PathBuf::from(&info.path);

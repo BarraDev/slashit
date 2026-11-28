@@ -241,6 +241,39 @@ async fn an_imported_task_does_not_keep_the_bundle_base_commit() {
     }));
 }
 
+/// The Project's base policy travels with it: a Project that starts its
+/// Tasks from the latest remote base is imported with that policy, and a
+/// bundle that carries none, like every bundle written before the policy
+/// existed, imports as the local base revision.
+#[tokio::test]
+async fn the_base_policy_survives_export_and_import_and_defaults_to_local() {
+    use crate::domain::BaseSync;
+    let imported_policy = |sync: BaseSync| async move {
+        let (src, source) = test_ctx().await;
+        seed(&source, None, &fixture_tasks()).await;
+        source.projects.write().await.get_mut(&project_id()).unwrap().base_sync = sync;
+        let bytes = exported_bytes(&source, &src).await;
+        let (dst, target) = test_ctx().await;
+        let path = write_bundle(&dst, &bytes);
+        let response = apply_with(&target, &path, &checksum_of(&bytes)).await;
+        assert!(response.ok, "apply failed: {:?}", response.error);
+        let projects = target.projects.read().await;
+        let imported = projects.values().find(|p| p.name == "Fixture").expect("imported");
+        (bytes, imported.base_sync)
+    };
+
+    let (bytes, policy) = imported_policy(BaseSync::FetchRemote).await;
+    assert_eq!(policy, BaseSync::FetchRemote);
+    assert_eq!(bundle::decode(&bytes).unwrap().payload.project.base_sync, BaseSync::FetchRemote);
+
+    let (bytes, policy) = imported_policy(BaseSync::Local).await;
+    assert_eq!(policy, BaseSync::Local);
+    assert!(!String::from_utf8(bytes).unwrap().contains("base_sync"), "the default is not written");
+
+    let golden = bundle::decode(include_bytes!("testdata/export-v1.golden.json")).unwrap();
+    assert_eq!(golden.payload.project.base_sync, BaseSync::Local, "an older bundle imports as local");
+}
+
 #[tokio::test]
 async fn a_repeated_apply_is_refused_and_changes_nothing() {
     let (src, source) = test_ctx().await;

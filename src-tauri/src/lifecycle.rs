@@ -2109,6 +2109,7 @@ mod tests {
             scope: ProjectScope::Standalone,
             state_location: StateLocation::External,
             base: None,
+            base_sync: Default::default(),
             agent_type: AgentType::ClaudeCode,
             agent_config: AgentConfig {
                 agent_type: AgentType::ClaudeCode,
@@ -4208,6 +4209,7 @@ mod tests {
                 scope: ProjectScope::Standalone,
                 state_location: StateLocation::External,
                 base: None,
+                base_sync: Default::default(),
                 agent_type: crate::domain::AgentType::ClaudeCode,
                 agent_config: AgentConfig {
                     agent_type: crate::domain::AgentType::ClaudeCode,

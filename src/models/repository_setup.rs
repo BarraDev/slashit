@@ -101,6 +101,18 @@ impl BaseStanding {
     }
 }
 
+/// Mirrors the backend's `domain::BaseSync`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaseSync {
+    /// The local base revision: the refs as they are; nothing is fetched.
+    #[default]
+    Local,
+    /// The latest remote base: origin's default branch, fetched when each new
+    /// Task Checkout is created.
+    FetchRemote,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Readiness {
     pub path: String,
@@ -111,6 +123,14 @@ pub struct Readiness {
     pub project_base: Option<String>,
     #[serde(default)]
     pub prefers_local: bool,
+    /// Whether new Task Checkouts start from origin's default branch fetched
+    /// just before, or from the refs as they are.
+    #[serde(default)]
+    pub base_sync: BaseSync,
+    /// Under the latest remote base: origin's default branch, not fetched
+    /// yet. Pending synchronization, not blocked: the next task fetches it.
+    #[serde(default)]
+    pub pending_fetch: Option<String>,
     #[serde(default)]
     pub standing: Option<BaseStanding>,
     pub base: Option<ResolvedBase>,
@@ -190,9 +210,77 @@ pub fn initialization_for(
     }
 }
 
+/// What the Repository panel says after a base-sync change came back as an
+/// error. The refusal is kept verbatim, durability warning included. What is
+/// saved is read back from the project and shown as authoritative: a refusal
+/// can come before the save, after it, or after a save that could not be
+/// confirmed durable. If the read-back fails too, the state is unknown.
+pub fn sync_refusal_message(refusal: &str, read_back: Result<&Readiness, &str>) -> String {
+    match read_back {
+        Ok(report) => {
+            let saved = match report.base_sync {
+                BaseSync::FetchRemote => "New tasks fetch origin's default branch first.",
+                BaseSync::Local => "New Task Checkouts are created without fetching origin first.",
+            };
+            format!("{refusal}\n\nSaved setting now: {saved}")
+        }
+        Err(why) => format!(
+            "{refusal}\n\nThe saved setting is unknown: it could not be read back ({why}). \
+             Read it again before changing it."
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn readiness(base_sync: BaseSync) -> Readiness {
+        Readiness {
+            path: "/work/a".to_string(),
+            vcs: Vcs::Git,
+            has_commits: true,
+            head: Head::Detached,
+            remote: RemoteState::NoOrigin,
+            project_base: Some("main".to_string()),
+            prefers_local: false,
+            base_sync,
+            pending_fetch: None,
+            standing: None,
+            base: None,
+            blocked: None,
+            proposal: None,
+            proposal_reason: None,
+            local_branches: vec!["main".to_string()],
+            jj_available: false,
+        }
+    }
+
+    #[test]
+    fn refused_sync_change_shows_the_saved_state_and_keeps_the_refusal() {
+        // Refused before anything was saved: the old setting is shown, and the refusal is kept.
+        let refusal = "The choice was not saved: origin names no default branch";
+        let message = sync_refusal_message(refusal, Ok(&readiness(BaseSync::Local)));
+        assert!(message.starts_with(refusal));
+        assert!(message.ends_with("New Task Checkouts are created without fetching origin first."));
+
+        // Saved, but not confirmed durable: the warning is kept verbatim and the saved state is the new one.
+        let warning = "The change was applied, but SlashIt could not confirm that it reached stable storage";
+        let message = sync_refusal_message(warning, Ok(&readiness(BaseSync::FetchRemote)));
+        assert!(message.starts_with(warning));
+        assert!(message.ends_with("New tasks fetch origin's default branch first."));
+    }
+
+    #[test]
+    fn refused_sync_change_whose_state_cannot_be_read_back_is_unknown() {
+        let refusal = "Failed to save where the project's tasks start: disk full";
+        let message = sync_refusal_message(refusal, Err("project not found"));
+        assert!(message.starts_with(refusal));
+        assert!(message.contains("The saved setting is unknown"));
+        assert!(message.contains("project not found"));
+        // No saved state is presented as authoritative.
+        assert!(!message.contains("Saved setting now"));
+    }
 
     fn preview(path: &str) -> InitPreview {
         InitPreview {

@@ -4599,20 +4599,21 @@ impl TaskExecutor {
                         .await
                 }
                 None if !dependency_ids.is_empty() => {
-                    let project_base = self.project_base_of(task_id).await;
+                    let (project_base, sync) = self.project_base_of(task_id).await;
                     self.worktree_manager
                         .create_or_adopt_holding(
                             repo_path,
                             &branch_name,
                             project_base.as_ref(),
+                            sync,
                             &held,
                         )
                         .await
                 }
                 None => {
-                    let project_base = self.project_base_of(task_id).await;
+                    let (project_base, sync) = self.project_base_of(task_id).await;
                     self.worktree_manager
-                        .create_or_adopt(repo_path, &branch_name, project_base.as_ref())
+                        .create_or_adopt(repo_path, &branch_name, project_base.as_ref(), sync)
                         .await
                 }
             };
@@ -4829,14 +4830,15 @@ impl TaskExecutor {
 
     /// The base a start checks its merged dependencies against, and creates
     /// its branch at. Resolved once per start, so every check and the branch
-    /// agree on one commit.
+    /// agree on one commit. Under the latest-remote-base policy this is where
+    /// that start fetches origin's default branch.
     async fn resolve_merge_base(
         &self,
         task_id: Uuid,
         repo_path: &str,
     ) -> Result<crate::worktree::ResolvedBase, String> {
-        let project_base = self.project_base_of(task_id).await;
-        crate::worktree::resolve_default_base(repo_path, project_base.as_ref())
+        let (project_base, sync) = self.project_base_of(task_id).await;
+        crate::worktree::resolve_new_task_base(repo_path, project_base.as_ref(), sync)
             .await
             .map_err(|e| {
                 format!(
@@ -4994,8 +4996,13 @@ impl TaskExecutor {
                 _ => return Ok(false),
             }
         };
-        let project_base = self.project_base_of(task_id).await;
-        let base = crate::worktree::resolve_default_base(repo_path, project_base.as_ref()).await?;
+        // Read without fetching: whether the dependency's work is in the base
+        // decides between starting from the base and stacking, and a stacked
+        // start fetches nothing. A start from the base fetches when it
+        // creates its branch.
+        let (project_base, sync) = self.project_base_of(task_id).await;
+        let base =
+            crate::worktree::resolve_base_as_fetched(repo_path, project_base.as_ref(), sync).await?;
         crate::worktree::restack::is_ancestor(
             std::path::Path::new(repo_path),
             &approved,
@@ -5004,11 +5011,22 @@ impl TaskExecutor {
         .await
     }
 
-    /// The local base (`domain::ProjectBase`) of the project `task_id`
-    /// belongs to, as recorded now.
-    async fn project_base_of(&self, task_id: Uuid) -> Option<crate::domain::ProjectBase> {
-        let project_id = self.tasks.read().await.get(&task_id)?.project_id;
-        self.projects.read().await.get(&project_id)?.base.clone()
+    /// The local base (`domain::ProjectBase`) and base policy
+    /// (`domain::BaseSync`) of the project `task_id` belongs to, as recorded
+    /// now.
+    async fn project_base_of(
+        &self,
+        task_id: Uuid,
+    ) -> (Option<crate::domain::ProjectBase>, crate::domain::BaseSync) {
+        let Some(project_id) = self.tasks.read().await.get(&task_id).map(|t| t.project_id) else {
+            return (None, crate::domain::BaseSync::Local);
+        };
+        self.projects
+            .read()
+            .await
+            .get(&project_id)
+            .map(|p| (p.base.clone(), p.base_sync))
+            .unwrap_or((None, crate::domain::BaseSync::Local))
     }
 
     /// Record a run's start on the task, durably before the board shows it:
@@ -9893,6 +9911,7 @@ mod tests {
             scope,
             state_location: crate::config::paths::StateLocation::External,
             base: None,
+            base_sync: Default::default(),
             agent_type: AgentType::ClaudeCode,
             agent_config: AgentConfig {
                 agent_type: AgentType::ClaudeCode,
@@ -14686,6 +14705,71 @@ mod tests {
         );
     }
 
+    /// Origin's `main` gains a commit `repo` has not fetched, pushed from
+    /// another clone. Returns that commit.
+    fn advance_published_main(repo: &std::path::Path) -> String {
+        let parent = repo.parent().unwrap();
+        let clone = parent.join("another-clone");
+        git_in(parent, &["clone", "-q", "-b", "main", parent.join("origin.git").to_str().unwrap(), clone.to_str().unwrap()]);
+        git_in(&clone, &["commit", "-q", "--allow-empty", "-m", "remote only"]);
+        git_in(&clone, &["push", "-q", "origin", "HEAD:main"]);
+        git_in(&clone, &["rev-parse", "HEAD"])
+    }
+
+    async fn fetch_remote_base(executor: &TaskExecutor, task_id: Uuid) {
+        let project_id = executor.tasks.read().await[&task_id].project_id;
+        executor.projects.write().await.get_mut(&project_id).unwrap().base_sync =
+            crate::domain::BaseSync::FetchRemote;
+    }
+
+    /// Under the latest remote base, a Task with no dependency fetches
+    /// origin's default branch and records the commit it started from, which
+    /// is the fetched one, not the stale remote-tracking ref or local `main`.
+    #[tokio::test]
+    async fn a_task_under_the_latest_remote_base_records_the_fetched_base_commit() {
+        let (executor, temps) = test_executor_with_events(Arc::new(crate::events::RecordingEventSink::new()));
+        let (repo, task_id, _) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, None, "task-unused01").await;
+        executor.tasks.write().await.get_mut(&task_id).unwrap().dependencies.clear();
+        publish_default_base(&repo);
+        let local_main = git_in(&repo, &["rev-parse", "main"]);
+        let newer = advance_published_main(&repo);
+        fetch_remote_base(&executor, task_id).await;
+
+        let (_, acquired) = executor.acquire_task_worktree(task_id, repo.to_str().unwrap()).await;
+
+        let Acquired { info, base_commit, origin, .. } = acquired.expect("a new worktree");
+        assert_eq!(base_commit.as_deref(), Some(newer.as_str()));
+        assert_eq!(git_in(std::path::Path::new(&info.path), &["rev-parse", "HEAD"]), newer);
+        assert_eq!(origin, Some(BranchOrigin::DefaultBase { branch: Some("main".to_string()) }));
+        assert_eq!(git_in(&repo, &["rev-parse", "main"]), local_main, "local main is not moved");
+    }
+
+    /// A dependent Task stacked on its dependency's branch starts there under
+    /// the latest remote base too: nothing is fetched and its base is the
+    /// dependency's tip, exactly as under the local base revision.
+    #[tokio::test]
+    async fn a_stacked_task_under_the_latest_remote_base_stacks_without_fetching() {
+        let (executor, temps) = test_executor_with_events(Arc::new(crate::events::RecordingEventSink::new()));
+        let (repo, task_id, _) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::InProgress, None, "task-parent01").await;
+        git_in(&repo, &["checkout", "-q", "-b", "task-parent01"]);
+        git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "dependency work"]);
+        let parent_tip = git_in(&repo, &["rev-parse", "HEAD"]);
+        git_in(&repo, &["checkout", "-q", "main"]);
+        publish_default_base(&repo);
+        let stale = git_in(&repo, &["rev-parse", "refs/remotes/origin/main"]);
+        advance_published_main(&repo);
+        fetch_remote_base(&executor, task_id).await;
+
+        let (_, acquired) = executor.acquire_task_worktree(task_id, repo.to_str().unwrap()).await;
+
+        let Acquired { base_commit, origin, .. } = acquired.expect("a stacked worktree");
+        assert_eq!(base_commit.as_deref(), Some(parent_tip.as_str()));
+        assert_eq!(origin, Some(BranchOrigin::Stacked { parent_branch: "task-parent01".to_string() }));
+        assert_eq!(git_in(&repo, &["rev-parse", "refs/remotes/origin/main"]), stale, "nothing was fetched");
+    }
+
     /// A dependency that is done, with a pull request, and whose local
     /// branch has since been deleted has been delivered, so the task gets an
     /// ordinary branch instead of a stacked one, and the log says why. The
@@ -15539,7 +15623,7 @@ mod tests {
         let branch = WorktreeManager::branch_for_task(task_id);
         let (leftover, _) = executor
             .worktree_manager
-            .create_or_adopt(repo.to_str().unwrap(), &branch, None)
+            .create_or_adopt(repo.to_str().unwrap(), &branch, None, crate::domain::BaseSync::Local)
             .await
             .expect("a leftover checkout of the task's branch");
         commit_unmerged_work(&repo, "task-leftover01", "dependency.txt");
@@ -15577,7 +15661,7 @@ mod tests {
         let branch = WorktreeManager::branch_for_task(task_id);
         let (leftover, _) = executor
             .worktree_manager
-            .create_or_adopt(repo.to_str().unwrap(), &branch, None)
+            .create_or_adopt(repo.to_str().unwrap(), &branch, None, crate::domain::BaseSync::Local)
             .await
             .expect("a leftover checkout of the task's branch");
         std::fs::write(repo.join("later.txt"), "later\n").unwrap();

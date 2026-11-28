@@ -2022,6 +2022,7 @@ pub(super) mod tests {
                 scope: crate::domain::project::ProjectScope::Standalone,
                 state_location: crate::config::paths::StateLocation::External,
                 base: None,
+                base_sync: Default::default(),
                 agent_type: crate::domain::AgentType::ClaudeCode,
                 agent_config: crate::domain::project::AgentConfig {
                     agent_type: crate::domain::AgentType::ClaudeCode,
@@ -2150,6 +2151,7 @@ pub(super) mod tests {
                 scope: crate::domain::project::ProjectScope::Standalone,
                 state_location: crate::config::paths::StateLocation::External,
                 base: None,
+                base_sync: Default::default(),
                 agent_type: crate::domain::AgentType::ClaudeCode,
                 agent_config: crate::domain::project::AgentConfig {
                     agent_type: crate::domain::AgentType::ClaudeCode,
@@ -2307,6 +2309,7 @@ pub(super) mod tests {
                 scope: crate::domain::project::ProjectScope::Standalone,
                 state_location: crate::config::paths::StateLocation::External,
                 base: None,
+                base_sync: Default::default(),
                 agent_type: crate::domain::AgentType::ClaudeCode,
                 agent_config: crate::domain::project::AgentConfig {
                     agent_type: crate::domain::AgentType::ClaudeCode,
@@ -2393,6 +2396,7 @@ pub(super) mod tests {
             scope: crate::domain::project::ProjectScope::Standalone,
             state_location: crate::config::paths::StateLocation::External,
             base: None,
+            base_sync: Default::default(),
             agent_type: crate::domain::AgentType::ClaudeCode,
             agent_config: crate::domain::project::AgentConfig {
                 agent_type: crate::domain::AgentType::ClaudeCode,
@@ -3254,6 +3258,7 @@ mod task_configuration_writes {
             scope: ProjectScope::Standalone,
             state_location: StateLocation::External,
             base: None,
+            base_sync: Default::default(),
             agent_type: AgentType::ClaudeCode,
             agent_config: AgentConfig {
                 agent_type: AgentType::ClaudeCode,
@@ -3889,6 +3894,7 @@ mod import_lock_order {
             scope: ProjectScope::Standalone,
             state_location: StateLocation::External,
             base: None,
+            base_sync: Default::default(),
             agent_type: AgentType::ClaudeCode,
             agent_config: AgentConfig {
                 agent_type: AgentType::ClaudeCode,
