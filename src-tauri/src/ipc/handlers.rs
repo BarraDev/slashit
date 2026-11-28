@@ -1266,6 +1266,7 @@ async fn handle_create_task(
         Ok(id) => id,
         Err(_) => return IpcResponse::error(format!("Invalid project_id: {project_id}")),
     };
+    let explicit_review_mode = review_mode.is_some();
     let review_mode = match review_mode.as_deref() {
         None | Some("automatic") => crate::domain::task::ReviewMode::Automatic,
         Some("manual") => crate::domain::task::ReviewMode::Manual,
@@ -1275,6 +1276,12 @@ async fn handle_create_task(
             ))
         }
     };
+    // This command chooses no reviewer, so an explicit Automatic has none.
+    if explicit_review_mode {
+        if let Err(refusal) = crate::domain::task::check_automatic_has_reviewer(review_mode, None) {
+            return IpcResponse::error(refusal);
+        }
+    }
 
     // Verify project exists and get its name
     let project_name = {
@@ -1711,6 +1718,8 @@ async fn handle_set_task_review_mode(
             ))
         }
     };
+    // The reviewer is chosen on the Task in the desktop app, not here. The
+    // refusal is judged inside the write, against the Task's stored reviewer.
     match crate::commands::task::set_task_model_and_review_mode(
         &ctx.tasks,
         &ctx.projects,
@@ -3558,6 +3567,37 @@ mod task_configuration_writes {
 
         let shown = read_back(&ctx, task_id).await;
         assert_eq!(shown["review_mode"], "manual", "the slice 1 read verb confirms it");
+    }
+
+    /// An explicit Automatic is refused while the Task has no reviewer, and the
+    /// mode stays as it was. Once a reviewer is chosen, the same request applies.
+    #[tokio::test]
+    async fn set_review_mode_automatic_needs_a_reviewer() {
+        let (_tmp, ctx) = test_ctx().await;
+        let mut unreviewed = backlog_task(Uuid::new_v4(), "no reviewer");
+        unreviewed.review_mode = ReviewMode::Manual;
+        let (task_id, project_id) = seed(&ctx, unreviewed).await;
+        let request = |task_id: Uuid| IpcRequest::SetTaskReviewMode {
+            task_id: task_id.to_string(),
+            review_mode: "automatic".to_string(),
+        };
+
+        let answer = dispatch(request(task_id), &ctx, &peer()).await.response;
+        assert!(!answer.ok, "{answer:?}");
+        let message = answer.error.unwrap_or_default();
+        assert!(message.contains("AI Reviewer"), "{message}");
+        assert_eq!(persisted(&ctx, project_id, task_id).review_mode, ReviewMode::Manual);
+
+        let mut reviewed = backlog_task(Uuid::new_v4(), "reviewed");
+        reviewed.review_mode = ReviewMode::Manual;
+        reviewed.reviewer_model = Some("sonnet".to_string());
+        let (reviewed_id, reviewed_project) = seed(&ctx, reviewed).await;
+        let answer = dispatch(request(reviewed_id), &ctx, &peer()).await.response;
+        assert!(answer.ok, "{answer:?}");
+        assert_eq!(
+            persisted(&ctx, reviewed_project, reviewed_id).review_mode,
+            ReviewMode::Automatic
+        );
     }
 
     #[tokio::test]

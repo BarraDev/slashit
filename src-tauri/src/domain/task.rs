@@ -2073,6 +2073,22 @@ pub fn parse_reviewer_model(requested: &str) -> Result<Option<String>, String> {
     Ok(Some(model.to_string()))
 }
 
+/// Why an explicit Automatic review request is refused without a reviewer.
+pub const AUTOMATIC_REVIEW_NEEDS_REVIEWER: &str = "Automatic AI Review needs an AI Reviewer model, and none is chosen for this Task. Choose a Claude model for the AI Reviewer, or set review to Manual. Without a reviewer, a finished run waits in Human Review and no AI Review runs.";
+
+/// Refuses a review configuration that asks for Automatic AI Review with no
+/// reviewer to run it. Callers apply it only to a write that asks for the
+/// configuration, so a Task that already stands this way is left alone.
+pub fn check_automatic_has_reviewer(
+    review_mode: ReviewMode,
+    reviewer_model: Option<&str>,
+) -> Result<(), String> {
+    if review_mode == ReviewMode::Automatic && reviewer_model.is_none() {
+        return Err(AUTOMATIC_REVIEW_NEEDS_REVIEWER.to_string());
+    }
+    Ok(())
+}
+
 /// The model a Task's Worker is saved with, for `provider`. Every write of the
 /// field (the desktop form, `create_task`, `update_task` and the control
 /// channel) applies this one rule, so the same identifier gets the same answer
@@ -3431,6 +3447,17 @@ mod tests {
             assert!(refusal.contains("provider/model"), "{refusal}");
             assert!(refusal.contains("was not saved"), "{refusal}");
         }
+    }
+
+    #[test]
+    fn an_automatic_review_needs_a_reviewer_and_a_manual_one_does_not() {
+        use crate::domain::task::{check_automatic_has_reviewer, ReviewMode, AUTOMATIC_REVIEW_NEEDS_REVIEWER};
+        assert_eq!(
+            check_automatic_has_reviewer(ReviewMode::Automatic, None),
+            Err(AUTOMATIC_REVIEW_NEEDS_REVIEWER.to_string())
+        );
+        assert!(check_automatic_has_reviewer(ReviewMode::Automatic, Some("sonnet")).is_ok());
+        assert!(check_automatic_has_reviewer(ReviewMode::Manual, None).is_ok());
     }
 
     #[test]

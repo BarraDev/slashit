@@ -33,7 +33,8 @@ pub struct CreateTaskParams {
     pub complexity: Option<TaskComplexity>,
     pub impact: Option<TaskImpact>,
     pub security_severity: Option<SecuritySeverity>,
-    pub review_mode: ReviewMode,
+    /// `None` keeps the backend default; an explicit Automatic is judged.
+    pub review_mode: Option<ReviewMode>,
     pub provider: CodingProvider,
 }
 
