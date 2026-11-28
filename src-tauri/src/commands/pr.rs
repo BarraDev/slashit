@@ -25048,6 +25048,8 @@ mod tests {
                 assert_eq!(run.after.human_review.entries, run.before.human_review.entries);
                 assert_eq!(run.after.worktree_path, run.before.worktree_path, "checkout path");
                 assert_eq!(run.after.branch_name, run.before.branch_name, "checkout branch");
+                assert_eq!(run.after.pr_publication, run.before.pr_publication, "publication record");
+                assert_eq!(run.after.external_refs, run.before.external_refs, "linked references");
                 assert_eq!(recorded_pr_state(&run.after), recorded_pr_state(&run.before), "nothing recorded");
                 assert_eq!(run.cached_head.as_deref(), Some(OTHER_HEAD), "the newer reading is kept");
             }
@@ -25086,6 +25088,8 @@ mod tests {
                 );
                 assert_eq!(run.after.human_review.entries, run.before.human_review.entries);
                 assert_eq!(run.after.worktree_path, run.before.worktree_path, "checkout path");
+                assert_eq!(run.after.pr_publication, run.before.pr_publication, "publication record");
+                assert_eq!(run.after.external_refs, run.before.external_refs, "linked references");
                 assert_eq!(recorded_pr_state(&run.after), recorded_pr_state(&run.before), "nothing recorded");
                 assert_eq!(run.cached_head.as_deref(), Some(OTHER_HEAD), "the newer reading is kept");
             }
