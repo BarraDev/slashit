@@ -89,8 +89,10 @@ enum Commands {
     /// finding's stable ID, the reviewer comment, the agent's summary and
     /// reasoning, the original proposal, any Human override, the effective
     /// instruction, the decision and approval, and what was fixed and
-    /// published. Nothing is analyzed, no agent is started, and no approval or
-    /// plan is changed. `--json` prints the full answer.
+    /// published. The analyzed head is compared with the pull request's head
+    /// on GitHub now (current, stale, unavailable or unknown). Nothing is
+    /// analyzed, no agent is started, no approval or plan is changed, and
+    /// nothing is written to GitHub. `--json` prints the full answer.
     PrReview {
         /// Task ID
         task_id: String,

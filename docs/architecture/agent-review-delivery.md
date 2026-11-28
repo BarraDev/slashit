@@ -10,13 +10,18 @@ A person makes every approval and publication decision.
 |---|---|---|
 | `slashit review <task>` | `GetReviewState` | reads decisions, approval coverage, branch commit, requests (JSON) |
 | `slashit delivery <task>` | `GetDeliveryState` | reads the pull request, failures, requests to open one (JSON) |
-| `slashit pr-review <task> [--markdown <file>]` | `GetPrCommentReview` | reads the PR Comment Review: findings, overrides, approvals, fix and reply evidence (JSON or Markdown) |
+| `slashit pr-review <task> [--markdown <file>]` | `GetPrCommentReview` | reads the PR Comment Review: findings, overrides, approvals, fix and reply evidence, and whether the analyzed head is current (JSON or Markdown) |
 | `slashit request <task> approve\|open-pr --commit <sha> --actor <name>` | `RequestOperation` | files a question for a person |
 | `slashit open-pr <task> --request <id> --actor <name>` | `OpenPr` | spends one authorization |
 
 There is no verb that decides a request, and no `approve_task` over IPC.
-`GetPrCommentReview` answers from the Task's stored review plan alone: it never
-analyzes, starts a fix agent, approves a finding or edits the plan. Each finding
+`GetPrCommentReview` answers from the Task's stored review plan and one
+time-limited `gh pr view` of the pull request's head: it never analyzes, starts
+a fix agent, approves a finding, edits the plan or writes to GitHub. Its
+`head_check.state` is `current` or `stale` (the remote head equals or differs
+from `analyzed_head_oid`), `unavailable` (the read failed, or the Task links no
+pull request or another one than the plan read) or `unknown` (no stored plan, or
+one without an analyzed head). It is observed per read and never stored. Each finding
 carries a `finding_id` derived from the stored plan (`<kind>:<comment id>`, or
 `item:<position>` for a finding with no comment), so two reads of the same plan
 name it alike. The Markdown export is written by the CLI process to a new file;

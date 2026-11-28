@@ -317,8 +317,9 @@ async fn handle_get_task(ctx: &IpcContext, task_id: String) -> IpcResponse {
 }
 
 /// One Task's PR Comment Review, read from a copy of the Task record taken
-/// under the board's read lock. The builder is a pure function of that copy:
-/// it reaches no analyzer, agent runner, approval writer or storage.
+/// under the board's read lock, which is released before the pull request's
+/// head is read from GitHub. That read and a pure builder see only the copy:
+/// they reach no analyzer, agent runner, approval writer or storage.
 async fn handle_get_pr_comment_review(ctx: &IpcContext, task_id: String) -> IpcResponse {
     let task_uuid = match Uuid::parse_str(&task_id) {
         Ok(id) => id,
@@ -327,7 +328,8 @@ async fn handle_get_pr_comment_review(ctx: &IpcContext, task_id: String) -> IpcR
     let Some(task) = ctx.tasks.read().await.get(&task_uuid).cloned() else {
         return IpcResponse::error(format!("Task {task_id} not found"));
     };
-    json_reply(Ok(crate::commands::pr::pr_comment_review(&task)))
+    let head_check = crate::commands::pr::check_head(&task).await;
+    json_reply(Ok(crate::commands::pr::pr_comment_review(&task, head_check)))
 }
 
 // --- Agent review and delivery -----------------------------------------------
@@ -6082,8 +6084,8 @@ mod evidence_bounds_and_redaction {
     }
 }
 
-/// `GetPrCommentReview` is a read: it answers from the Task record and
-/// reaches nothing that analyzes, runs an agent or records a decision.
+/// `GetPrCommentReview` is a read: it answers from the Task record and the
+/// pull request's head, and reaches nothing that analyzes, runs an agent or records a decision.
 #[cfg(all(test, unix))]
 mod pr_comment_review_read {
     use super::*;
@@ -6093,12 +6095,13 @@ mod pr_comment_review_read {
     use slashit_ipc::Endpoint;
     use std::sync::Arc;
 
-    /// The analyzer and the fix agents run `claude` (or `opencode`), and
-    /// publication runs `gh`; each is replaced by a fake that logs a launch.
+    /// The analyzer and the fix agents run `claude` (or `opencode`), and the
+    /// head check and publication run `gh`; each is replaced by a fake that
+    /// logs a launch and fails, so the head read here is a failed one.
     /// The context has no application state, so no approval writer is
     /// reachable, and no executor, so no run can start. The read must leave
     /// the Task, the files under the instance's roots, the event sink and the
-    /// executor exactly as they were, and launch none of the programs.
+    /// executor exactly as they were, and launch only `gh`, once.
     #[tokio::test]
     async fn the_read_calls_no_analyzer_agent_runner_or_approval_writer() {
         let fake = FakeProgram::install("claude", "exit 1").await;
@@ -6116,7 +6119,8 @@ mod pr_comment_review_read {
         let sink = Arc::new(crate::events::RecordingEventSink::new());
         ctx.events = sink.clone();
 
-        let (mut task, plan) = create_test_pr_review_setup();
+        let (mut task, mut plan) = create_test_pr_review_setup();
+        plan.analyzed_head_oid = Some("a".repeat(40));
         task.pr_review_plan = Some(plan);
         let task_id = task.id;
         ctx.tasks.write().await.insert(task_id, task.clone());
@@ -6137,15 +6141,20 @@ mod pr_comment_review_read {
         let view: slashit_ipc::PrCommentReview =
             serde_json::from_value(reply.data).expect("the answer is a PR Comment Review");
         assert_eq!(view.plan.expect("the plan is shown").findings.len(), 2);
+        assert_eq!(
+            view.head_check.state,
+            slashit_ipc::pr_comment_review::PrCommentReviewHeadState::Unavailable
+        );
 
         let after = serde_json::to_value(ctx.tasks.read().await.get(&task_id).unwrap()).unwrap();
         assert_eq!(after, serde_json::to_value(&task).unwrap(), "the Task is unchanged");
         assert_eq!(files_under(tmp.path()), files_before, "nothing was written");
         assert!(sink.recorded().is_empty(), "no event was emitted");
         assert!(ctx.executor.get().is_none(), "no executor was reached");
-        for program in ["claude", "opencode", "gh"] {
+        for program in ["claude", "opencode"] {
             assert_eq!(fake.launches(program), 0, "{program} was launched");
         }
+        assert_eq!(fake.launches("gh"), 1, "only the head read runs");
     }
 
     #[tokio::test]
