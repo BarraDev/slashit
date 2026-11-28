@@ -11,7 +11,7 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use uuid::Uuid;
 
-use crate::components::diff_viewer::DiffViewer;
+use crate::components::diff_viewer::{DiffViewMemory, DiffViewer};
 use crate::components::task_dependency::DependencyList;
 use crate::components::task_issue_links::{draft_is_unsaved, TaskIssueLinks};
 use crate::components::new_work_pause::NewWorkPauseNotice;
@@ -419,6 +419,10 @@ pub fn TaskDrawer(
     // Loaded when the Changes tab is opened, and again if the task moves on
     // while it is open (an AI review fix changes the code).
     let changes = RwSignal::new(None::<Result<ChangesView, String>>);
+    // The reader's place in the diff and the files they opened or closed,
+    // kept across reloads of the changes (a status change, a review fix, a
+    // stale-commit refresh) for as long as this Task's drawer is open.
+    let diff_memory = StoredValue::new(DiffViewMemory::default());
     // The commit the loaded changes are for, shared with the decision panel so
     // it can refuse to approve a commit other than the one on screen.
     let viewed_tip = RwSignal::new(None::<String>);
@@ -580,7 +584,13 @@ pub fn TaskDrawer(
                 aria-label="Task details"
                 tabindex="-1"
                 on:keydown=on_keydown
-                class="relative h-full w-full max-w-[520px] bg-[#101018] border-l border-white/10 shadow-2xl flex flex-col outline-none"
+                // Wide while the Changes tab is open, so the diff and its
+                // file list are not squeezed into the narrow column the rest
+                // of the drawer reads well in.
+                class=move || format!(
+                    "relative h-full w-full {} bg-[#101018] border-l border-white/10 shadow-2xl flex flex-col outline-none transition-[max-width] duration-150",
+                    if tab.get() == Tab::Changes { "max-w-[min(1280px,94vw)]" } else { "max-w-[520px]" }
+                )
             >
                 {move || match task.get() {
                     None => view! {
@@ -772,10 +782,8 @@ pub fn TaskDrawer(
                         <PublishToPrPanel task_id=task_id task=task refresh_tasks=refresh_tasks />
                     </Show>
 
-                    // How the task got here.
-                    <TaskActivity task=task />
-
-                    // Output and, where there are any, changes.
+                    // Output and, where there are any, changes; then how the
+                    // task got here.
                     <section class="space-y-2">
                         <div role="tablist" class="flex items-center gap-1 border-b border-white/10">
                             <TabButton label="Output" testid="task-drawer-tab-output" active=Signal::derive(move || tab.get() == Tab::Output) on_click=Callback::new(move |_| tab.set(Tab::Output)) />
@@ -833,12 +841,14 @@ pub fn TaskDrawer(
                                     Some(Err(e)) => view! { <p class="text-xs text-red-300">{format!("Could not load the changes: {e}")}</p> }.into_any(),
                                     Some(Ok(ChangesView { diff, stat, review })) => view! {
                                         {review.map(|r| view! { <ReviewScope review=r /> })}
-                                        <DiffViewer diff=diff stat=stat />
+                                        <DiffViewer diff=diff stat=stat memory=diff_memory height="max-h-[calc(100vh-10rem)]" />
                                     }.into_any(),
                                 }}
                             </div>
                         </Show>
                     </section>
+
+                    <TaskActivity task=task />
                 </div>
             </aside>
         </div>
@@ -1054,7 +1064,7 @@ fn ReviewScope(review: ReviewChanges) -> impl IntoView {
                 <details data-testid="review-changes-pending" class="rounded-md border border-amber-500/20 bg-amber-500/[0.06] p-2">
                     <summary class="text-xs text-amber-200 cursor-pointer">{summary}</summary>
                     <div class="mt-2">
-                        <DiffViewer diff=review.pending_patch.clone() stat=review.pending_stat.clone() />
+                        <DiffViewer diff=review.pending_patch.clone() stat=review.pending_stat.clone() height="max-h-[40vh]" />
                     </div>
                 </details>
             })}
@@ -1161,6 +1171,22 @@ mod tests {
         assert_eq!(review_neighbour(&tasks, second.id, ReviewStep::Previous), Some(first.id));
         assert_eq!(review_neighbour(&tasks, second.id, ReviewStep::Next), Some(third.id));
         assert_eq!(review_step(&tasks, second.id, ReviewStep::Next, false), StepOutcome::Open(third.id));
+    }
+
+    #[test]
+    fn next_then_previous_walks_the_whole_column_and_back() {
+        let tasks: Vec<Task> = (0..3).map(|p| in_column(TaskStatus::HumanReview, p)).collect();
+        let ids: Vec<Uuid> = tasks.iter().map(|t| t.id).collect();
+        let mut at = ids[0];
+        for &want in &ids[1..] {
+            assert_eq!(review_step(&tasks, at, ReviewStep::Next, false), StepOutcome::Open(want));
+            at = want;
+        }
+        for &want in ids[..2].iter().rev() {
+            assert_eq!(review_step(&tasks, at, ReviewStep::Previous, false), StepOutcome::Open(want));
+            at = want;
+        }
+        assert_eq!(at, ids[0]);
     }
 
     #[test]

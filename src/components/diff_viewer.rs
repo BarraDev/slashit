@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
+use std::collections::HashMap;
+
 use leptos::prelude::*;
+use wasm_bindgen::JsCast;
 
 const DIFF_DEFAULT_COLLAPSED_KEY: &str = "slashit_diff_default_collapsed";
 
@@ -354,10 +357,86 @@ fn normalize_stat(stat: &str) -> String {
     out
 }
 
+/// Where a reader is in a diff: a file, and how far into it. Kept by file
+/// rather than by pixel, so a refreshed diff whose earlier files grew or
+/// shrank opens at the same place in the same file.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DiffAnchor {
+    pub path: String,
+    /// Pixels scrolled past the top of that file's section.
+    pub offset: f64,
+}
+
+/// What a reader set up in a diff, held by whoever outlives one rendering of
+/// it. The Task drawer keeps one across reloads of the Task's changes, so a
+/// refresh does not send the reader back to the first file.
+#[derive(Clone, Debug, Default)]
+pub struct DiffViewMemory {
+    pub anchor: Option<DiffAnchor>,
+    /// Files the reader collapsed (`true`) or expanded (`false`), by path.
+    pub collapsed: HashMap<String, bool>,
+}
+
+/// The file being read: the last one whose section starts at or above the
+/// top of the scrolled pane. `tops` are the sections' offsets in the pane, in
+/// order.
+fn current_file(tops: &[f64], scroll_top: f64) -> Option<usize> {
+    if tops.is_empty() {
+        return None;
+    }
+    Some(tops.iter().rposition(|&top| top <= scroll_top + 1.0).unwrap_or(0))
+}
+
+/// The reader's place, as a file and an offset into it.
+fn anchor_at(paths: &[String], tops: &[f64], scroll_top: f64) -> Option<DiffAnchor> {
+    let idx = current_file(tops, scroll_top)?;
+    Some(DiffAnchor {
+        path: paths.get(idx)?.clone(),
+        offset: (scroll_top - tops[idx]).max(0.0),
+    })
+}
+
+/// Where to scroll a newly rendered diff so the reader is back at `anchor`.
+/// The offset is kept inside the file's section when the file shrank. `None`
+/// when the file is no longer in the diff. `end` is the pane's scroll height.
+fn restored_scroll_top(anchor: &DiffAnchor, paths: &[String], tops: &[f64], end: f64) -> Option<f64> {
+    let idx = paths.iter().position(|p| *p == anchor.path)?;
+    let top = *tops.get(idx)?;
+    let next = tops.get(idx + 1).copied().unwrap_or(end);
+    Some(top + anchor.offset.min((next - top - 1.0).max(0.0)))
+}
+
+/// The offsets of the file sections directly inside a diff pane.
+fn section_tops(pane: &web_sys::Element) -> Vec<f64> {
+    let Ok(nodes) = pane.query_selector_all(":scope > [data-diff-file]") else {
+        return Vec::new();
+    };
+    (0..nodes.length())
+        .filter_map(|i| nodes.item(i))
+        .filter_map(|node| node.dyn_into::<web_sys::HtmlElement>().ok())
+        .map(|el| f64::from(el.offset_top()))
+        .collect()
+}
+
+/// A path's file name and the directory it is in, for the file list.
+fn split_path(path: &str) -> (&str, &str) {
+    match path.rsplit_once('/') {
+        Some((dir, name)) => (name, dir),
+        None => (path, ""),
+    }
+}
+
 #[component]
 pub fn DiffViewer(
     diff: String,
     #[prop(optional)] stat: Option<String>,
+    /// Where the reader was in an earlier rendering of this diff. Without it
+    /// the place is kept only while this rendering lasts.
+    #[prop(optional)]
+    memory: Option<StoredValue<DiffViewMemory>>,
+    /// The height the file list and the diff share; each scrolls inside it.
+    #[prop(default = "max-h-[70vh]")]
+    height: &'static str,
 ) -> impl IntoView {
     let files = parse_diff(&diff);
     let total_additions: usize = files.iter().map(|f| f.additions).sum();
@@ -378,10 +457,29 @@ pub fn DiffViewer(
         }.into_any();
     }
 
+    let memory = memory.unwrap_or_else(|| StoredValue::new(DiffViewMemory::default()));
+    let paths = StoredValue::new(files.iter().map(|f| f.path.clone()).collect::<Vec<_>>());
+
     let default_collapsed = read_default_collapsed();
-    let file_signals: Vec<RwSignal<bool>> = (0..file_count)
-        .map(|_| RwSignal::new(default_collapsed))
+    let file_signals: Vec<RwSignal<bool>> = files
+        .iter()
+        .map(|f| {
+            let remembered = memory.with_value(|m| m.collapsed.get(&f.path).copied());
+            RwSignal::new(remembered.unwrap_or(default_collapsed))
+        })
         .collect();
+    // A file the reader opens or closes stays that way across a refresh.
+    for (file, collapsed) in files.iter().zip(&file_signals) {
+        let path = file.path.clone();
+        let collapsed = *collapsed;
+        Effect::new(move |previous: Option<bool>| {
+            let now = collapsed.get();
+            if previous.is_some() {
+                memory.try_update_value(|m| m.collapsed.insert(path.clone(), now));
+            }
+            now
+        });
+    }
 
     let signals_for_collapse = file_signals.clone();
     let collapse_all = move |_| {
@@ -396,8 +494,93 @@ pub fn DiffViewer(
     let stat_text = stat.as_ref().map(|s| normalize_stat(s));
     let has_stat = stat_text.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
 
+    // The scrolled pane of file sections, and the file at its top.
+    let pane = NodeRef::<leptos::html::Div>::new();
+    let current = RwSignal::new(None::<usize>);
+    let on_scroll = move |_| {
+        let Some(el) = pane.try_get_untracked().flatten() else { return };
+        let tops = section_tops(&el);
+        let top = f64::from(el.scroll_top());
+        current.try_set(current_file(&tops, top));
+        let anchor = paths.try_with_value(|p| anchor_at(p, &tops, top)).flatten();
+        memory.try_update_value(|m| m.anchor = anchor);
+    };
+    // Back to where the reader was, once the sections are laid out.
+    Effect::new(move |_| {
+        if pane.get().is_none() {
+            return;
+        }
+        request_animation_frame(move || {
+            let Some(el) = pane.try_get_untracked().flatten() else { return };
+            let tops = section_tops(&el);
+            let anchor = memory.try_with_value(|m| m.anchor.clone()).flatten();
+            let end = f64::from(el.scroll_height());
+            let restored = anchor.and_then(|anchor| {
+                paths.try_with_value(|p| restored_scroll_top(&anchor, p, &tops, end)).flatten()
+            });
+            if let Some(top) = restored {
+                el.set_scroll_top(top.round() as i32);
+            }
+            current.try_set(current_file(&tops, f64::from(el.scroll_top())));
+        });
+    });
+    // Open a file and bring its header to the top of the pane.
+    let jump = move |idx: usize, collapsed: RwSignal<bool>| {
+        collapsed.set(false);
+        current.set(Some(idx));
+        request_animation_frame(move || {
+            let Some(el) = pane.try_get_untracked().flatten() else { return };
+            if let Some(top) = section_tops(&el).get(idx) {
+                el.set_scroll_top(top.round() as i32);
+            }
+        });
+    };
+
+    let nav = (file_count > 1).then(|| {
+        let items = files.iter().enumerate().map(|(idx, file)| {
+            let (name, dir) = split_path(&file.path);
+            let (name, dir) = (name.to_string(), dir.to_string());
+            let (adds, dels) = (file.additions, file.deletions);
+            let collapsed = file_signals[idx];
+            let is_current = move || current.get() == Some(idx);
+            view! {
+                <li>
+                    <button
+                        data-testid="diff-file-nav-item"
+                        data-path=file.path.clone()
+                        aria-current=move || if is_current() { "true" } else { "false" }
+                        title=file.path.clone()
+                        class=move || format!(
+                            "w-full text-left px-2 py-1 rounded transition-colors {}",
+                            if is_current() { "bg-blue-500/15 text-white/90" } else { "text-white/60 hover:bg-white/[0.05] hover:text-white/80" }
+                        )
+                        on:click=move |_| jump(idx, collapsed)
+                    >
+                        <span class="flex items-center gap-2 text-xs">
+                            <span class="font-mono truncate">{name}</span>
+                            <span class="ml-auto shrink-0 text-emerald-400">{"+"}{adds}</span>
+                            <span class="shrink-0 text-red-400">{"-"}{dels}</span>
+                        </span>
+                        {(!dir.is_empty()).then(|| view! {
+                            <span class="block text-[11px] font-mono text-white/30 truncate">{dir}</span>
+                        })}
+                    </button>
+                </li>
+            }
+        }).collect_view();
+        view! {
+            <nav
+                data-testid="diff-file-nav"
+                aria-label="Changed files"
+                class="w-56 shrink-0 overflow-y-auto rounded-lg border border-white/[0.06] bg-white/[0.02] p-1"
+            >
+                <ul class="space-y-0.5">{items}</ul>
+            </nav>
+        }
+    });
+
     view! {
-        <div class="diff-viewer space-y-3">
+        <div class="diff-viewer flex flex-col gap-3 min-h-0">
             // Summary header — compact, with global actions
             <div class="rounded-lg bg-white/[0.03] border border-white/[0.06]">
                 <div class="flex items-center gap-3 px-3 py-2 flex-wrap">
@@ -441,57 +624,72 @@ pub fn DiffViewer(
                 })}
             </div>
 
-            // File sections
-            {files.into_iter().enumerate().map(|(idx, file)| {
-                let path = file.path.clone();
-                let adds = file.additions;
-                let dels = file.deletions;
-                let collapsed = file_signals[idx];
+            <div class=format!("flex gap-3 min-h-0 {height}")>
+                {nav}
 
-                view! {
-                    <div class="rounded-lg border border-white/[0.06] overflow-hidden">
-                        <button
-                            class="w-full flex items-center gap-2 px-3 py-2 bg-white/[0.03] hover:bg-white/[0.05] transition-colors text-left"
-                            on:click=move |_| collapsed.update(|v| *v = !*v)
-                        >
-                            <span class="text-xs text-white/40">{move || if collapsed.get() { "▶" } else { "▼" }}</span>
-                            <span class="text-sm font-mono text-white/80 truncate">{path.clone()}</span>
-                            <span class="ml-auto flex items-center gap-2 text-xs">
-                                <span class="text-emerald-400">{"+"}{adds}</span>
-                                <span class="text-red-400">{"-"}{dels}</span>
-                            </span>
-                        </button>
+                // File sections. Each header sticks to the top of the pane
+                // while its file is read, until the next file's header
+                // takes its place.
+                <div
+                    node_ref=pane
+                    on:scroll=on_scroll
+                    data-testid="diff-files"
+                    class="relative flex-1 min-w-0 overflow-y-auto space-y-3"
+                >
+                    {files.into_iter().enumerate().map(|(idx, file)| {
+                        let path = file.path.clone();
+                        let adds = file.additions;
+                        let dels = file.deletions;
+                        let collapsed = file_signals[idx];
 
-                        <Show when=move || !collapsed.get()>
-                            <div class="overflow-x-auto">
-                                <pre class="text-xs font-mono leading-5 p-0 m-0">
-                                    {file.lines.iter().map(|line| {
-                                        let (bg, text_color) = match line.kind {
-                                            LineKind::Addition => ("bg-emerald-500/10", "text-emerald-300"),
-                                            LineKind::Deletion => ("bg-red-500/10", "text-red-300"),
-                                            LineKind::Header => ("bg-blue-500/10", "text-blue-300"),
-                                            LineKind::Context => ("", "text-white/50"),
-                                        };
-                                        let content = line.content.clone();
-                                        view! {
-                                            <div class=format!("px-3 min-h-[1.25rem] {} {}", bg, text_color)>
-                                                {content}
-                                            </div>
-                                        }
-                                    }).collect_view()}
-                                </pre>
+                        view! {
+                            <div data-testid="diff-file" data-diff-file=path.clone() class="rounded-lg border border-white/[0.06]">
+                                <button
+                                    data-testid="diff-file-header"
+                                    class="sticky top-0 z-10 w-full flex items-center gap-2 px-3 py-2 rounded-t-lg bg-[#15151e] hover:bg-[#1a1a24] transition-colors text-left"
+                                    aria-expanded=move || if collapsed.get() { "false" } else { "true" }
+                                    on:click=move |_| collapsed.update(|v| *v = !*v)
+                                >
+                                    <span class="text-xs text-white/40">{move || if collapsed.get() { "▶" } else { "▼" }}</span>
+                                    <span class="text-sm font-mono text-white/80 truncate">{path.clone()}</span>
+                                    <span class="ml-auto flex items-center gap-2 text-xs">
+                                        <span class="text-emerald-400">{"+"}{adds}</span>
+                                        <span class="text-red-400">{"-"}{dels}</span>
+                                    </span>
+                                </button>
+
+                                <Show when=move || !collapsed.get()>
+                                    <div class="overflow-x-auto">
+                                        <pre class="text-xs font-mono leading-5 p-0 m-0">
+                                            {file.lines.iter().map(|line| {
+                                                let (bg, text_color) = match line.kind {
+                                                    LineKind::Addition => ("bg-emerald-500/10", "text-emerald-300"),
+                                                    LineKind::Deletion => ("bg-red-500/10", "text-red-300"),
+                                                    LineKind::Header => ("bg-blue-500/10", "text-blue-300"),
+                                                    LineKind::Context => ("", "text-white/50"),
+                                                };
+                                                let content = line.content.clone();
+                                                view! {
+                                                    <div class=format!("px-3 min-h-[1.25rem] {} {}", bg, text_color)>
+                                                        {content}
+                                                    </div>
+                                                }
+                                            }).collect_view()}
+                                        </pre>
+                                    </div>
+                                </Show>
                             </div>
-                        </Show>
-                    </div>
-                }
-            }).collect_view()}
+                        }
+                    }).collect_view()}
+                </div>
+            </div>
         </div>
     }.into_any()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_stat, parse_diff};
+    use super::{anchor_at, current_file, normalize_stat, parse_diff, restored_scroll_top, split_path, DiffAnchor};
 
     fn only_path(raw: &str) -> String {
         let files = parse_diff(raw);
@@ -679,6 +877,63 @@ mod tests {
         assert!(out.contains("a+b.txt"));
         assert!(out.contains("c-d.txt"));
     }
+
+    fn paths(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn the_current_file_is_the_last_one_whose_header_has_reached_the_top() {
+        let tops = [0.0, 400.0, 900.0];
+        assert_eq!(current_file(&tops, 0.0), Some(0));
+        assert_eq!(current_file(&tops, 398.0), Some(0));
+        // A header a rounding pixel short of the top already counts.
+        assert_eq!(current_file(&tops, 399.5), Some(1));
+        // Jumping to a file scrolls its header to the top: that file is current.
+        assert_eq!(current_file(&tops, 400.0), Some(1));
+        assert_eq!(current_file(&tops, 2000.0), Some(2));
+        assert_eq!(current_file(&[], 10.0), None);
+    }
+
+    #[test]
+    fn a_place_in_the_diff_is_kept_as_a_file_and_an_offset_into_it() {
+        let names = paths(&["a.rs", "b.rs", "c.rs"]);
+        let anchor = anchor_at(&names, &[0.0, 400.0, 900.0], 650.0);
+        assert_eq!(anchor, Some(DiffAnchor { path: "b.rs".into(), offset: 250.0 }));
+    }
+
+    #[test]
+    fn a_refresh_that_grows_an_earlier_file_keeps_the_reader_in_the_same_file() {
+        let names = paths(&["a.rs", "b.rs", "c.rs"]);
+        let anchor = anchor_at(&names, &[0.0, 400.0, 900.0], 650.0).unwrap();
+        // After the refresh `a.rs` holds 300px more: the pixel position moved,
+        // the place in `b.rs` did not.
+        let top = restored_scroll_top(&anchor, &names, &[0.0, 700.0, 1200.0], 2000.0);
+        assert_eq!(top, Some(950.0));
+    }
+
+    #[test]
+    fn a_refresh_that_shrinks_the_file_keeps_the_offset_inside_it() {
+        let names = paths(&["a.rs", "b.rs"]);
+        let anchor = DiffAnchor { path: "a.rs".into(), offset: 600.0 };
+        let top = restored_scroll_top(&anchor, &names, &[0.0, 200.0], 800.0);
+        assert_eq!(top, Some(199.0));
+        // The last file ends where the pane does.
+        let last = DiffAnchor { path: "b.rs".into(), offset: 5000.0 };
+        assert_eq!(restored_scroll_top(&last, &names, &[0.0, 200.0], 800.0), Some(799.0));
+    }
+
+    #[test]
+    fn a_file_no_longer_in_the_diff_restores_nothing() {
+        let anchor = DiffAnchor { path: "gone.rs".into(), offset: 10.0 };
+        assert_eq!(restored_scroll_top(&anchor, &paths(&["a.rs"]), &[0.0], 100.0), None);
+    }
+
+    #[test]
+    fn the_file_list_names_a_file_and_its_directory() {
+        assert_eq!(split_path("src/components/diff_viewer.rs"), ("diff_viewer.rs", "src/components"));
+        assert_eq!(split_path("README.md"), ("README.md", ""));
+    }
 }
 
 /// Modal wrapper for viewing diffs
@@ -713,10 +968,11 @@ pub fn DiffModal(
                                     "×"
                                 </button>
                             </div>
-                            <div class="overflow-y-auto p-4">
+                            <div class="min-h-0 p-4">
                                 <DiffViewer
                                     diff=diff_val
                                     stat=stat_val
+                                    height="max-h-[calc(85vh-9rem)]"
                                 />
                             </div>
                         </div>
