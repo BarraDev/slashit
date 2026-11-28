@@ -270,6 +270,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
                 removed_at: None,
+                pr_review_defaults: Default::default(),
             };
             let project_id = project.id;
             state.project.projects.write().await.insert(project_id, project);
@@ -670,6 +671,7 @@ mod tests {
                     created_at: chrono::Utc::now(),
                     updated_at: chrono::Utc::now(),
                     removed_at: None,
+                    pr_review_defaults: Default::default(),
                 },
             );
 

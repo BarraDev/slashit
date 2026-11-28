@@ -759,6 +759,7 @@ mod tests {
             agent_type: AgentType::ClaudeCode,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            pr_review_defaults: Default::default(),
         }
     }
 

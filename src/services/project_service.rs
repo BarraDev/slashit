@@ -109,6 +109,21 @@ pub async fn rename_project(project_id: String, name: String) -> Result<(), Stri
         .ok_or_else(|| "This Project no longer exists.".to_string())
 }
 
+/// Save a Project's PR Comment Review defaults. Nothing else about the Project changes.
+pub async fn set_project_pr_review_defaults(
+    project_id: String,
+    defaults: PrReviewDefaults,
+) -> Result<Project, String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({
+        "id": project_id,
+        "autoPush": defaults.auto_push,
+    })).unwrap();
+
+    let response = invoke_checked("set_project_pr_review_defaults", args).await?;
+    let updated: Option<Project> = serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())?;
+    updated.ok_or_else(|| "This Project no longer exists.".to_string())
+}
+
 /// Remove a Project from SlashIt's active Projects. Its folder, Tasks, history
 /// and identity are kept; opening the same folder again brings it back.
 pub async fn remove_project(project_id: String) -> Result<(), String> {

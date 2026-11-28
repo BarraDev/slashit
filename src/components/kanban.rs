@@ -203,6 +203,16 @@ pub fn Kanban(
     let pr_review_applying = RwSignal::new(false);
     let pr_review_error = RwSignal::new(None::<String>);
     let pr_review_auto_push = RwSignal::new(crate::services::PR_REVIEW_AUTO_PUSH_DEFAULT);
+    // The Project's saved PR review defaults; refreshed at each dialog opening.
+    let pr_review_defaults = RwSignal::new(crate::models::PrReviewDefaults::default());
+    {
+        let project_id = project_id.clone();
+        spawn_local(async move {
+            if let Ok(Some(project)) = crate::services::get_project(project_id).await {
+                let _ = pr_review_defaults.try_set(project.pr_review_defaults);
+            }
+        });
+    }
     let pr_review_selected_replies = RwSignal::new(Vec::<(u64, String, bool)>::new());
     let pr_review_dry_run = RwSignal::new(false);
     let pr_review_last_apply = RwSignal::new(None::<PrReviewApplyResult>);
@@ -495,13 +505,35 @@ pub fn Kanban(
         generation: RwSignal::new(0_u64),
     };
     let on_analyze_pr_comments = Callback::new({
+        let project_id = project_id.clone();
         move |task: Task| {
-            if !pr_review_dialog.open(task.clone()) {
-                return;
-            }
+            // The Project's saved default, read as of this opening so a change
+            // made in the Project settings applies at once. A failed read
+            // falls back to the safe default: off.
+            let defaults = pr_review_defaults.get_untracked();
+            let needs_analysis = pr_review_dialog.open(task.clone(), defaults);
             let Some(opening) = pr_review_dialog.opening() else {
                 return;
             };
+            // Refresh the Project's defaults at every opening, including one
+            // that reuses a cached plan, so a changed default applies at once.
+            spawn_local({
+                let project_id = project_id.clone();
+                async move {
+                    let read = crate::services::get_project(project_id).await;
+                    let saved = match &read {
+                        Ok(Some(project)) => Some(project.pr_review_defaults),
+                        _ => None,
+                    };
+                    pr_review_dialog.adopt_saved_auto_push(opening, defaults, saved);
+                    if let Some(saved) = saved {
+                        let _ = pr_review_defaults.try_set(saved);
+                    }
+                }
+            });
+            if !needs_analysis {
+                return;
+            }
             spawn_local(async move {
                 match analyze_pr_comments(task.id.to_string()).await {
                     Ok(plan) => {
@@ -1106,6 +1138,23 @@ impl PrReviewDialog {
         true
     }
 
+    /// Applies the Project's saved Auto-push default read for `opening`, which
+    /// started from the cached `started_with`. A failed read (`saved` is
+    /// `None`) falls back to the safe default: off. Only before the person has
+    /// touched the toggle: it still shows the value this opening started with.
+    fn adopt_saved_auto_push(
+        self,
+        opening: ReviewOpening,
+        started_with: crate::models::PrReviewDefaults,
+        saved: Option<crate::models::PrReviewDefaults>,
+    ) -> bool {
+        if !self.shows(opening) || self.auto_push.try_get_untracked() != Some(started_with.auto_push) {
+            return false;
+        }
+        self.auto_push.set(saved.is_some_and(|d| d.auto_push));
+        true
+    }
+
     /// Clears the replies selected for posting after a Sync that began at
     /// `opening`, but only while that opening is shown.
     fn release_selected_replies(self, opening: ReviewOpening) -> bool {
@@ -1120,15 +1169,15 @@ impl PrReviewDialog {
 impl PrReviewDialog {
     /// Prepares and shows the dialog for `task`. Returns `true` when no usable
     /// plan is cached, so the caller must analyze the task's comments.
-    fn open(self, task: Task) -> bool {
+    fn open(self, task: Task, defaults: crate::models::PrReviewDefaults) -> bool {
         // Every operation started before this opening is now stale.
         self.generation.update(|g| *g += 1);
         // Auto-push is a choice for one dialog opening. Every opening starts
-        // from the default, so enabling it for one Task never reaches another,
-        // or the same Task on a later opening. Nothing else resets it while
-        // the dialog is open.
-        self.auto_push
-            .set(crate::services::PR_REVIEW_AUTO_PUSH_DEFAULT);
+        // from the Project's saved default (off unless the Project turned it
+        // on), so enabling it for one Task never reaches another, or the same
+        // Task on a later opening. Nothing else resets it while the dialog is
+        // open.
+        self.auto_push.set(defaults.auto_push);
         // Reply selections follow the same rule: a Task A selection must not
         // leave Task B's Post button enabled.
         self.selected_replies.set(Vec::new());
@@ -3560,11 +3609,11 @@ mod tests {
         let dialog = dialog(&owner);
         let task_a = task_with_plan_for_pr(1, 101);
         let task_b = task_with_plan_for_pr(2, 202);
-        assert!(!dialog.open(task_a.clone()), "A has a cached plan");
+        assert!(!dialog.open(task_a.clone(), Default::default()), "A has a cached plan");
         let opening_a = dialog.opening().expect("A is shown");
         dialog.show.set(false);
 
-        assert!(!dialog.open(task_b.clone()), "B has a cached plan");
+        assert!(!dialog.open(task_b.clone(), Default::default()), "B has a cached plan");
         let opening_b = dialog.opening().expect("B is shown");
         dialog
             .selected_replies
@@ -3600,7 +3649,7 @@ mod tests {
         let owner = Owner::new();
         let dialog = dialog(&owner);
         let task_a = task_with_plan_for_pr(1, 101);
-        assert!(!dialog.open(task_a.clone()));
+        assert!(!dialog.open(task_a.clone(), Default::default()));
         let opening_a = dialog.opening().expect("A is shown");
 
         let refreshed = task_with_plan_for_pr(1, 303).pr_review_plan.expect("a plan");
@@ -3619,10 +3668,10 @@ mod tests {
         let owner = Owner::new();
         let dialog = dialog(&owner);
         let task_a = task_with_plan_for_pr(1, 101);
-        assert!(!dialog.open(task_a.clone()));
+        assert!(!dialog.open(task_a.clone(), Default::default()));
         let first = dialog.opening().expect("shown");
         dialog.show.set(false);
-        assert!(!dialog.open(task_a.clone()));
+        assert!(!dialog.open(task_a.clone(), Default::default()));
         assert!(!dialog.shows(first));
         let stale = task_with_plan_for_pr(1, 999).pr_review_plan.expect("a plan");
         assert!(!dialog.adopt_plan(first, stale));
@@ -3635,7 +3684,7 @@ mod tests {
         let owner = Owner::new();
         let dialog = dialog(&owner);
         let task_a = task_with_plan_for_pr(1, 101);
-        assert!(!dialog.open(task_a.clone()));
+        assert!(!dialog.open(task_a.clone(), Default::default()));
         let opening_a = dialog.opening().expect("shown");
         dialog.show.set(false);
         let refreshed = task_with_plan_for_pr(1, 404).pr_review_plan.expect("a plan");
@@ -3656,7 +3705,7 @@ mod tests {
     fn a_disposed_dialog_shows_nothing_and_does_not_panic() {
         let owner = Owner::new();
         let dialog = dialog(&owner);
-        assert!(!dialog.open(task_with_cached_plan(1)));
+        assert!(!dialog.open(task_with_cached_plan(1), Default::default()));
         let opening = dialog.opening().expect("shown before disposal");
         drop(owner);
         assert_eq!(dialog.opening(), None);
@@ -3692,7 +3741,7 @@ mod tests {
         let task_b = column_task(2, "b");
 
         assert!(
-            dialog.open(task_a.clone()),
+            dialog.open(task_a.clone(), Default::default()),
             "no cached plan, so task A is analyzed"
         );
         assert!(
@@ -3702,7 +3751,7 @@ mod tests {
         dialog.auto_push.set(true);
         dialog.show.set(false);
 
-        assert!(dialog.open(task_b), "task B is analyzed");
+        assert!(dialog.open(task_b, Default::default()), "task B is analyzed");
         assert!(
             !dialog.auto_push.get_untracked(),
             "task B opens with Auto-push off"
@@ -3710,11 +3759,53 @@ mod tests {
 
         dialog.auto_push.set(true);
         dialog.show.set(false);
-        assert!(dialog.open(task_a), "reopening task A is analyzed");
+        assert!(dialog.open(task_a, Default::default()), "reopening task A is analyzed");
         assert!(
             !dialog.auto_push.get_untracked(),
             "reopening task A opens with Auto-push off"
         );
+    }
+
+    /// The dialog's Auto-push toggle starts from the Project's saved default,
+    /// and a later opening with the default off clears it again.
+    #[test]
+    fn the_dialog_initial_auto_push_reads_the_project_default() {
+        let owner = Owner::new();
+        let dialog = dialog(&owner);
+        let on = crate::models::PrReviewDefaults { auto_push: true };
+
+        assert!(dialog.open(column_task(1, "a"), on));
+        assert!(dialog.auto_push.get_untracked(), "the Project turned Auto-push on");
+        dialog.show.set(false);
+
+        assert!(dialog.open(column_task(2, "b"), Default::default()));
+        assert!(!dialog.auto_push.get_untracked(), "a Project with the default off opens it off");
+    }
+
+    /// A failed Project read must not leave Auto-push on just because the
+    /// cached default was on; a successful read still applies the saved value,
+    /// and a toggle the person already changed is left alone.
+    #[test]
+    fn a_failed_project_read_turns_a_cached_auto_push_default_off() {
+        let owner = Owner::new();
+        let dialog = dialog(&owner);
+        let on = crate::models::PrReviewDefaults { auto_push: true };
+
+        assert!(dialog.open(column_task(1, "a"), on));
+        let opening = dialog.opening().expect("the dialog shows task a");
+        assert!(dialog.adopt_saved_auto_push(opening, on, None));
+        assert!(!dialog.auto_push.get_untracked(), "a failed read falls back to off");
+
+        assert!(dialog.open(column_task(2, "b"), on));
+        let opening = dialog.opening().expect("the dialog shows task b");
+        assert!(dialog.adopt_saved_auto_push(opening, on, Some(on)));
+        assert!(dialog.auto_push.get_untracked(), "a saved default of on still applies");
+
+        assert!(dialog.open(column_task(3, "c"), Default::default()));
+        let opening = dialog.opening().expect("the dialog shows task c");
+        dialog.auto_push.set(true);
+        assert!(!dialog.adopt_saved_auto_push(opening, Default::default(), None));
+        assert!(dialog.auto_push.get_untracked(), "the person's own choice is kept");
     }
 
     /// A reply selected for Task A must not stay selected, and keep Post enabled,
@@ -3726,13 +3817,13 @@ mod tests {
         let task_a = column_task(1, "a");
         let task_b = column_task(2, "b");
 
-        assert!(dialog.open(task_a), "task A is analyzed");
+        assert!(dialog.open(task_a, Default::default()), "task A is analyzed");
         dialog
             .selected_replies
             .set(vec![(7, "Fixed it.".to_string(), false)]);
         dialog.show.set(false);
 
-        assert!(dialog.open(task_b), "task B is analyzed");
+        assert!(dialog.open(task_b, Default::default()), "task B is analyzed");
         assert!(
             dialog.selected_replies.get_untracked().is_empty(),
             "task A's selection must not carry over to task B"
@@ -3746,14 +3837,14 @@ mod tests {
         let cached = task_with_cached_plan(3);
 
         assert!(
-            !dialog.open(cached.clone()),
+            !dialog.open(cached.clone(), Default::default()),
             "a usable cached plan is shown without analysis"
         );
         assert!(dialog.show.get_untracked());
         dialog.auto_push.set(true);
         dialog.show.set(false);
 
-        assert!(!dialog.open(cached));
+        assert!(!dialog.open(cached, Default::default()));
         assert!(
             !dialog.auto_push.get_untracked(),
             "the cached-plan opening starts with Auto-push off"
@@ -3793,7 +3884,7 @@ mod tests {
     fn a_refused_operation_keeps_the_drafts() {
         let owner = Owner::new();
         let dialog = dialog(&owner);
-        assert!(!dialog.open(task_with_cached_plan(1)));
+        assert!(!dialog.open(task_with_cached_plan(1), Default::default()));
         let opening = dialog.opening().expect("shown");
         let mut drafted = dialog.plan.get_untracked().expect("plan");
         let item = &mut drafted.items[0];

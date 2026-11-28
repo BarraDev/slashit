@@ -3570,6 +3570,7 @@ baz = 123
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             removed_at: None,
+            pr_review_defaults: Default::default(),
         }
     }
 
@@ -3623,6 +3624,7 @@ baz = 123
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             removed_at: None,
+            pr_review_defaults: Default::default(),
         };
         config.projects.insert(project_id.to_string(), project);
         
@@ -4123,6 +4125,7 @@ user_name = "Test"
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
                 removed_at: None,
+                pr_review_defaults: Default::default(),
             },
         );
 
@@ -4220,6 +4223,7 @@ user_name = "Test"
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             removed_at: None,
+            pr_review_defaults: Default::default(),
         };
 
         let mut config = AppConfig::default();

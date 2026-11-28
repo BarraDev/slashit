@@ -499,6 +499,7 @@ fn materialize(payload: Payload) -> Result<Materialized, BundleError> {
         created_at: p.created_at,
         updated_at: p.updated_at,
         removed_at: None,
+        pr_review_defaults: Default::default(),
     };
 
     let mut normalization = Vec::new();

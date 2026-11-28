@@ -1276,6 +1276,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
                 removed_at: None,
+                pr_review_defaults: Default::default(),
             },
         );
         config
@@ -1395,6 +1396,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             removed_at: None,
+            pr_review_defaults: Default::default(),
         };
         let project_id = project.id;
 
@@ -1534,6 +1536,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             removed_at: None,
+            pr_review_defaults: Default::default(),
         };
         let project_id = project.id;
 
@@ -1956,6 +1959,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             removed_at: None,
+            pr_review_defaults: Default::default(),
         };
 
         let mut task = crate::test_helpers::create_test_task("A task");
@@ -2091,6 +2095,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             removed_at: None,
+            pr_review_defaults: Default::default(),
         };
         let stale = tmp
             .path()
@@ -2201,6 +2206,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             removed_at: None,
+            pr_review_defaults: Default::default(),
         };
         let stale = tmp
             .path()
@@ -2332,6 +2338,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             removed_at: None,
+            pr_review_defaults: Default::default(),
         };
 
         // `InProgress` with an idle phase, which is exactly what the queue
@@ -2604,6 +2611,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             removed_at: None,
+            pr_review_defaults: Default::default(),
         };
 
         let recorded_path = tmp
@@ -2730,6 +2738,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             removed_at: None,
+            pr_review_defaults: Default::default(),
         };
 
         let mut task = crate::test_helpers::create_test_task("checkout vanished");
@@ -3237,6 +3246,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             removed_at: None,
+            pr_review_defaults: Default::default(),
         };
         let storage = Storage::with_paths((*paths).clone());
         let mut cfg = config::storage::AppConfig::default();

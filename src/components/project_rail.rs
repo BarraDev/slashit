@@ -611,6 +611,7 @@ mod tests {
             agent_type: crate::models::AgentType::ClaudeCode,
             created_at: now,
             updated_at: now,
+            pr_review_defaults: Default::default(),
         }
     }
 

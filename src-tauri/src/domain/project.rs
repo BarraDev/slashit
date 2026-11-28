@@ -73,6 +73,16 @@ impl ProjectBase {
     }
 }
 
+/// A Project's defaults for the PR Comment Review options. Auto-push is off
+/// unless a person turns it on; a review can still override it per operation.
+/// Records stored before this existed load with it off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrReviewDefaults {
+    /// Push the task branch after review fixes are committed.
+    #[serde(default)]
+    pub auto_push: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: Uuid,
@@ -115,6 +125,9 @@ pub struct Project {
     /// returns the same Project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub removed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Defaults for the PR Comment Review options. See [`PrReviewDefaults`].
+    #[serde(default)]
+    pub pr_review_defaults: PrReviewDefaults,
 }
 
 /// The refusal every admission boundary gives for a removed Project.
