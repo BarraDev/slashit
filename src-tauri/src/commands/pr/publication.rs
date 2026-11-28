@@ -407,6 +407,60 @@ fn record_write_failure(error: RecordWriteError) -> String {
     format!("the publication could not be recorded: {error}")
 }
 
+/// Record that the approved `commit` is on `branch` for `pr_url`, after the
+/// remote was read at it: pushed by this request, or already there. Without
+/// this record an approved correction linked to its pull request is not
+/// delivered (see `open_delivery`), so a retry that finds the remote already
+/// at the commit must write it too.
+///
+/// A record already `Published` for this exact commit, branch and pull request
+/// is left as it is. An unreconciled record for anything else is not
+/// overwritten, because its outcome is still unknown; the caller refuses.
+pub(in crate::commands::pr) async fn record_approved_publication(
+    state: &crate::AppState,
+    task_id: Uuid,
+    branch: &str,
+    commit: &str,
+    pr_url: &str,
+) -> Result<(), String> {
+    let existing = state
+        .task
+        .tasks
+        .read()
+        .await
+        .get(&task_id)
+        .and_then(|t| t.pr_publication.clone());
+    let same = |r: &PrPublication| r.commit == commit && r.branch == branch && r.pr_url == pr_url;
+    if let Some(record) = existing.as_ref() {
+        if same(record) && record.state == (PublicationState::Published {}) {
+            return Ok(());
+        }
+        if record.needs_reconciliation() && !same(record) {
+            return Err(format!(
+                "An earlier publication of {} to {} is still unsettled, so the approved commit {} was \
+                 not recorded as published. Reconcile that publication first.",
+                short_commit(&record.commit),
+                record.pr_url,
+                short_commit(commit),
+            ));
+        }
+    }
+    let now = chrono::Utc::now();
+    let record = PrPublication {
+        request_id: Uuid::new_v4(),
+        commit: commit.to_string(),
+        branch: branch.to_string(),
+        pr_url: pr_url.to_string(),
+        remote_before: None,
+        state: PublicationState::Published {},
+        requested_at: now,
+        updated_at: now,
+    };
+    write_publication(state, task_id, existing.as_ref(), &record)
+        .await
+        .map_err(record_write_failure)
+}
+
 /// Refuse while the task is queued, being worked on, in AI review, or while
 /// an agent run is live. Checked before the reservation, because the
 /// reservation ends an existing run's ownership and would cancel it.
@@ -697,7 +751,7 @@ mod orchestration {
     //! The publish command against a real bare remote. GitHub's answer is the
     //! only stand-in ([`super::test_seam`]); every Git effect is real.
 
-    use super::{inspect, remote_head_of, test_seam};
+    use super::{inspect, record_approved_publication, remote_head_of, test_seam};
     use crate::domain::publication::{PrPublication, PublicationState};
     use crate::domain::task::{FixEffect, HumanReviewRecord, PrReviewDecision, PrReviewItem, PrReviewPlan};
     use crate::domain::{AgentConfig, AgentType, Project, ProjectScope, Repository, Task, TaskStatus};
@@ -1100,6 +1154,64 @@ mod orchestration {
         let retried = publish(&fx.state, fx.task_id, BRANCH, &c1, PR).await.unwrap();
         assert_eq!(retried.state, PublicationState::Published {});
         assert_eq!(fx.remote_head().as_deref(), Some(c1.as_str()));
+    }
+
+    #[tokio::test]
+    async fn an_approved_commit_already_on_the_remote_is_recorded_and_the_retry_is_idempotent() {
+        let fx = fixture().await;
+        let c1 = fx.commit("one");
+        // An earlier attempt pushed it, and only the record was lost.
+        git(&fx.checkout, &["push", "-q", "origin", &format!("{c1}:refs/heads/{BRANCH}")]);
+
+        record_approved_publication(&fx.state, fx.task_id, BRANCH, &c1, PR)
+            .await
+            .expect("the approved commit is recorded as published");
+        let first = fx.record().await.expect("a record exists");
+        assert_eq!(first.state, PublicationState::Published {});
+        assert_eq!(first.commit, c1);
+
+        record_approved_publication(&fx.state, fx.task_id, BRANCH, &c1, PR)
+            .await
+            .expect("a retry of the same outcome succeeds");
+        assert_eq!(
+            fx.record().await.expect("the record stays").request_id,
+            first.request_id,
+            "the retry writes no new record"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_publication_record_is_reported_and_a_retry_records_it() {
+        let fx = fixture().await;
+        let c1 = fx.commit("one");
+        git(&fx.checkout, &["push", "-q", "origin", &format!("{c1}:refs/heads/{BRANCH}")]);
+        fx.block_persistence();
+
+        let error = record_approved_publication(&fx.state, fx.task_id, BRANCH, &c1, PR)
+            .await
+            .expect_err("a persistence failure is returned to the caller");
+        assert!(!error.is_empty());
+        assert!(fx.record().await.is_none(), "an unwritten record is not published");
+
+        fx.unblock_persistence();
+        record_approved_publication(&fx.state, fx.task_id, BRANCH, &c1, PR)
+            .await
+            .expect("the retry records the outcome");
+        assert_eq!(fx.record().await.unwrap().state, PublicationState::Published {});
+    }
+
+    #[tokio::test]
+    async fn an_unsettled_publication_of_another_commit_is_not_overwritten() {
+        let fx = fixture().await;
+        let c1 = fx.commit("one");
+        let c2 = fx.commit("two");
+        fx.leave_record(pending_record(&c1, &fx.base)).await;
+
+        let error = record_approved_publication(&fx.state, fx.task_id, BRANCH, &c2, PR)
+            .await
+            .expect_err("an unsettled record for another commit is not overwritten");
+        assert!(error.contains("still unsettled"), "{error}");
+        assert_eq!(fx.record().await.unwrap().commit, c1);
     }
 
     #[tokio::test]

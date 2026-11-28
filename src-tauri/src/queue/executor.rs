@@ -1088,6 +1088,26 @@ fn polled_pull_requests(
         .collect()
 }
 
+/// Reopen a reference `task` records as `CLOSED` for the pull request `key`,
+/// because an admitted `OPEN` observation at the approved commit replaces it
+/// in the same write that moves the Task. `MERGED` stays final and is never
+/// touched. Answers whether anything changed.
+fn reopen_recorded_closure(task: &mut Task, key: &crate::pr_status::PrKey, state: &str) -> bool {
+    let mut changed = false;
+    for r in &mut task.external_refs {
+        if let ExternalRef::GithubPr { number, repo, state: recorded, .. } = r {
+            if *number == key.number
+                && *repo == key.repo
+                && recorded.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("CLOSED"))
+            {
+                *recorded = Some(state.to_string());
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 /// Write `state` onto every reference `task` has to the pull request `key`,
 /// and note it in the task's activity when it is a milestone. Answers whether
 /// anything changed.
@@ -3850,7 +3870,7 @@ impl TaskExecutor {
                     .await
             }
             PrState::Merged => {}
-            _ => self.record_pr_poll_state(task_id, observation).await,
+            _ => self.record_pr_poll_state(task_id, observation).await?,
         }
         Ok(())
     }
@@ -3915,9 +3935,14 @@ impl TaskExecutor {
             return Err(crate::domain::project::PROJECT_REMOVED_REFUSAL.to_string());
         }
         // Admission under the lease: a superseded reading writes nothing, and
-        // the newer one is observed on its own.
+        // the newer one is observed on its own. The merge commit is still
+        // missing, so this is not success: it is retryable until a later
+        // observation records it.
         if !self.pr_statuses.admit(observation).await {
-            return Ok(());
+            return Err(format!(
+                "Pull request #{} merge commit was not recorded: a newer reading of the pull request arrived first; refresh again",
+                key.number
+            ));
         }
         let key_owned = key.clone();
         let commit_owned = commit.to_string();
@@ -3968,23 +3993,26 @@ impl TaskExecutor {
     /// selector-terminal and would self-heal on the next poll regardless; it
     /// is persisted the same way here only because it shares this call site,
     /// not because it shares the hazard.
+    ///
+    /// Returns the write failure, so an explicit refresh reports it; the
+    /// background poll logs it and asks again on its next pass.
     async fn record_pr_poll_state(
         &self,
         task_id: Uuid,
         observation: &crate::pr_status::PrObservation,
-    ) {
+    ) -> Result<(), String> {
         let key = &observation.key;
         let Some(state) = observation.state.as_recorded() else {
-            return;
+            return Ok(());
         };
         // Declined while another transition holds the task: the next poll
         // observes the same state again, so nothing is lost.
         let Some(_lease) = self.lifecycle.try_acquire(task_id).await else {
-            return;
+            return Ok(());
         };
         // Checked under the lease: removal holds it while it writes `removed_at`.
         if self.task_project_removed(task_id).await {
-            return;
+            return Ok(());
         }
         // The admission boundary, under the lease and before any owner is
         // ended or any Task is written. A reading a newer publication replaced
@@ -3992,17 +4020,21 @@ impl TaskExecutor {
         // the newer reading is observed on its own pass. Once admitted, the
         // decision below is not revoked by a later publication.
         if !self.pr_statuses.admit(observation).await {
-            return;
+            return Ok(());
         }
         // G2, decided on the Task before any owner is ended. Only a published
         // Human Review correction can move here: an open pull request at the
         // approved commit, with its publication recorded. Anything else
-        // records the state alone.
+        // records the state alone. A pending local integration pins the Task
+        // in Human Review, so it is not moved either (the same rule
+        // `refresh_task_pr_state` applies).
         let head = observation.head_oid.as_deref();
         let verified = {
             let tasks = self.tasks.read().await;
             tasks.get(&task_id).is_some_and(|t| {
-                t.status == TaskStatus::HumanReview && delivery_verified(t, key, state, head)
+                t.status == TaskStatus::HumanReview
+                    && t.integration_unfinished_refusal().is_none()
+                    && delivery_verified(t, key, state, head)
             })
         };
         if verified {
@@ -4010,12 +4042,13 @@ impl TaskExecutor {
             // next observation asks again, and nothing is moved half-way.
             let running = Some(self as &dyn crate::lifecycle::ExecutionOwnership);
             if let Err(e) = crate::lifecycle::end_active_ownership(running, task_id).await {
+                let message = format!("Pull request {state:?} at the approved commit was observed for task {task_id}, but its live run could not be ended, so the task stays in Human Review: {e}");
                 self.events.agent_event(AgentEvent::Log {
                     task_id: task_id.to_string(),
                     level: LogLevel::Warn,
-                    message: format!("Pull request {state:?} at the approved commit was observed for task {task_id}, but its live run could not be ended, so the task stays in Human Review: {e}"),
+                    message,
                 });
-                return;
+                return Ok(());
             }
         }
         let state_owned = state.to_string();
@@ -4025,14 +4058,26 @@ impl TaskExecutor {
             let Some(t) = staged.get_mut(&task_id) else {
                 return false;
             };
-            let mut changed = record_observed_pr_state(t, &key_owned, &state_owned);
+            // Decided on the staged Task: the move and the reopening are one
+            // write. An admitted OPEN observation at the approved commit
+            // reopens a recorded CLOSED reference (MERGED stays final).
+            let delivered_now = verified
+                && t.status == TaskStatus::HumanReview
+                && t.integration_unfinished_refusal().is_none()
+                && delivery_verified(t, &key_owned, &state_owned, head_owned.as_deref());
+            let mut changed = if delivered_now {
+                reopen_recorded_closure(t, &key_owned, &state_owned)
+            } else {
+                false
+            };
+            changed |= record_observed_pr_state(t, &key_owned, &state_owned);
             // A post-PR correction keeps its status and error on a closure:
             // the closure is recorded as the pull request's state only.
             let correction = is_post_pr_correction(t, &key_owned);
             if changed && state_owned == "CLOSED" && in_pr_lifecycle(t) && !correction {
                 t.error_message = Some("PR was closed without merge".to_string());
             }
-            if verified && t.status == TaskStatus::HumanReview && delivery_verified(t, &key_owned, &state_owned, head_owned.as_deref()) {
+            if delivered_now {
                 t.status = TaskStatus::PrCreated;
                 changed = true;
             }
@@ -4054,12 +4099,9 @@ impl TaskExecutor {
                      it failed, so it was not applied and will be retried: {e}"
                 )
             };
-            self.events.agent_event(AgentEvent::Log {
-                task_id: task_id.to_string(),
-                level: LogLevel::Warn,
-                message,
-            });
+            return Err(message);
         }
+        Ok(())
     }
 
     /// Write a PR's remote state onto the task's external ref to that exact
@@ -10138,7 +10180,14 @@ impl TaskExecutor {
         let observation = self
             .pr_statuses
             .observe(key, test_pr_status(state, head_oid, None));
-        self.record_pr_poll_state(task_id, &observation).await;
+        // Logged as the background poll logs a failed write, then the pass goes on.
+        if let Err(message) = self.record_pr_poll_state(task_id, &observation).await {
+            self.events.agent_event(AgentEvent::Log {
+                task_id: task_id.to_string(),
+                level: LogLevel::Warn,
+                message,
+            });
+        }
     }
 }
 
@@ -13270,6 +13319,17 @@ mod tests {
         id
     }
 
+    /// Record `state` on the task's reference to the correction's pull request,
+    /// as an earlier write would have left it.
+    async fn set_recorded_state(executor: &TaskExecutor, task_id: Uuid, state: &str) {
+        let mut tasks = executor.tasks.write().await;
+        for r in &mut tasks.get_mut(&task_id).unwrap().external_refs {
+            if let ExternalRef::GithubPr { state: recorded, .. } = r {
+                *recorded = Some(state.to_string());
+            }
+        }
+    }
+
     /// The rejected observation left the correction as it was: status, live
     /// owner, approval history and the approved commit's currency, publication
     /// record, and Task Checkout.
@@ -13330,7 +13390,10 @@ mod tests {
         executor.pr_statuses.observe(&key, open_reading(Some(NEWER_AT)));
         let before = executor.tasks.read().await[&id].clone();
 
-        executor.record_pr_poll_state(id, &older).await;
+        executor
+            .record_pr_poll_state(id, &older)
+            .await
+            .expect("the older reading records");
 
         assert_correction_kept(&executor, id, &before, &owner, "superseded OPEN under the lease").await;
     }
@@ -13382,6 +13445,118 @@ mod tests {
         assert!(
             after.human_review.is_approved() && after.human_review.approved_tip() == Some(APPROVED_AT),
             "the approval of the approved commit stays current"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_integration_keeps_a_delivered_correction_in_human_review() {
+        use crate::domain::{IntegrationState, IntegrationStrategy, LocalIntegration};
+        let (executor, _temps) = test_executor();
+        let key = crate::pr_status::PrKey::new("owner/repo", 7);
+        let id = published_correction(&executor, TaskStatus::HumanReview).await;
+        executor.tasks.write().await.get_mut(&id).unwrap().local_integration =
+            Some(LocalIntegration {
+                state: IntegrationState::Pending,
+                target_branch: "main".into(),
+                target_old_oid: "a".repeat(40),
+                approved_tip: APPROVED_AT.into(),
+                result_oid: "c".repeat(40),
+                strategy: IntegrationStrategy::FastForward,
+                checkout_path: None,
+                started_at: chrono::Utc::now(),
+                completed_at: None,
+                completes_task: false,
+            });
+        let owner = executor.register_fake_running_execution_for_test(id).await;
+        executor.pr_statuses.remember(&key, open_reading(Some(APPROVED_AT)));
+
+        executor
+            .apply_test_state(id, &key, crate::pr_status::PrState::Open, Some(APPROVED_AT), None)
+            .await
+            .expect("observation applies");
+
+        let after = executor.tasks.read().await[&id].clone();
+        assert_eq!(
+            after.status,
+            TaskStatus::HumanReview,
+            "a pending local integration pins the Task, so the move is withheld"
+        );
+        assert!(!owner.load(std::sync::atomic::Ordering::SeqCst), "the owner is not ended");
+    }
+
+    #[tokio::test]
+    async fn an_admitted_reopening_replaces_a_recorded_closure_in_the_same_move() {
+        use crate::pr_status::PrState;
+        let (executor, _temps) = test_executor();
+        let key = crate::pr_status::PrKey::new("owner/repo", 7);
+        let id = published_correction(&executor, TaskStatus::HumanReview).await;
+        // The pull request was closed and recorded so; a newer reading reopens
+        // it at the approved commit.
+        set_recorded_state(&executor, id, "CLOSED").await;
+        let _owner = executor.register_fake_running_execution_for_test(id).await;
+        executor.pr_statuses.remember(&key, open_reading(Some(APPROVED_AT)));
+
+        executor
+            .apply_test_state(id, &key, PrState::Open, Some(APPROVED_AT), None)
+            .await
+            .expect("observation applies");
+
+        let after = executor.tasks.read().await[&id].clone();
+        assert_eq!(after.status, TaskStatus::PrCreated);
+        assert_eq!(
+            recorded_pr_state(&after).as_deref(),
+            Some("OPEN"),
+            "the reference is reopened in the same write that moves the Task"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recorded_merge_stays_final_when_an_open_reading_arrives() {
+        use crate::pr_status::PrState;
+        let (executor, _temps) = test_executor();
+        let key = crate::pr_status::PrKey::new("owner/repo", 7);
+        let id = published_correction(&executor, TaskStatus::HumanReview).await;
+        set_recorded_state(&executor, id, "MERGED").await;
+        executor.pr_statuses.remember(&key, open_reading(Some(APPROVED_AT)));
+
+        executor
+            .apply_test_state(id, &key, PrState::Open, Some(APPROVED_AT), None)
+            .await
+            .expect("observation applies");
+
+        let after = executor.tasks.read().await[&id].clone();
+        assert_eq!(recorded_pr_state(&after).as_deref(), Some("MERGED"), "MERGED is final");
+    }
+
+    #[tokio::test]
+    async fn a_superseded_merge_without_its_commit_is_a_retryable_failure() {
+        use crate::pr_status::PrState;
+        let (executor, _temps) = test_executor();
+        let key = crate::pr_status::PrKey::new("owner/repo", 7);
+        let (id, _) =
+            seed_with_pr(&executor, TaskStatus::PrCreated, pr_ref("owner/repo", 7, Some("MERGED")))
+                .await;
+        // A merge with its commit is observed, then a newer reading replaces it
+        // before it is applied.
+        let merge_commit = "d".repeat(40);
+        let stale = executor.pr_statuses.observe(
+            &key,
+            test_pr_status(PrState::Merged, None, Some(merge_commit.as_str())),
+        );
+        executor.pr_statuses.remember(&key, polled_status(PrState::Merged));
+
+        let err = executor
+            .apply_polled_pr_state(id, &stale)
+            .await
+            .expect_err("the missing commit is not recorded, so the refresh is retryable");
+        assert!(err.contains("refresh again"), "{err}");
+        let after = executor.tasks.read().await[&id].clone();
+        assert!(
+            after.external_refs.iter().all(|r| !matches!(
+                r,
+                crate::domain::task::ExternalRef::GithubPr { merge_commit: Some(_), .. }
+            )),
+            "no commit is recorded by the superseded reading"
         );
     }
 
@@ -13475,16 +13650,15 @@ mod tests {
             slashit_durable_fs::Stage::SyncTemp,
             std::io::ErrorKind::Other,
         );
-        executor.apply_polled_pr_state(id, &first).await.expect("observation applies");
+        let err = executor
+            .apply_polled_pr_state(id, &first)
+            .await
+            .expect_err("the failed write is reported to the caller");
         drop(fault);
 
         let after = executor.tasks.read().await[&id].clone();
         assert_eq!(after.status, TaskStatus::HumanReview, "the move was not published");
-        assert!(
-            warn_message_containing(&recording, "will be retried"),
-            "an unpublished move says it will be retried: {:?}",
-            recording.recorded()
-        );
+        assert!(err.contains("will be retried"), "an unpublished move says it will be retried: {err}");
         assert!(owner.load(std::sync::atomic::Ordering::SeqCst), "the owner end was already done");
         assert_eq!(after.human_review.entries, before.human_review.entries, "approval history");
         assert!(
@@ -13527,15 +13701,17 @@ mod tests {
             slashit_durable_fs::Stage::SyncDirectory,
             std::io::ErrorKind::Other,
         );
-        executor.apply_polled_pr_state(id, &first).await.expect("observation applies");
+        let err = executor
+            .apply_polled_pr_state(id, &first)
+            .await
+            .expect_err("the unconfirmed write is reported to the caller");
         drop(fault);
 
         let after = executor.tasks.read().await[&id].clone();
         assert_eq!(after.status, TaskStatus::PrCreated, "memory follows the published file");
         assert!(
-            warn_message_containing(&recording, "durability is unconfirmed"),
-            "the failure says the durability is unconfirmed: {:?}",
-            recording.recorded()
+            err.contains("durability is unconfirmed"),
+            "the failure says the durability is unconfirmed: {err}"
         );
         assert!(owner.load(std::sync::atomic::Ordering::SeqCst));
         assert!(

@@ -6613,7 +6613,11 @@ async fn publish_approved_to_existing_pr(
     refuse_if_pr_operation_cancelled(reservation, "pushing the branch")?;
     refuse_unless_still_approved(state, task_id).await?;
     match remote_branch_relation(working_dir, branch, tip).await? {
-        RemoteBranchRelation::At | RemoteBranchRelation::Contains => return Ok(()),
+        // Already on the remote (an earlier attempt pushed it): the outcome is
+        // still recorded, so the link that follows finds the evidence it needs.
+        RemoteBranchRelation::At | RemoteBranchRelation::Contains => {
+            return publication::record_approved_publication(state, task_id, branch, tip, pr_url).await;
+        }
         RemoteBranchRelation::Missing | RemoteBranchRelation::Other => {}
     }
     let pr_state = fetch_pr_state(&state.pr_statuses, pr_url).await;
@@ -6639,8 +6643,11 @@ async fn publish_approved_to_existing_pr(
         Ok(())
     })
     .await
-    .map(|_| ())
-    .map_err(explain_refused_publication)
+    .map_err(explain_refused_publication)?;
+    // The push landed at `tip`: record the outcome before the caller links the
+    // pull request. A failed record holds the link, and the retry finds the
+    // remote At `tip` and records it then.
+    publication::record_approved_publication(state, task_id, branch, tip, pr_url).await
 }
 
 /// What a refused push to an existing pull request means to the person. A
@@ -9788,9 +9795,18 @@ fn pr_refresh_changes(task: &Task, pr_url: &str, remote: &str, head: Option<&str
         && task.status != TaskStatus::PrCreated
         && pr_observation_effect(task, pr_url, linked_before, remote, head, true)
             == PrObservationEffect::MovesToPrCreated;
-    let restates = task.external_refs.iter().any(|r| {
-        matches!(r, ExternalRef::GithubPr { url, state, .. } if url == pr_url && state.as_deref() != Some(remote))
-    });
+    // A legacy Task linked only by `pr_url` has no reference to this pull
+    // request yet: recording the state creates one, so that is a change too,
+    // and the state survives a restart instead of living only in the cache.
+    let has_reference = task
+        .external_refs
+        .iter()
+        .any(|r| matches!(r, ExternalRef::GithubPr { url, .. } if url == pr_url));
+    let unrecorded_link = !has_reference && task.authoritative_pr_url() == Some(pr_url);
+    let restates = unrecorded_link
+        || task.external_refs.iter().any(|r| {
+            matches!(r, ExternalRef::GithubPr { url, state, .. } if url == pr_url && state.as_deref() != Some(remote))
+        });
     moves || restates
 }
 
@@ -9946,6 +9962,28 @@ pub async fn refresh_task_pr_state(
     let apply = move |staged: &mut std::collections::HashMap<Uuid, Task>| {
         if let Some(task) = staged.get_mut(&task_uuid) {
             let mut numbers = Vec::new();
+            // A legacy Task linked only by `pr_url` gets the reference the
+            // observation describes, written in this same durable write.
+            let has_reference = task
+                .external_refs
+                .iter()
+                .any(|r| matches!(r, ExternalRef::GithubPr { url, .. } if url == &target));
+            if !has_reference {
+                if let Some(mut created) = parse_pr_url_to_ref(&target) {
+                    if let ExternalRef::GithubPr { state: s, merge_commit: recorded, .. } = &mut created {
+                        *s = Some(refreshed.clone());
+                        *recorded = merge_commit.clone();
+                    }
+                    task.external_refs.push(created);
+                }
+            }
+            // MERGED is final: a recorded merge keeps its state against any
+            // later answer that is not a merge. Only evidence still lands.
+            let keeps_merged = refreshed != "MERGED"
+                && task.external_refs.iter().any(|r| {
+                    matches!(r, ExternalRef::GithubPr { url, state: s, .. }
+                        if url == &target && s.as_deref() == Some("MERGED"))
+                });
             for r in task.external_refs.iter_mut() {
                 if let ExternalRef::GithubPr {
                     url,
@@ -9956,11 +9994,13 @@ pub async fn refresh_task_pr_state(
                 } = r
                 {
                     if url == &target {
-                        *s = Some(refreshed.clone());
+                        if !keeps_merged {
+                            *s = Some(refreshed.clone());
+                            numbers.push(*number);
+                        }
                         if let Some(commit) = &merge_commit {
                             *recorded = Some(commit.clone());
                         }
-                        numbers.push(*number);
                     }
                 }
             }
@@ -9977,6 +10017,7 @@ pub async fn refresh_task_pr_state(
             // refuses the move instead of writing it, the always-safe
             // direction.
             if matches!(refreshed.as_str(), "CLOSED" | "OPEN")
+                && !keeps_merged
                 && !pinned
                 && task.integration_unfinished_refusal().is_none()
                 && pr_observation_effect(task, &target, true, &refreshed, head.as_deref(), true)
@@ -25790,6 +25831,65 @@ mod tests {
                 );
             }
 
+            /// A merge recorded on the reference is final on the Check now path:
+            /// an OPEN answer does not overwrite its state or move the task, and
+            /// it is not recorded as a new state, while the evidence it carries
+            /// is still kept.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn refresh_task_pr_state_keeps_a_recorded_merge_final() {
+                use tauri::Manager;
+
+                let _guard = PATH_LOCK.lock().await;
+                let mock = MockGh::setup("unused", r#"{"state":"OPEN"}"#);
+                let _ = &mock;
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    "/tmp",
+                    Some("task-branch-merged-final"),
+                    TaskStatus::PrCreated,
+                )
+                .await;
+                let merge = "d".repeat(40);
+                {
+                    let mut tasks = state.task.tasks.write().await;
+                    let task = tasks.get_mut(&task_id).unwrap();
+                    task.pr_url = Some("https://github.com/testorg/testrepo/pull/18".to_string());
+                    task.external_refs.push(crate::domain::task::ExternalRef::GithubPr {
+                        url: "https://github.com/testorg/testrepo/pull/18".to_string(),
+                        number: 18,
+                        repo: "testorg/testrepo".to_string(),
+                        state: Some("MERGED".to_string()),
+                        merge_commit: Some(merge.clone()),
+                    });
+                }
+
+                let app = tauri::test::mock_app();
+                app.manage(state);
+                let after = refresh_task_pr_state(
+                    GuiMutation::untracked(),
+                    app.state(),
+                    task_id.to_string(),
+                )
+                .await
+                .expect("the refresh of a merged reference succeeds")
+                .expect("the task is there");
+
+                assert_eq!(after.status, TaskStatus::PrCreated, "a merged task does not move");
+                assert!(
+                    after.external_refs.iter().any(|r| matches!(
+                        r,
+                        crate::domain::task::ExternalRef::GithubPr { state, merge_commit, .. }
+                            if state.as_deref() == Some("MERGED")
+                                && merge_commit.as_deref() == Some(merge.as_str())
+                    )),
+                    "MERGED stays recorded with its commit: {:?}",
+                    after.external_refs
+                );
+            }
+
             /// `refresh_task_pr_state` on a pinned task: an OPEN and a CLOSED
             /// answer record their state on the reference and never move the
             /// task, asked again and again.
@@ -26397,6 +26497,17 @@ mod tests {
                     .expect("task");
                 assert_eq!(after.status, TaskStatus::HumanReview);
                 assert_eq!(after.pr_url.as_deref(), Some(PR_A));
+                // The observed closure is persisted as a reference to the pull
+                // request, created from the admitted observation, not only cached.
+                assert!(
+                    after.external_refs.iter().any(|r| matches!(
+                        r,
+                        crate::domain::task::ExternalRef::GithubPr { url, state, .. }
+                            if url == PR_A && state.as_deref() == Some("CLOSED")
+                    )),
+                    "the legacy pull request reference records CLOSED: {:?}",
+                    after.external_refs
+                );
             }
 
             /// A write that fails during a valid refresh is reported and
