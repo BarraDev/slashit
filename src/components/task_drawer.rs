@@ -937,22 +937,36 @@ fn TaskSummary(task: Task) -> impl IntoView {
 /// read from the run's own record, because the Task's configured mode can be
 /// edited after the run started and then applies only to the next run. When
 /// the record names a skipped or failed review, its reason is said as well.
+/// The closing sentence comes from the same recorded approval the Human Review
+/// panel reads, so it never denies an approval the Task holds.
 fn no_ai_review_note(task: &Task) -> String {
     let handoff = task.worker_handoff.as_ref();
     let unconfirmed = handoff.is_some_and(|handoff| handoff.review_mode_unproven);
     let manual = handoff.is_some_and(|handoff| {
         handoff.review_mode == crate::models::task::ReviewMode::Manual
     });
-    if unconfirmed {
-        "No AI Review ran for these changes. Their review mode could not be confirmed, so AI Review was withheld. Nothing has been approved by AI.".to_string()
+    let body = if unconfirmed {
+        "No AI Review ran for these changes. Their review mode could not be confirmed, so AI Review was withheld.".to_string()
     } else if manual {
-        "No AI Review ran: Manual review mode is selected. Inspect the changes yourself; nothing has been approved.".to_string()
+        "No AI Review ran: Manual review mode is selected. Inspect the changes yourself.".to_string()
     } else if let Some(summary) =
         crate::components::task_review::no_verdict_summary(None, &task.activity)
     {
-        format!("{summary} Nothing has been approved by AI.")
+        summary
     } else {
-        "No AI Review ran for these changes. Nothing has been approved by AI.".to_string()
+        "No AI Review ran for these changes.".to_string()
+    };
+    format!("{body} {}", approval_sentence(task))
+}
+
+/// Who approved the changes, as the Human Review record says. A recorded Human
+/// approval is named whether or not it still covers the branch: the panel
+/// says that, and this line must not deny the approval.
+fn approval_sentence(task: &Task) -> &'static str {
+    if task.human_review.is_approved() {
+        "A person approved these changes. Human Review shows whether that approval still covers the branch."
+    } else {
+        "Nothing has been approved by AI."
     }
 }
 
@@ -1246,6 +1260,41 @@ mod tests {
         assert!(note.contains("could not be confirmed"), "{note}");
         assert!(!note.contains("Manual"), "{note}");
         assert!(!note.contains("selected"), "{note}");
+    }
+
+    /// An approval of the current arrival, as the record holds it.
+    fn approval_entry(task: &Task) -> crate::models::task::HumanReviewEntry {
+        use crate::models::task::{HumanReviewDecision, HumanReviewEntry};
+        HumanReviewEntry {
+            sequence: 1,
+            arrival: task.human_review.arrivals,
+            decision: HumanReviewDecision::Approved,
+            feedback: None,
+            approved_tip: Some("a".repeat(40)),
+            decided_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn a_recorded_human_approval_is_not_denied_by_the_ai_note() {
+        use crate::models::task::ReviewMode;
+        let mut task = human_review_task(ReviewMode::Manual, ReviewMode::Manual, false);
+        task.human_review.entries.push(approval_entry(&task));
+        let note = no_ai_review_note(&task);
+        assert!(note.contains("A person approved these changes"), "{note}");
+        assert!(!note.contains("Nothing has been approved"), "{note}");
+        assert!(!note.contains("nothing has been approved"), "{note}");
+    }
+
+    #[test]
+    fn a_stale_human_approval_is_still_named_as_one() {
+        use crate::models::task::ReviewMode;
+        let mut task = human_review_task(ReviewMode::Automatic, ReviewMode::Automatic, false);
+        task.human_review.entries.push(approval_entry(&task));
+        // The branch may have moved past the approved commit: the note still names
+        // the approval and leaves the question of coverage to Human Review.
+        let note = no_ai_review_note(&task);
+        assert!(note.contains("still covers the branch"), "{note}");
     }
 
     #[test]
