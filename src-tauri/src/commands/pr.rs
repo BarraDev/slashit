@@ -24848,24 +24848,25 @@ mod tests {
                 }
             }
 
-            /// The manual routes against a stale OPEN answer. The cache already
-            /// holds a newer OPEN reading at another head, so the answer read
-            /// here (OPEN at the approved head, which would otherwise move the
-            /// correction) is older than the cache's and is refused when
-            /// recorded. Neither route may act on it. The newer reading is
-            /// recorded with a later start, so the refresh's own answer is the
-            /// one it refuses.
+            /// An approved correction whose pull request has not been read yet.
+            /// The cache holds no reading, so the first one published is the
+            /// refresh's own, and each test places its barrier around it.
             #[cfg(unix)]
-            async fn stale_open_correction_fixture() -> (crate::AppState, Uuid, std::sync::Arc<crate::queue::TaskExecutor>, tempfile::TempDir, MockGh) {
+            async fn open_correction_fixture() -> (crate::AppState, Uuid, std::sync::Arc<crate::queue::TaskExecutor>, tempfile::TempDir, MockGh) {
                 use crate::domain::publication::PublicationState;
-                use crate::pr_status::{ChecksState, PrKey, PrState, PrStatus};
                 let mock = MockGh::setup(CORRECTION_PR, &open_at(APPROVED_HEAD));
                 let (state, tmp) = build_test_state().await;
                 let executor = attach_test_executor(&state);
                 let task_id =
                     seed_task(&state, "/tmp", Some("task-branch"), TaskStatus::HumanReview).await;
                 stamp_correction(&state, task_id, Some(PublicationState::Published {})).await;
-                let newer = PrStatus {
+                (state, task_id, executor, tmp, mock)
+            }
+
+            /// An OPEN reading at `head`, as GitHub reports it.
+            fn open_reading(head: &str) -> crate::pr_status::PrStatus {
+                use crate::pr_status::{ChecksState, PrState, PrStatus};
+                PrStatus {
                     state: PrState::Open,
                     checks: ChecksState::Passing,
                     failing_checks: vec![],
@@ -24873,76 +24874,234 @@ mod tests {
                     review_decision: None,
                     mergeable: None,
                     merge_commit: None,
-                    head_oid: Some(OTHER_HEAD.to_string()),
-                };
-                state.pr_statuses.remember_at(
-                    &PrKey::new("testorg/testrepo", 9),
-                    newer,
-                    chrono::Utc::now() + chrono::Duration::hours(1),
-                );
-                (state, task_id, executor, tmp, mock)
+                    head_oid: Some(head.to_string()),
+                }
             }
 
+            /// Waits, bounded, until a refresh publishes a reading for `key`,
+            /// and returns that reading.
+            async fn await_published_reading(
+                statuses: &crate::pr_status::PrStatuses,
+                key: &crate::pr_status::PrKey,
+            ) -> crate::pr_status::PrObservation {
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    loop {
+                        if let Some(entry) = statuses.get(key) {
+                            if let Some(status) = entry.status {
+                                return crate::pr_status::PrObservation {
+                                    key: key.clone(),
+                                    generation: entry.generation,
+                                    status,
+                                };
+                            }
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "the refresh did not publish its reading of pull request #{} within 10s",
+                        key.number
+                    )
+                })
+            }
+
+            /// The barrier between a route's publication and its admission.
+            /// Waits for the valid OPEN answer at the approved head to be
+            /// published, then, when `superseding` is set, publishes a newer
+            /// OPEN reading at that head with its own generation. Returns
+            /// with the route still ahead of its admission.
+            async fn barrier_before_admission(
+                statuses: &crate::pr_status::PrStatuses,
+                key: &crate::pr_status::PrKey,
+                superseding: Option<&str>,
+            ) {
+                let published = await_published_reading(statuses, key).await;
+                assert!(
+                    matches!(published.status.state, crate::pr_status::PrState::Open)
+                        && published.status.head_oid.as_deref() == Some(APPROVED_HEAD),
+                    "the barrier sees the valid OPEN answer at the approved head"
+                );
+                if let Some(head) = superseding {
+                    statuses.remember(key, open_reading(head));
+                    let newer = statuses.get(key).expect("the newer reading is published");
+                    assert!(
+                        newer.generation > published.generation,
+                        "the newer reading has its own generation"
+                    );
+                    assert_eq!(newer.status.and_then(|s| s.head_oid).as_deref(), Some(head));
+                }
+            }
+
+            /// What one route did across its barrier: the Task before and
+            /// after, whether the correction run was ended, the route's
+            /// answer, and the head the cache holds at the end.
+            struct BarrierRun {
+                before: crate::domain::task::Task,
+                after: crate::domain::task::Task,
+                owner_ended: bool,
+                answer: Result<(), String>,
+                cached_head: Option<String>,
+            }
+
+            /// Check now on the approved correction, across the barrier. The
+            /// barrier holds the answer's application at its admission point:
+            /// the application reads the projects gate after the answer is
+            /// published and before it takes the lease, so the gate is held
+            /// until the barrier has run.
             #[cfg(unix)]
-            #[tokio::test(flavor = "multi_thread")]
-            async fn check_now_does_not_move_a_correction_on_an_open_answer_a_newer_reading_replaced() {
-                use std::sync::atomic::Ordering;
+            async fn check_now_across_barrier(superseding: Option<&str>) -> BarrierRun {
                 use tauri::Manager;
-                let _guard = PATH_LOCK.lock().await;
-                let (state, task_id, executor, _tmp, _mock) = stale_open_correction_fixture().await;
+                let (state, task_id, executor, _tmp, _mock) = open_correction_fixture().await;
                 let owner = executor.register_fake_running_execution_for_test(task_id).await;
                 let before = state.task.tasks.read().await[&task_id].clone();
+                let key = crate::pr_status::PrKey::new("testorg/testrepo", 9);
+                let statuses = state.pr_statuses.clone();
+                let projects = state.project.projects.clone();
+                let gate = projects.write().await;
                 let app = tauri::test::mock_app();
                 app.manage(state);
 
-                refresh_pr_status(GuiMutation::untracked(), app.state(), task_id.to_string())
-                    .await
-                    .expect("check now answers");
+                let (answer, ()) = tokio::join!(
+                    refresh_pr_status(GuiMutation::untracked(), app.state(), task_id.to_string()),
+                    async move {
+                        barrier_before_admission(&statuses, &key, superseding).await;
+                        drop(gate);
+                    }
+                );
+                let state = app.state::<crate::AppState>();
+                let after = state.task.tasks.read().await[&task_id].clone();
+                let cached_head = state
+                    .pr_statuses
+                    .get(&crate::pr_status::PrKey::new("testorg/testrepo", 9))
+                    .and_then(|e| e.status)
+                    .and_then(|s| s.head_oid);
+                BarrierRun {
+                    before,
+                    after,
+                    owner_ended: owner.load(std::sync::atomic::Ordering::SeqCst),
+                    answer: answer.map(|_| ()),
+                    cached_head,
+                }
+            }
 
-                let after = app.state::<crate::AppState>().task.tasks.read().await[&task_id].clone();
-                assert_eq!(after.status, TaskStatus::HumanReview);
-                assert!(!owner.load(Ordering::SeqCst), "the correction run is not ended");
+            /// The explicit refresh on the approved correction, across the
+            /// barrier. The lease is held from before the call, so the
+            /// refresh's answer waits for it at admission.
+            #[cfg(unix)]
+            async fn refresh_task_pr_state_across_barrier(superseding: Option<&str>) -> BarrierRun {
+                use tauri::Manager;
+                let (state, task_id, executor, _tmp, _mock) = open_correction_fixture().await;
+                let owner = executor.register_fake_running_execution_for_test(task_id).await;
+                let before = state.task.tasks.read().await[&task_id].clone();
+                let key = crate::pr_status::PrKey::new("testorg/testrepo", 9);
+                let statuses = state.pr_statuses.clone();
+                let lease = state
+                    .task_lifecycle_locks
+                    .acquire(task_id)
+                    .await
+                    .expect("the lease is free");
+                let app = tauri::test::mock_app();
+                app.manage(state);
+
+                let (answer, ()) = tokio::join!(
+                    refresh_task_pr_state(GuiMutation::untracked(), app.state(), task_id.to_string()),
+                    async move {
+                        barrier_before_admission(&statuses, &key, superseding).await;
+                        drop(lease);
+                    }
+                );
+                let state = app.state::<crate::AppState>();
+                let after = state.task.tasks.read().await[&task_id].clone();
+                let cached_head = state
+                    .pr_statuses
+                    .get(&crate::pr_status::PrKey::new("testorg/testrepo", 9))
+                    .and_then(|e| e.status)
+                    .and_then(|s| s.head_oid);
+                BarrierRun {
+                    before,
+                    after,
+                    owner_ended: owner.load(std::sync::atomic::Ordering::SeqCst),
+                    answer: answer.map(|_| ()),
+                    cached_head,
+                }
+            }
+
+            /// Check now's superseded OPEN answer is refused at admission: the
+            /// newer reading replaces it after publication, so nothing is
+            /// ended or written, and the newer reading stays cached.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn check_now_does_not_move_a_correction_on_an_open_answer_a_newer_reading_replaced() {
+                let _guard = PATH_LOCK.lock().await;
+                let run = check_now_across_barrier(Some(OTHER_HEAD)).await;
+                run.answer.expect("check now answers");
+
+                assert_eq!(run.after.status, TaskStatus::HumanReview);
+                assert!(!run.owner_ended, "the correction run is not ended");
                 assert!(
-                    after.human_review.is_approved()
-                        && after.human_review.approved_tip() == Some(APPROVED_HEAD),
+                    run.after.human_review.is_approved()
+                        && run.after.human_review.approved_tip() == Some(APPROVED_HEAD),
                     "the approval of the approved commit stays current"
                 );
-                assert_eq!(after.human_review.entries, before.human_review.entries);
-                assert_eq!(after.worktree_path, before.worktree_path, "checkout path");
-                assert_eq!(recorded_pr_state(&after), recorded_pr_state(&before), "nothing recorded");
+                assert_eq!(run.after.human_review.entries, run.before.human_review.entries);
+                assert_eq!(run.after.worktree_path, run.before.worktree_path, "checkout path");
+                assert_eq!(run.after.branch_name, run.before.branch_name, "checkout branch");
+                assert_eq!(recorded_pr_state(&run.after), recorded_pr_state(&run.before), "nothing recorded");
+                assert_eq!(run.cached_head.as_deref(), Some(OTHER_HEAD), "the newer reading is kept");
+            }
+
+            /// Positive control for the test above: with no newer reading, the
+            /// same barrier admits the answer and the approved correction moves.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn check_now_moves_a_correction_across_the_same_barrier_without_a_newer_reading() {
+                let _guard = PATH_LOCK.lock().await;
+                let run = check_now_across_barrier(None).await;
+                run.answer.expect("check now answers");
+
+                assert_eq!(run.after.status, TaskStatus::PrCreated);
+                assert!(run.owner_ended, "the admitted answer ends the correction run");
+                assert_eq!(run.cached_head.as_deref(), Some(APPROVED_HEAD));
             }
 
             #[cfg(unix)]
             #[tokio::test(flavor = "multi_thread")]
             async fn refresh_task_pr_state_refuses_an_open_answer_a_newer_reading_replaced() {
-                use std::sync::atomic::Ordering;
-                use tauri::Manager;
                 let _guard = PATH_LOCK.lock().await;
-                let (state, task_id, executor, _tmp, _mock) = stale_open_correction_fixture().await;
-                let owner = executor.register_fake_running_execution_for_test(task_id).await;
-                let before = state.task.tasks.read().await[&task_id].clone();
-                let app = tauri::test::mock_app();
-                app.manage(state);
-
-                let result = refresh_task_pr_state(
-                    GuiMutation::untracked(),
-                    app.state(),
-                    task_id.to_string(),
-                )
-                .await;
-                assert!(result.is_err(), "a superseded answer is refused: {result:?}");
-
-                let after = app.state::<crate::AppState>().task.tasks.read().await[&task_id].clone();
-                assert_eq!(after.status, TaskStatus::HumanReview);
-                assert!(!owner.load(Ordering::SeqCst), "the correction run is not ended");
+                let run = refresh_task_pr_state_across_barrier(Some(OTHER_HEAD)).await;
+                let error = run.answer.expect_err("a superseded answer is refused");
                 assert!(
-                    after.human_review.is_approved()
-                        && after.human_review.approved_tip() == Some(APPROVED_HEAD),
+                    error.contains("arrived while GitHub was being asked"),
+                    "refused at admission, not at publication: {error}"
+                );
+
+                assert_eq!(run.after.status, TaskStatus::HumanReview);
+                assert!(!run.owner_ended, "the correction run is not ended");
+                assert!(
+                    run.after.human_review.is_approved()
+                        && run.after.human_review.approved_tip() == Some(APPROVED_HEAD),
                     "the approval of the approved commit stays current"
                 );
-                assert_eq!(after.human_review.entries, before.human_review.entries);
-                assert_eq!(after.worktree_path, before.worktree_path, "checkout path");
-                assert_eq!(recorded_pr_state(&after), recorded_pr_state(&before), "nothing recorded");
+                assert_eq!(run.after.human_review.entries, run.before.human_review.entries);
+                assert_eq!(run.after.worktree_path, run.before.worktree_path, "checkout path");
+                assert_eq!(recorded_pr_state(&run.after), recorded_pr_state(&run.before), "nothing recorded");
+                assert_eq!(run.cached_head.as_deref(), Some(OTHER_HEAD), "the newer reading is kept");
+            }
+
+            /// Positive control for the refresh: with no newer reading, the
+            /// same barrier admits the answer and the approved correction moves.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn refresh_task_pr_state_moves_a_correction_across_the_same_barrier_without_a_newer_reading() {
+                let _guard = PATH_LOCK.lock().await;
+                let run = refresh_task_pr_state_across_barrier(None).await;
+                run.answer.expect("the refresh answers");
+
+                assert_eq!(run.after.status, TaskStatus::PrCreated);
+                assert!(run.owner_ended, "the admitted answer ends the correction run");
+                assert_eq!(run.cached_head.as_deref(), Some(APPROVED_HEAD));
             }
 
             /// PR link, refused before any owner ends: the link's answer is
