@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 pub mod admission;
+mod coderabbit;
 pub mod start_guard;
 pub mod manager;
 pub mod executor;

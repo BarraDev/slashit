@@ -1127,7 +1127,7 @@ impl Drop for ClaudeRunner {
         // one this runner spawned (see `wait`).
         #[cfg(unix)]
         if let Some(pid) = self.child.try_lock().ok().and_then(|child| child.id()) {
-            Self::kill_process_group(pid);
+            crate::process_tree::kill_process_group(pid);
         }
         if let Some(writer) = self.prompt_writer.get_mut().take() {
             writer.abort();
@@ -1587,9 +1587,9 @@ impl ClaudeRunner {
             // process group, so `taskkill /T` walks the tree instead.
             if let Some(pid) = child.id() {
                 #[cfg(unix)]
-                Self::kill_process_group(pid);
+                crate::process_tree::kill_process_group(pid);
                 #[cfg(windows)]
-                Self::kill_process_tree(pid);
+                crate::process_tree::kill_process_tree(pid);
                 #[cfg(not(any(unix, windows)))]
                 let _ = pid;
             }
@@ -1623,83 +1623,13 @@ impl ClaudeRunner {
         if let Ok(pid) = leader_pid.lock() {
             if let Some(pid) = *pid {
                 #[cfg(unix)]
-                Self::kill_process_group(pid);
+                crate::process_tree::kill_process_group(pid);
                 #[cfg(windows)]
-                Self::kill_process_tree(pid);
+                crate::process_tree::kill_process_tree(pid);
                 #[cfg(not(any(unix, windows)))]
                 let _ = pid;
             }
         }
-    }
-
-    /// Kill the process `pid` and every descendant it started. `taskkill /T`
-    /// walks the tree, which Windows does not do for a plain kill. Best-effort,
-    /// like [`Self::kill_process_group`]: a tree that has already gone is the
-    /// outcome asked for. The call blocks for the duration of `taskkill`.
-    #[cfg(windows)]
-    fn kill_process_tree(pid: u32) {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
-
-    /// Signal the whole group a spawned agent leads.
-    ///
-    /// Best-effort by design: the only failure is a group that has already
-    /// gone, which is the outcome being asked for.
-    #[cfg(unix)]
-    fn kill_process_group(pid: u32) {
-        // Safety: `pid` was returned by a child this process spawned as the
-        // leader of its own group (see `start_program`'s `process_group(0)`),
-        // so the group id equals the pid.
-        unsafe {
-            libc::killpg(pid as libc::pid_t, libc::SIGKILL);
-        }
-    }
-
-    /// Block until the leader has exited, without reaping it.
-    ///
-    /// An ordinary wait reaps as part of reporting the exit, and once that
-    /// happens the pid -- which doubles as the process group id, see
-    /// `start_program` -- can be reissued to an unrelated process. `WNOWAIT`
-    /// leaves the zombie in place instead, so whatever runs immediately after
-    /// this call still owns that number: the kernel cannot have handed it to
-    /// anyone else while a member of this process's own group -- even just
-    /// its own unreaped zombie -- still holds it. The real reap still has to
-    /// happen; this only buys the caller a safe window to act before it does.
-    ///
-    /// A blocking syscall, so this runs on a blocking-pool thread rather than
-    /// tying up the async runtime for however long the run takes.
-    ///
-    /// Best-effort like `kill_process_group`: the only failure this can see
-    /// is the child having already gone (`ECHILD`), which only happens if
-    /// something else reaped it first, and there is nothing safer to do about
-    /// that than to move on -- the reap that follows this call will report
-    /// that outcome on its own.
-    #[cfg(unix)]
-    async fn wait_for_exit_without_reaping(pid: u32) {
-        let _ = tokio::task::spawn_blocking(move || {
-            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            loop {
-                // Safety: `info` is a correctly sized out-parameter the
-                // kernel only ever writes into.
-                let ret = unsafe {
-                    libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT)
-                };
-                if ret == 0
-                    || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
-                {
-                    break;
-                }
-            }
-        })
-        .await;
     }
 
     /// Wait for the process to complete and return exit status.
@@ -1728,8 +1658,8 @@ impl ClaudeRunner {
         // still contains.
         #[cfg(unix)]
         if let Some(pid) = child.id() {
-            Self::wait_for_exit_without_reaping(pid).await;
-            Self::kill_process_group(pid);
+            crate::process_tree::wait_for_exit_without_reaping(pid).await;
+            crate::process_tree::kill_process_group(pid);
         }
 
         // Stderr has been draining since spawn (see `start_program`), so a

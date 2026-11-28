@@ -91,6 +91,17 @@ libc = "0.2"
 # `fs4`.
 rustix = { version = "1", features = ["fs"] }
 
+[target.'cfg(windows)'.dependencies]
+# Job Objects and suspended process creation for owning a CodeRabbit run's
+# process tree (see `process_tree::TreeOwner`). Already in the lock file through
+# tokio.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
 [features]
 # ACCEPTANCE BUILDS ONLY. Never enable this for a release.
 #

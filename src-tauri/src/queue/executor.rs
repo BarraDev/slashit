@@ -14,6 +14,7 @@ use crate::domain::{
 use crate::events::{EventSink, SharedEventSink};
 use crate::queue::QueueManager;
 use crate::queue::admission::{Admission, AdmissionPermit};
+use crate::queue::coderabbit::{self, CodeRabbitReview};
 use crate::queue::prompt::{build_fix_prompt, build_review_prompt, build_run_prompt};
 use crate::queue::start_guard::StartGuard;
 use crate::queue::tool_activity::RunTools;
@@ -7411,70 +7412,6 @@ impl TaskExecutor {
         }
     }
 
-    /// Same contract as [`Self::run_cancellable_agent`], for the CodeRabbit
-    /// subprocess: owned by the code that spawned it for its whole life, so a
-    /// cancellation arriving while it is running kills and reaps it rather
-    /// than leaving `tokio::join!` (see [`Self::spawn_review`]) parked on a
-    /// branch nothing will ever signal again -- the exact way a parked
-    /// joined branch could make a stop hang forever.
-    async fn run_cancellable_coderabbit(
-        working_dir: &str,
-        cancelled: &mut tokio::sync::watch::Receiver<bool>,
-    ) -> String {
-        if *cancelled.borrow() {
-            return String::new();
-        }
-        let mut child = match tokio::process::Command::new("coderabbit")
-            .args([
-                "review",
-                "--prompt-only",
-                "--type",
-                "uncommitted",
-                "--cwd",
-                working_dir,
-                "--no-color",
-            ])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            // A dropped review future (an aborted task, a runtime shutdown)
-            // must not leave the CLI running. Cancellation kills it explicitly
-            // below; this covers the paths where the future is simply dropped.
-            .kill_on_drop(true)
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => return format!("CodeRabbit error: {}", e),
-        };
-
-        let status = tokio::select! {
-            biased;
-            status = child.wait() => Some(status),
-            _ = cancelled.changed() => None,
-        };
-
-        let Some(status) = status else {
-            let _ = child.kill().await;
-            let _ = child.wait().await; // reap; no zombie left behind
-            return String::new();
-        };
-
-        use tokio::io::AsyncReadExt;
-        let mut stdout_buf = String::new();
-        if let Some(mut out) = child.stdout.take() {
-            let _ = out.read_to_string(&mut stdout_buf).await;
-        }
-        let mut stderr_buf = String::new();
-        if let Some(mut err) = child.stderr.take() {
-            let _ = err.read_to_string(&mut stderr_buf).await;
-        }
-
-        match status {
-            Ok(s) if s.success() => stdout_buf,
-            Ok(_) => format!("CodeRabbit warning: {}", stderr_buf),
-            Err(e) => format!("CodeRabbit error: {}", e),
-        }
-    }
-
     /// Re-prove the exact Worker commit before the first AI Review of its
     /// result. A failure puts the Task back into recovery with the checkout
     /// and references untouched; it never starts a provider or moves Git.
@@ -8168,7 +8105,7 @@ impl TaskExecutor {
             let task_id_str_for_coderabbit = task_id_str.clone();
             let coderabbit_review = async move {
                 if !use_coderabbit {
-                    return String::new();
+                    return CodeRabbitReview::default();
                 }
                 match tokio::process::Command::new("which")
                     .arg("coderabbit")
@@ -8177,12 +8114,10 @@ impl TaskExecutor {
                 {
                     Ok(output) if output.status.success() => {}
                     _ => {
-                        events_for_coderabbit.agent_event(AgentEvent::Log {
-                            task_id: task_id_str_for_coderabbit.clone(),
-                            level: LogLevel::Warn,
-                            message: "CodeRabbit enabled but CLI not found. Install it or disable in Queue Settings.".to_string(),
-                        });
-                        return String::new();
+                        return CodeRabbitReview::failed(
+                            "CodeRabbit is enabled but its CLI was not found. Install it or \
+                             disable it in Queue Settings",
+                        );
                     }
                 }
                 events_for_coderabbit.agent_event(AgentEvent::Log {
@@ -8190,9 +8125,17 @@ impl TaskExecutor {
                     level: LogLevel::Info,
                     message: "Running CodeRabbit review...".to_string(),
                 });
-                Self::run_cancellable_coderabbit(
+                // The diff above was computed, so the boundary is recorded.
+                let Some(base_commit) = base_commit else {
+                    return CodeRabbitReview::failed(
+                        "the task has no recorded starting commit for CodeRabbit to review from",
+                    );
+                };
+                coderabbit::run_review(
                     &working_dir_for_coderabbit,
+                    &base_commit,
                     &mut cancelled_for_coderabbit,
+                    coderabbit::REVIEW_TIMEOUT,
                 )
                 .await
             };
@@ -8214,6 +8157,24 @@ impl TaskExecutor {
                 return;
             }
 
+            // A CodeRabbit run that did not complete found nothing out, which
+            // is not the same as finding nothing: it goes on the timeline
+            // whatever the reviewer's verdict turns out to be.
+            let coderabbit_failed = coderabbit_result.failure.as_ref().map(|reason| {
+                events.agent_event(AgentEvent::Log {
+                    task_id: task_id_str.clone(),
+                    level: LogLevel::Warn,
+                    message: format!("CodeRabbit review did not complete: {reason}"),
+                });
+                (
+                    chrono::Utc::now(),
+                    ActivityKind::CoderabbitReviewFailed {
+                        review,
+                        reason: reason.clone(),
+                    },
+                )
+            });
+
             // A reviewer run that failed, or ended without a verdict, has
             // not reviewed anything, and must not read as a pass.
             let (has_claude_issues, claude_answer) = match review_verdict(&claude_result) {
@@ -8233,16 +8194,16 @@ impl TaskExecutor {
                         timestamp: chrono::Utc::now(),
                         session_id: Uuid::new_v4(),
                     };
-                    let trail = vec![
-                        started.clone(),
-                        (
+                    let trail = std::iter::once(started.clone())
+                        .chain(coderabbit_failed)
+                        .chain([(
                             chrono::Utc::now(),
                             ActivityKind::AiReviewFailed {
                                 review,
                                 reason: reason.clone(),
                             },
-                        ),
-                    ];
+                        )])
+                        .collect();
                     Self::transition_to_human_review(
                         &tasks,
                         &storage,
@@ -8258,9 +8219,8 @@ impl TaskExecutor {
             };
 
             // Merge findings
-            let has_coderabbit_issues = !coderabbit_result.is_empty()
-                && !coderabbit_result.starts_with("CodeRabbit error:")
-                && !coderabbit_result.starts_with("CodeRabbit warning:");
+            let coderabbit_findings = coderabbit_result.findings_text();
+            let has_coderabbit_issues = !coderabbit_findings.is_empty();
 
             if has_claude_issues || has_coderabbit_issues {
                 let verdict_at = chrono::Utc::now();
@@ -8279,7 +8239,7 @@ impl TaskExecutor {
                 }
                 if has_coderabbit_issues {
                     findings.push_str("### CodeRabbit Review\n");
-                    findings.push_str(&coderabbit_result);
+                    findings.push_str(&coderabbit_findings);
                     findings.push('\n');
                 }
 
@@ -8622,28 +8582,30 @@ impl TaskExecutor {
                     session_id: Uuid::new_v4(),
                 };
 
-                let trail = vec![
-                    started.clone(),
-                    (
-                        verdict_at,
-                        ActivityKind::AiReviewChangesRequested {
-                            review,
-                            issues: issue_count,
-                        },
-                    ),
-                    (fix_started, ActivityKind::AiFixStarted { review }),
-                    (
-                        chrono::Utc::now(),
-                        match &fix_failure {
-                            None if fix_changed_nothing => ActivityKind::AiFixUnchanged { review },
-                            None => ActivityKind::AiFixApplied { review },
-                            Some(reason) => ActivityKind::AiFixFailed {
+                let trail = std::iter::once(started.clone())
+                    .chain(coderabbit_failed)
+                    .chain([
+                        (
+                            verdict_at,
+                            ActivityKind::AiReviewChangesRequested {
                                 review,
-                                reason: reason.clone(),
+                                issues: issue_count,
                             },
-                        },
-                    ),
-                ];
+                        ),
+                        (fix_started, ActivityKind::AiFixStarted { review }),
+                        (
+                            chrono::Utc::now(),
+                            match &fix_failure {
+                                None if fix_changed_nothing => ActivityKind::AiFixUnchanged { review },
+                                None => ActivityKind::AiFixApplied { review },
+                                Some(reason) => ActivityKind::AiFixFailed {
+                                    review,
+                                    reason: reason.clone(),
+                                },
+                            },
+                        ),
+                    ])
+                    .collect();
                 Self::transition_to_human_review(
                     &tasks,
                     &storage,
@@ -8668,13 +8630,13 @@ impl TaskExecutor {
                     session_id: Uuid::new_v4(),
                 };
 
-                let trail = vec![
-                    started.clone(),
-                    (
+                let trail = std::iter::once(started.clone())
+                    .chain(coderabbit_failed)
+                    .chain([(
                         chrono::Utc::now(),
                         ActivityKind::AiReviewApproved { review },
-                    ),
-                ];
+                    )])
+                    .collect();
                 Self::transition_to_human_review(
                     &tasks,
                     &storage,
@@ -19306,6 +19268,15 @@ mod tests {
                     }
                 }
 
+                /// Puts a stand-in `coderabbit` running `script` (shell) first
+                /// on `PATH`, for as long as this mock lives.
+                fn coderabbit_runs(&self, script: &str) {
+                    crate::test_helpers::write_executable(
+                        &self._tmp.path().join("bin").join("coderabbit"),
+                        &format!("#!/bin/sh\n{script}\n"),
+                    );
+                }
+
                 /// What the reviewer read from its stdin, if it ran.
                 fn review_prompt(&self) -> String {
                     std::fs::read_to_string(&self.review_prompt_file).unwrap_or_default()
@@ -19442,11 +19413,21 @@ mod tests {
                 base_commit: &str,
                 configure: impl FnOnce(&mut Task),
             ) -> Task {
-                let (executor, _temps) = test_executor();
                 // Only the Claude reviewer is under test, not a CodeRabbit CLI
                 // that may or may not be installed on this machine.
+                settle_review_task_with(false, working_dir, base_commit, configure).await
+            }
+
+            /// [`settle_review_task`] with CodeRabbit enabled or not.
+            async fn settle_review_task_with(
+                use_coderabbit: bool,
+                working_dir: &str,
+                base_commit: &str,
+                configure: impl FnOnce(&mut Task),
+            ) -> Task {
+                let (executor, _temps) = test_executor();
                 let config = crate::config::queue::QueueConfig {
-                    use_coderabbit: false,
+                    use_coderabbit,
                     ..Default::default()
                 };
                 executor
@@ -19479,6 +19460,69 @@ mod tests {
             async fn settle_review(configure: impl FnOnce(&mut Task)) -> Task {
                 let (repo, base_commit) = git_repo_with_change();
                 settle_review_task(repo.path().to_str().unwrap(), &base_commit, configure).await
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_failed_coderabbit_run_is_on_the_timeline_beside_the_verdict() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock = MockReviewer::install("Looks good.\nVERDICT: APPROVED", 0);
+                mock.coderabbit_runs("echo \"error: unknown option '--agent'\" >&2; exit 1");
+                let (repo, base_commit) = git_repo_with_change();
+                let task = settle_review_task_with(
+                    true,
+                    repo.path().to_str().unwrap(),
+                    &base_commit,
+                    |_| {},
+                )
+                .await;
+
+                assert!(
+                    task.activity.iter().any(|entry| matches!(
+                        &entry.kind,
+                        ActivityKind::CoderabbitReviewFailed { reason, .. }
+                            if reason.contains("exited with code 1")
+                                && reason.contains("unknown option")
+                    )),
+                    "{:?}",
+                    task.activity
+                );
+                // The reviewer's verdict stands, and the error text is not a finding.
+                assert_eq!(task.qa_signoff.expect("a signoff").status, QaStatus::Approved);
+                assert!(mock.fix_args().is_empty(), "{:?}", mock.fix_args());
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn coderabbit_findings_reach_the_fix_agent() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock = MockReviewer::install("Looks good.\nVERDICT: APPROVED", 0);
+                mock.coderabbit_runs(
+                    "cat <<'EVENTS'\n\
+                     {\"type\":\"finding\",\"severity\":\"major\",\"title\":\"Unchecked index\",\"fileName\":\"a.rs\",\"startLine\":1,\"endLine\":2,\"comment\":\"This panics.\"}\n\
+                     {\"type\":\"complete\",\"status\":\"review_completed\",\"findings\":1}\n\
+                     EVENTS",
+                );
+                let (repo, base_commit) = git_repo_with_change();
+                let task = settle_review_task_with(
+                    true,
+                    repo.path().to_str().unwrap(),
+                    &base_commit,
+                    |_| {},
+                )
+                .await;
+
+                assert!(mock.fix_prompt().contains("Unchecked index"), "{}", mock.fix_prompt());
+                assert!(
+                    !task.activity.iter().any(|entry| matches!(
+                        entry.kind,
+                        ActivityKind::CoderabbitReviewFailed { .. }
+                    )),
+                    "{:?}",
+                    task.activity
+                );
+                assert!(task.activity.iter().any(|entry| matches!(
+                    entry.kind,
+                    ActivityKind::AiReviewChangesRequested { issues: 1, .. }
+                )));
             }
 
             /// The Worker run a Task was started with, recording the reviewer
@@ -29268,89 +29312,5 @@ VERDICT: APPROVED"
             assert!(failed.executed_approvals.is_empty());
             assert_eq!(failed.base_commit.as_deref(), Some(fx.base.as_str()));
         }
-    }
-
-    /// Reads the pid a fake program recorded, once the file has been written.
-    #[cfg(target_os = "linux")]
-    async fn recorded_pid(path: &std::path::Path) -> i32 {
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                if let Some(pid) = std::fs::read_to_string(path)
-                    .ok()
-                    .and_then(|text| text.trim().parse().ok())
-                {
-                    return pid;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the fake CodeRabbit CLI recorded its pid")
-    }
-
-    /// A process is running unless it is gone or has exited and is only
-    /// waiting to be reaped (state `Z`). This reads `/proc`, which exists only
-    /// on Linux; elsewhere every process would look gone and the test would
-    /// pass without checking anything.
-    #[cfg(target_os = "linux")]
-    fn process_is_running(pid: i32) -> bool {
-        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Ok(stat) => {
-                let state = stat.rsplit(')').next().unwrap_or("").trim_start();
-                !state.starts_with('Z')
-            }
-            Err(_) => false,
-        }
-    }
-
-    /// Dropping the CodeRabbit review future, as an aborted task or a runtime
-    /// shutdown does, must end the CLI it started. Without `kill_on_drop` the
-    /// child outlives its owner, and nothing signals it.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn dropping_the_coderabbit_review_ends_its_cli() {
-        let scratch = tempfile::tempdir().unwrap();
-        let pid_file = scratch.path().join("pid");
-        let pid_tmp = scratch.path().join("pid.tmp");
-        // `exec` makes the recorded pid the pid of the blocking `sleep`.
-        let _fake = crate::test_helpers::FakeProgram::install(
-            "coderabbit",
-            &format!(
-                "echo $$ > '{}' && mv '{}' '{}'\nexec sleep 60",
-                pid_tmp.display(),
-                pid_tmp.display(),
-                pid_file.display()
-            ),
-        )
-        .await;
-        // The sender must stay alive: a dropped sender reads as cancellation.
-        let (_cancel_tx, mut cancelled) = tokio::sync::watch::channel(false);
-        // Boxed so that `drop(review)` drops the future itself, not just a pin of it.
-        let mut review = Box::pin(TaskExecutor::run_cancellable_coderabbit(
-            scratch.path().to_str().unwrap(),
-            &mut cancelled,
-        ));
-        let pid = tokio::select! {
-            _ = &mut review => panic!("the review ended before its CLI was observed"),
-            pid = recorded_pid(&pid_file) => pid,
-        };
-        drop(review);
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let mut running = process_is_running(pid);
-        while running && std::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            running = process_is_running(pid);
-        }
-        if running {
-            // Leave nothing behind when the assertion below fails.
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-            }
-        }
-        assert!(
-            !running,
-            "dropping the review left its CLI (pid {pid}) running"
-        );
     }
 }

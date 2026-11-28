@@ -267,6 +267,13 @@ pub enum Kind {
         review: u32,
         reason: String,
     },
+    /// The CodeRabbit part of an AI review did not complete: it could not
+    /// run, failed, or its output could not be read. It says nothing about the
+    /// reviewer's verdict.
+    CoderabbitReviewFailed {
+        review: u32,
+        reason: String,
+    },
     AiFixStarted {
         review: u32,
     },
@@ -354,6 +361,7 @@ impl Kind {
             | Self::AiReviewChangesRequested { review, .. }
             | Self::AiReviewFailed { review, .. }
             | Self::AiReviewSkipped { review, .. } => Identity::ReviewVerdict(*review),
+            Self::CoderabbitReviewFailed { review, .. } => Identity::CoderabbitFailed(*review),
             Self::AiFixStarted { review } => Identity::FixStarted(*review),
             Self::AiFixApplied { review }
             | Self::AiFixUnchanged { review }
@@ -390,6 +398,7 @@ enum Identity<'a> {
     RecoveryRequired(u32),
     ReviewStarted(u32),
     ReviewVerdict(u32),
+    CoderabbitFailed(u32),
     FixStarted(u32),
     FixEnded(u32),
     Arrival(u32),
@@ -518,6 +527,7 @@ fn sanitize_text(kind: &mut Kind) {
         Kind::RunFailed { reason, .. }
         | Kind::AiReviewFailed { reason, .. }
         | Kind::AiReviewSkipped { reason, .. }
+        | Kind::CoderabbitReviewFailed { reason, .. }
         | Kind::AiFixFailed { reason, .. }
         | Kind::DeliveryFailed { reason }
         | Kind::RecoveryRequired { reason, .. } => *reason = sanitize(reason, MAX_REASON_CHARS),
@@ -580,6 +590,7 @@ pub fn next_review(entries: &[Entry]) -> u32 {
             | Kind::AiReviewChangesRequested { review, .. }
             | Kind::AiReviewFailed { review, .. }
             | Kind::AiReviewSkipped { review, .. }
+            | Kind::CoderabbitReviewFailed { review, .. }
             | Kind::AiFixStarted { review }
             | Kind::AiFixApplied { review }
             | Kind::AiFixUnchanged { review }
@@ -752,6 +763,7 @@ impl Item<'_> {
                 Kind::ToolUsed { .. } | Kind::ToolsOmitted { .. } => Tone::Quiet,
                 Kind::RunFailed { .. }
                 | Kind::AiReviewFailed { .. }
+                | Kind::CoderabbitReviewFailed { .. }
                 | Kind::AiFixFailed { .. }
                 | Kind::DeliveryFailed { .. }
                 | Kind::RecoveryRequired { .. }
@@ -821,6 +833,7 @@ impl Item<'_> {
                 Kind::AiReviewChangesRequested { .. } => "ai_review_changes_requested",
                 Kind::AiReviewFailed { .. } => "ai_review_failed",
                 Kind::AiReviewSkipped { .. } => "ai_review_skipped",
+                Kind::CoderabbitReviewFailed { .. } => "coderabbit_review_failed",
                 Kind::AiFixStarted { .. } => "ai_fix_started",
                 Kind::AiFixApplied { .. } => "ai_fix_applied",
                 Kind::AiFixUnchanged { .. } => "ai_fix_unchanged",
@@ -893,6 +906,7 @@ fn kind_title(kind: &Kind) -> String {
         Kind::AiReviewChangesRequested { .. } => "AI review requested changes".to_string(),
         Kind::AiReviewFailed { .. } => "AI review failed".to_string(),
         Kind::AiReviewSkipped { .. } => "AI review skipped".to_string(),
+        Kind::CoderabbitReviewFailed { .. } => "CodeRabbit review did not complete".to_string(),
         Kind::AiFixStarted { .. } => "Fixing AI review findings".to_string(),
         Kind::AiFixApplied { .. } => "AI review fixes applied".to_string(),
         Kind::AiFixUnchanged { .. } => "Fix agent changed nothing".to_string(),
@@ -916,6 +930,7 @@ fn kind_detail(kind: &Kind) -> Option<String> {
         Kind::RunFailed { reason, .. }
         | Kind::AiReviewFailed { reason, .. }
         | Kind::AiReviewSkipped { reason, .. }
+        | Kind::CoderabbitReviewFailed { reason, .. }
         | Kind::AiFixFailed { reason, .. }
         | Kind::DeliveryFailed { reason }
         | Kind::RecoveryRequired { reason, .. } => Some(reason.clone()),
