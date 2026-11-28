@@ -16,6 +16,7 @@ use crate::components::task_live::{activity_from_event, changes_task_record, Act
 use crate::models::AgentEvent;
 use crate::services::task_run_service::{get_live_runs, listen_agent_events_with_ready};
 use crate::components::markdown::render_safe_markdown;
+use crate::services::clipboard_service::write_text;
 use crate::services::{reorder_task, queue_service, promoted_message, run_queued_task, RunNowOutcome,get_task_diff, get_task_diff_stat, analyze_pr_comments, address_pr_review, sync_pr_review_replies, ApprovedPublicReply, discuss_pr_review_questions, save_pr_review_instructions, find_pr_candidates, link_existing_pr, get_pr_push_recovery, recover_private_email_and_create_pr, refresh_task_pr_state, AddressPrReviewOptions, PrCandidate, PrPushRecoveryPlan};
 use uuid::Uuid;
 use std::collections::{HashMap, HashSet};
@@ -1582,8 +1583,11 @@ fn PrReviewModal(
                                     }
                                 })}
                             </div>
-                            <p class="text-xs text-white/40 truncate mt-0.5">
+                            <p class="text-xs text-white/40 truncate mt-0.5" data-testid="pr-review-task">
                                 {move || task.get().map(|t| t.title).unwrap_or_else(|| "Review comments before applying fixes".to_string())}
+                            </p>
+                            <p class="text-xs text-white/40 truncate mt-0.5 font-mono" data-testid="pr-review-pr-url">
+                                {move || plan.get().map(|p| p.pr_url).unwrap_or_default()}
                             </p>
                         </div>
                         <button
@@ -1742,15 +1746,31 @@ fn PrReviewModal(
                                                         PrCommentKind::Review => "review",
                                                         PrCommentKind::Conversation => "conversation",
                                                     };
-                                                    let loc = match (&c.path, c.line) {
-                                                        (Some(p), Some(l)) => format!("{}:{}", p, l),
-                                                        (Some(p), None) => p.clone(),
-                                                        _ => "PR-level".to_string(),
-                                                    };
+                                                    let loc = comment_location(c);
+                                                    let copy_text = comment_copy_text(c);
                                                     view! {
                                                         <div class="rounded bg-white/[0.03] p-2">
-                                                            <div class="text-white/50 font-mono">
-                                                                {format!("[{}] {} - {}", kind, c.author, loc)}
+                                                            <div class="flex items-start justify-between gap-2">
+                                                                <div class="text-white/50 font-mono">
+                                                                    {format!("[{}] {} - {}", kind, c.author, loc)}
+                                                                </div>
+                                                                <button
+                                                                    type="button"
+                                                                    class="flex-shrink-0 px-1.5 py-0.5 rounded text-[10px] text-white/55 hover:text-white hover:bg-white/10 transition-colors"
+                                                                    data-testid="pr-review-copy-comment"
+                                                                    title="Copy this reviewer comment: its identity, link and original text"
+                                                                    on:click=move |_| {
+                                                                        let text = copy_text.clone();
+                                                                        spawn_local(async move {
+                                                                            match write_text(&text).await {
+                                                                                Ok(()) => toast::success("Comment copied".to_string()),
+                                                                                Err(e) => toast::error(format!("Could not copy comment: {}", e)),
+                                                                            }
+                                                                        });
+                                                                    }
+                                                                >
+                                                                    "Copy"
+                                                                </button>
                                                             </div>
                                                             <div class="text-white/80 whitespace-pre-wrap mt-1">{c.body.clone()}</div>
                                                         </div>
@@ -1926,7 +1946,7 @@ fn PrReviewModal(
                                 class="px-3 py-1.5 rounded-lg text-xs text-white/70 hover:bg-white/10 transition-colors disabled:opacity-40"
                                 on:click=on_discuss
                                 disabled=move || loading.get() || applying.get() || discussing.get() || pending_discussion_count() == 0
-                                title="Send Question items with notes back to the agent"
+                                title="Send Question items that have a note back to the agent for a new answer. Changes no code and posts nothing to GitHub."
                             >
                                 {move || if discussing.get() {
                                     "Re-discussing...".to_string()
@@ -1981,6 +2001,7 @@ fn PrReviewModal(
                             <button
                                 class="px-4 py-1.5 rounded-lg text-sm bg-yellow-500 text-black font-medium hover:bg-yellow-400 transition-colors disabled:opacity-40 disabled:hover:bg-yellow-500"
                                 data-testid="pr-review-apply"
+                                title="Edits code for approved Fix items and commits it (pushes when Auto-push is on). Replies are not posted here; select them in the replies list."
                                 on:click=on_apply
                                 disabled=move || loading.get() || applying.get() || discussing.get() || approved_fix_count() == 0
                             >
@@ -2002,6 +2023,33 @@ fn PrReviewModal(
             </div>
         </Show>
     }
+}
+
+/// Where a reviewer comment sits: its file and line, or PR-level.
+fn comment_location(c: &PrReviewComment) -> String {
+    match (&c.path, c.line) {
+        (Some(p), Some(l)) => format!("{}:{}", p, l),
+        (Some(p), None) => p.clone(),
+        _ => "PR-level".to_string(),
+    }
+}
+
+/// The text a reviewer comment is copied as: its identity (kind, author,
+/// location, link) followed by the verbatim body. Agent text is never included.
+fn comment_copy_text(c: &PrReviewComment) -> String {
+    let kind = match c.kind {
+        PrCommentKind::Inline => "inline",
+        PrCommentKind::Review => "review",
+        PrCommentKind::Conversation => "conversation",
+    };
+    let mut out = format!("[{}] {} - {}", kind, c.author, comment_location(c));
+    if let Some(url) = &c.url {
+        out.push('\n');
+        out.push_str(url);
+    }
+    out.push_str("\n\n");
+    out.push_str(&c.body);
+    out
 }
 
 /// Whether a review item stays approved after its decision changes. Only a
@@ -2107,11 +2155,7 @@ fn render_review_item(
         update_item(&|it| it.user_note = v.clone());
     };
 
-    let location = related.as_ref().map(|c| match (&c.path, c.line) {
-        (Some(p), Some(l)) => format!("{}:{}", p, l),
-        (Some(p), None) => p.clone(),
-        _ => "PR-level".to_string(),
-    }).unwrap_or_else(|| "PR-level".to_string());
+    let location = related.as_ref().map(comment_location).unwrap_or_else(|| "PR-level".to_string());
     let original_body = related.as_ref().map(|c| c.body.clone());
     let author = related.as_ref().map(|c| c.author.clone()).unwrap_or_default();
     let comment_url = related.as_ref().and_then(|c| c.url.clone());
@@ -2245,12 +2289,16 @@ fn render_review_item(
                             }
                         }
                     </div>
-                    <div class="text-sm text-white/90 font-medium">{summary}</div>
+                    <div class="text-sm text-white/90 font-medium" data-testid="pr-review-agent-summary">
+                        <span class="block text-[10px] uppercase tracking-wide text-white/40 font-normal">"Agent summary (not the reviewer's words)"</span>
+                        {summary}
+                    </div>
                 </div>
                 <select
                     class="text-xs bg-white/[0.05] border border-white/10 rounded px-2 py-1 text-white/80 flex-shrink-0 disabled:opacity-60 disabled:cursor-not-allowed"
                     on:change=on_decision_change
                     disabled=move || busy.get()
+                    title="Fix: change the code and reply on the PR. Skip: no action. Question: ask the agent about it (Re-discuss), no code change."
                 >
                     <option value="fix" selected=decision_value == "fix">"Fix"</option>
                     <option value="skip" selected=decision_value == "skip">"Skip"</option>
@@ -3434,6 +3482,8 @@ fn KanbanTaskCard(
 #[cfg(test)]
 mod tests {
     use super::approved_after_decision_change;
+    use super::comment_copy_text;
+    use crate::models::task::{PrCommentKind, PrReviewComment};
     use super::{delivered_reply_fix, reply_offered};
     use super::next_card_id;
     use crate::models::task::{PrReviewItem, PrReviewPlan};
@@ -3444,6 +3494,26 @@ mod tests {
     use leptos::prelude::{GetUntracked, RwSignal, Set};
     use leptos::reactive::owner::Owner;
     use uuid::Uuid;
+
+    #[test]
+    fn comment_copy_text_keeps_identity_and_original_body() {
+        let comment = PrReviewComment {
+            id: Some(7),
+            kind: PrCommentKind::Inline,
+            author: "reviewer".to_string(),
+            author_association: Some("NONE".to_string()),
+            body: "Please rename `foo`.\n\nThanks".to_string(),
+            path: Some("src/lib.rs".to_string()),
+            line: Some(42),
+            url: Some("https://github.com/o/r/pull/1#discussion_r7".to_string()),
+            created_at: None,
+            updated_at: None,
+        };
+        assert_eq!(
+            comment_copy_text(&comment),
+            "[inline] reviewer - src/lib.rs:42\nhttps://github.com/o/r/pull/1#discussion_r7\n\nPlease rename `foo`.\n\nThanks"
+        );
+    }
 
     /// A keyboard activation of the card menu button reports no pointer
     /// position (Chromium and Firefox send (0, 0); WebKitGTK sends synthetic
