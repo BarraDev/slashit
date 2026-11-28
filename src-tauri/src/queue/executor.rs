@@ -15306,9 +15306,13 @@ mod tests {
         });
         // Give the spawned task a chance to actually run and panic before
         // asserting on it, rather than racing its own scheduling.
-        while !handle.is_finished() {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the empty owner future finishes");
         let (cancel, _cancelled) = tokio::sync::watch::channel(false);
         executor
             .reviewing_handles
@@ -19480,9 +19484,13 @@ mod tests {
         // the executor: the future ran its own cleanup and recorded the result.
         let (cancel, _cancelled) = tokio::sync::watch::channel(false);
         let handle = tokio::spawn(async {});
-        while !handle.is_finished() {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the empty owner future finishes");
         executor.running_handles.write().await.insert(
             task_id,
             RunningTask {
@@ -28018,9 +28026,13 @@ VERDICT: APPROVED"
                 let executor = executor.clone();
                 tokio::spawn(async move { executor.stop_task(task_id).await })
             };
-            while !run_states(&recording, task_id).contains(&serde_json::json!("stopping")) {
-                tokio::task::yield_now().await;
-            }
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !run_states(&recording, task_id).contains(&serde_json::json!("stopping")) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the stop announces Stopping while the helper is held");
             assert_eq!(
                 executor.tasks.read().await.get(&task_id).unwrap().status,
                 TaskStatus::AiReview
@@ -28144,9 +28156,13 @@ VERDICT: APPROVED"
             let task_id = Uuid::new_v4();
             let (cancel, _cancelled) = tokio::sync::watch::channel(false);
             let handle = tokio::spawn(async {});
-            while !handle.is_finished() {
-                tokio::task::yield_now().await;
-            }
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !handle.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the empty owner future finishes");
             executor.running_handles.write().await.insert(
                 task_id,
                 RunningTask {
@@ -28816,11 +28832,24 @@ VERDICT: APPROVED"
                 tokio::task::yield_now().await;
             }
             assert!(!draining.is_finished(), "still waiting for the owner to stop");
-            assert_eq!(executor.running_task_count().await, 0, "taken out of the map while awaited");
+            assert_eq!(
+                executor.running_task_count().await,
+                1,
+                "the gated owner stays registered until it is joined"
+            );
 
             gated.release.send(true).expect("release");
-            draining.await.expect("join").expect("drained once the owner stopped");
+            tokio::time::timeout(Duration::from_secs(5), draining)
+                .await
+                .expect("the drain completes once the owner is released")
+                .expect("join")
+                .expect("drained once the owner stopped");
             assert!(gated.finished.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(
+                executor.running_task_count().await,
+                0,
+                "no owner remains after the drain"
+            );
         }
 
         /// A real Worker with a real provider process: shutdown ends the

@@ -24970,9 +24970,13 @@ mod tests {
                 let (answer, ()) = tokio::join!(
                     link_pr_to_task_reserved(&state, task_id, CORRECTION_PR, None),
                     async move {
-                        while statuses.get(&key).and_then(|e| e.status).is_none() {
-                            tokio::task::yield_now().await;
-                        }
+                        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                            while statuses.get(&key).and_then(|e| e.status).is_none() {
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .expect("the link has read the PR status before it waits for the lease");
                         statuses.remember(
                             &key,
                             PrStatus {
@@ -25081,9 +25085,13 @@ mod tests {
                     async move {
                         // The read has answered, so the link has taken its snapshot
                         // and is waiting for the lease this test holds.
-                        while statuses.get(&key).and_then(|e| e.status).is_none() {
-                            tokio::task::yield_now().await;
-                        }
+                        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                            while statuses.get(&key).and_then(|e| e.status).is_none() {
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .expect("the link has read the PR status before it waits for the lease");
                         tasks.write().await.get_mut(&task_id).unwrap().pr_url =
                             Some(OTHER_PR.to_string());
                         drop(lease);
@@ -25205,9 +25213,13 @@ mod tests {
             ) {
                 use crate::pr_status::{ChecksState, PrKey, PrState, PrStatus};
                 use std::sync::atomic::Ordering;
-                while !gated.cancel_seen.load(Ordering::SeqCst) {
-                    tokio::task::yield_now().await;
-                }
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    while !gated.cancel_seen.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the owner is told to stop");
                 statuses.remember(
                     &PrKey::new("testorg/testrepo", 9),
                     PrStatus {
