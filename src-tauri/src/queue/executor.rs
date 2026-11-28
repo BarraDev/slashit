@@ -2146,6 +2146,29 @@ mod admission_quiesce_tests {
     }
 }
 
+/// Waits, bounded by [`AGENT_SHUTDOWN_TIMEOUT`], for a registered owner to
+/// finish. A refusal names the owner class and changes nothing: the caller
+/// has already put the owner's handle back where it was found.
+async fn await_owner_exit(join: &OwnerJoin, what: &str, task_id: Uuid) -> Result<(), String> {
+    let refusal = || {
+        format!(
+            "the {what} for task {task_id} is still finishing up; nothing was changed, so this \
+             can simply be asked for again shortly"
+        )
+    };
+    match join.begin_join() {
+        JoinAccess::Wait(mut wait) => {
+            if wait.finished_within(AGENT_SHUTDOWN_TIMEOUT).await {
+                Ok(())
+            } else {
+                Err(refusal())
+            }
+        }
+        JoinAccess::Finished => Ok(()),
+        JoinAccess::Busy => Err(refusal()),
+    }
+}
+
 impl Drop for StoppingMark {
     fn drop(&mut self) {
         self.ending
@@ -7111,16 +7134,13 @@ impl TaskExecutor {
         &self,
         task_id: Uuid,
     ) -> Result<Option<TaskStatus>, String> {
-        // The entry is read, not removed, until the owner has been joined. It
-        // stays registered for the whole wait, so the owner is never absent
-        // from the map while it may still be running -- whatever happens to
-        // this future (a timeout, a cancellation, a dropped caller). Its join
-        // handle is handed to a `JoinWait` that restores it on any exit that
-        // did not observe the owner finish; see `OwnerJoin`.
+        // Every registered owner class is signalled before any is joined, and
+        // each entry stays registered until its own owner has been joined. A
+        // refused join therefore never leaves a live owner that was not even
+        // cancelled, and a dropped or timed-out stop puts every handle back.
         //
-        // The mark goes up while the map's read guard is still held, so a
-        // reader never sees the run being ended without also seeing that it
-        // is being ended.
+        // The marks go up while each map's read guard is held, so a reader
+        // never sees a run being ended without also seeing that it is.
         let mut mark = None;
         let running = {
             let handles = self.running_handles.read().await;
@@ -7132,35 +7152,43 @@ impl TaskExecutor {
             }
             owner
         };
-
-        if let Some((join, cancel, execution_id)) = running {
-            self.announce_stopping(task_id, execution_id).await;
-            let _ = cancel.send(true);
-            // A run that finished on its own between the read and here has
-            // already recorded its own outcome; joining it is still correct,
-            // it simply returns at once. A panicked run returns an error,
-            // which the caller's own settling is what covers.
-            match join.begin_join() {
-                JoinAccess::Wait(mut wait) => {
-                    if !wait.finished_within(AGENT_SHUTDOWN_TIMEOUT).await {
-                        // Still live, so still owning the checkout: the entry
-                        // is untouched and the handle is back in its slot.
-                        // Refuse instead of telling a caller ownership ended
-                        // when the agent has not actually stopped.
-                        return Err(format!(
-                            "the agent for task {task_id} is still finishing up; nothing was \
-                             changed, so this can simply be asked for again shortly"
-                        ));
-                    }
-                }
-                JoinAccess::Finished => {}
-                JoinAccess::Busy => {
-                    return Err(format!(
-                        "the agent for task {task_id} is still finishing up; nothing was \
-                         changed, so this can simply be asked for again shortly"
-                    ));
-                }
+        let reviewing = {
+            let handles = self.reviewing_handles.read().await;
+            let owner = handles
+                .get(&task_id)
+                .map(|review| (review.handle.clone(), review.cancel.clone()));
+            if owner.is_some() && mark.is_none() {
+                mark = Some(self.mark_ending(task_id, None));
             }
+            owner
+        };
+        if running.is_none() && reviewing.is_none() {
+            // Neither map owned it: either nothing was ever running for this
+            // task, or an execution already finished and moved status off
+            // `InProgress`/`AiReview` entirely on its own.
+            return Ok(None);
+        }
+
+        if let Some((_, _, execution_id)) = &running {
+            self.announce_stopping(task_id, *execution_id).await;
+        }
+        if reviewing.is_some() {
+            self.announce_stopping(task_id, None).await;
+        }
+        if let Some((_, cancel, _)) = &running {
+            let _ = cancel.send(true);
+        }
+        if let Some((_, cancel)) = &reviewing {
+            let _ = cancel.send(true);
+        }
+
+        // An execution is joined first, then a review. Each join must finish
+        // before its entry is removed, so the owner is never absent from the
+        // map while it may still be running. A failed join returns with the
+        // other owner still registered and already cancelled.
+        let mut ended = None;
+        if let Some((join, _, _)) = running {
+            await_owner_exit(&join, "agent", task_id).await?;
             self.announce_stopped(task_id);
             // Joined, so the entry is spent. Removed only if it is still this
             // owner's: the run may already have removed its own. A removal
@@ -7170,65 +7198,24 @@ impl TaskExecutor {
             if handles.get(&task_id).is_some_and(|run| run.handle.is_same_owner(&join)) {
                 handles.remove(&task_id);
             }
-            return Ok(Some(TaskStatus::InProgress));
+            ended = Some(TaskStatus::InProgress);
         }
-
-        // No execution owns it; an AI review/fix might. Same shape, same
-        // bound, same map-then-return ordering -- and that ordering is the
-        // whole safety argument against a stale write: whatever this join
-        // waits for (including any durable write the review future itself
-        // makes on its way out, such as `transition_to_human_review`) always
-        // finishes *before* this returns, never after. A caller that commits
-        // its own status write only once this has returned therefore never
-        // races a review that is still mid-flight -- it either sees the
-        // review's own completed result already durable (nothing left to
-        // end) or ends it before it can publish anything further.
-        // Same shape as the execution branch above, including the entry that
-        // stays registered until its owner is joined.
-        let reviewing = {
-            let handles = self.reviewing_handles.read().await;
-            let owner = handles
-                .get(&task_id)
-                .map(|review| (review.handle.clone(), review.cancel.clone()));
-            if owner.is_some() {
-                mark = Some(self.mark_ending(task_id, None));
-            }
-            owner
-        };
-
-        if let Some((join, cancel)) = reviewing {
-            self.announce_stopping(task_id, None).await;
-            let _ = cancel.send(true);
-            match join.begin_join() {
-                JoinAccess::Wait(mut wait) => {
-                    if !wait.finished_within(AGENT_SHUTDOWN_TIMEOUT).await {
-                        return Err(format!(
-                            "the AI review for task {task_id} is still finishing up; nothing was \
-                             changed, so this can simply be asked for again shortly"
-                        ));
-                    }
-                }
-                JoinAccess::Finished => {}
-                JoinAccess::Busy => {
-                    return Err(format!(
-                        "the AI review for task {task_id} is still finishing up; nothing was \
-                         changed, so this can simply be asked for again shortly"
-                    ));
-                }
-            }
+        // Whatever this join waits for (including any durable write the review
+        // future makes on its way out, such as `transition_to_human_review`)
+        // always finishes *before* this returns, never after. A caller that
+        // commits its own status write only once this has returned therefore
+        // never races a review that is still mid-flight.
+        if let Some((join, _)) = reviewing {
+            await_owner_exit(&join, "AI review", task_id).await?;
             self.announce_stopped(task_id);
             let mut handles = self.reviewing_handles.write().await;
             if handles.get(&task_id).is_some_and(|review| review.handle.is_same_owner(&join)) {
                 handles.remove(&task_id);
             }
-            return Ok(Some(TaskStatus::AiReview));
+            ended = ended.or(Some(TaskStatus::AiReview));
         }
         drop(mark);
-
-        // Neither map owned it: either nothing was ever running for this
-        // task, or an execution already finished and moved status off
-        // `InProgress`/`AiReview` entirely on its own.
-        Ok(None)
+        Ok(ended)
     }
 
     /// Admit a new PR-helper Claude invocation for `task_id`, or refuse.
@@ -8045,6 +8032,13 @@ impl TaskExecutor {
         let Some(_lease) = self.lifecycle.try_acquire(task_id).await else {
             return; // another lifecycle operation owns this task right now
         };
+
+        // One owner per task, across both classes: registering a review over a
+        // live execution would leave two owners for one checkout. Checked under
+        // the lease, which every registration holds until its insert.
+        if self.is_task_running(task_id).await {
+            return;
+        }
 
         // One owner per task, in this direction too: a PR helper or PR
         // side-effect flow that owns the task keeps it until it lets go, and
@@ -9139,14 +9133,17 @@ impl TaskExecutor {
                 Some(AgentStatus::Stopped | AgentStatus::Failed(_)) => AgentStatus::Stopping,
             });
         }
+        // A signalled review is ending, not running: its cancel flag is set
+        // before its join, and stays set if a stop times out and is retried.
         let reviewing = self
             .reviewing_handles
             .read()
             .await
             .get(&task_id)
-            .is_some_and(|r| !r.handle.is_finished());
-        if reviewing {
-            return Some(AgentStatus::Running);
+            .filter(|r| !r.handle.is_finished())
+            .map(|r| *r.cancel.borrow());
+        if let Some(cancelled) = reviewing {
+            return Some(if cancelled { AgentStatus::Stopping } else { AgentStatus::Running });
         }
         if self
             .ending_runs
@@ -13789,6 +13786,75 @@ mod tests {
             Ok(Some(TaskStatus::InProgress))
         );
         assert!(!executor.is_task_running(task_id).await, "the joined owner is gone");
+    }
+
+    /// A reviewer that is signalled to stop reports `Stopping`, not `Running`,
+    /// from the signal until it is joined. A stop dropped mid-join keeps the
+    /// signal, so the status stays `Stopping` for the retry.
+    #[tokio::test(start_paused = true)]
+    async fn a_signalled_reviewer_reports_stopping_until_it_is_joined() {
+        let (executor, _temps) = test_executor();
+        let task = running_task(Uuid::new_v4());
+        let task_id = task.id;
+        executor.tasks.write().await.insert(task_id, task);
+        let owner = register_barrier_review(&executor, task_id).await;
+        assert_eq!(executor.owned_run_status(task_id).await, Some(AgentStatus::Running));
+
+        let mut stop = Box::pin(executor.end_task_owners_under_lease(task_id));
+        assert!(futures::FutureExt::now_or_never(stop.as_mut()).is_none());
+        owner.observed.await.expect("the reviewer observed the cancellation");
+        assert_eq!(
+            executor.owned_run_status(task_id).await,
+            Some(AgentStatus::Stopping),
+            "a cancelled reviewer is ending, not running"
+        );
+        drop(stop);
+        assert_eq!(
+            executor.owned_run_status(task_id).await,
+            Some(AgentStatus::Stopping),
+            "a dropped stop keeps the cancellation the reviewer is still honouring"
+        );
+
+        owner.release.send(()).expect("the reviewer is still waiting for release");
+        let _lease = executor.lifecycle.acquire(task_id).await.expect("the lease is free");
+        assert_eq!(executor.end_task_owners_under_lease(task_id).await, Ok(Some(TaskStatus::AiReview)));
+        assert_eq!(executor.owned_run_status(task_id).await, None, "the joined reviewer is gone");
+    }
+
+    /// Dual registration of an execution and a review for one Task (which
+    /// admission refuses) must not let a stop finish with a live owner. The
+    /// stop signals both, joins the execution, and times out on the review,
+    /// which stays registered and cancelled; the retry joins it.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_signals_and_joins_every_owner_class_and_retries_a_timed_out_one() {
+        let (executor, _temps) = test_executor();
+        let task = running_task(Uuid::new_v4());
+        let task_id = task.id;
+        executor.tasks.write().await.insert(task_id, task);
+        let execution = register_barrier_execution(&executor, task_id).await;
+        let review = register_barrier_review(&executor, task_id).await;
+
+        let mut stop = Box::pin(executor.end_task_owners_under_lease(task_id));
+        assert!(futures::FutureExt::now_or_never(stop.as_mut()).is_none());
+        execution.observed.await.expect("the execution observed the cancellation");
+        review.observed.await.expect("the review observed the cancellation");
+
+        // The execution finishes; the review does not, so the stop times out.
+        execution.release.send(()).expect("the execution is still waiting for release");
+        assert!(stop.await.is_err(), "a review that is still live refuses the stop");
+        assert!(!executor.running_handles.read().await.contains_key(&task_id));
+        assert!(
+            executor.reviewing_handles.read().await.contains_key(&task_id),
+            "the unjoined review stays registered"
+        );
+        assert_eq!(executor.owned_run_status(task_id).await, Some(AgentStatus::Stopping));
+
+        review.release.send(()).expect("the review is still waiting for release");
+        let _lease = executor.lifecycle.acquire(task_id).await.expect("the lease is free");
+        assert_eq!(executor.end_task_owners_under_lease(task_id).await, Ok(Some(TaskStatus::AiReview)));
+        assert!(executor.running_handles.read().await.is_empty());
+        assert!(executor.reviewing_handles.read().await.is_empty(), "no live owner survives");
+        assert!(!executor.is_task_running(task_id).await);
     }
 
     #[cfg(unix)]
@@ -22741,6 +22807,27 @@ VERDICT: APPROVED"
                 TaskStatus::AiReview,
                 "declining is free: the task is untouched and the next pass retries it"
             );
+        }
+
+        /// A review must not register over a live execution of the same Task:
+        /// that would leave two owners for one checkout.
+        #[tokio::test]
+        async fn spawn_review_declines_over_a_live_execution() {
+            let (executor, _temps) = test_executor();
+            let (repo, base_commit) = git_repo_with_change();
+            let task = reviewing_task(Uuid::new_v4(), repo.path().to_str().unwrap(), &base_commit);
+            let task_id = task.id;
+            executor.tasks.write().await.insert(task_id, task);
+            let execution = register_barrier_execution(&executor, task_id).await;
+
+            executor.spawn_review(task_id).await;
+
+            assert!(
+                executor.reviewing_handles.read().await.is_empty(),
+                "a review must not register while an execution owns the Task"
+            );
+            assert!(executor.running_handles.read().await.contains_key(&task_id));
+            execution.release.send(()).expect("the execution is still waiting for release");
         }
 
         /// Try to start a review of `task_id` and prove it declined: nothing
