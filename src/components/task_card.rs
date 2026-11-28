@@ -80,7 +80,13 @@ pub fn TaskCard(
     /// working only from this, never from the task's status.
     #[prop(default = None)]
     run: Option<Signal<Option<AgentStatus>>>,
+    /// Show only the title, status and priority, on one line.
+    #[prop(default = false)]
+    compact: bool,
 ) -> impl IntoView {
+    if compact {
+        return view! { <CompactTaskCard task=task /> }.into_any();
+    }
     let is_stuck = task.stuck_since.is_some();
     let show_review = matches!(task.status, TaskStatus::AiReview | TaskStatus::HumanReview);
 
@@ -337,6 +343,46 @@ pub fn TaskCard(
                 })}
             </div>
         </div>
+    }.into_any()
+}
+
+/// What a compact card shows: the title, the status (named as the board
+/// names its column) and the priority, and nothing else.
+#[derive(Debug, PartialEq, Eq)]
+struct CompactCardLine {
+    title: String,
+    status: &'static str,
+    priority: &'static str,
+}
+
+impl CompactCardLine {
+    fn of(task: &Task) -> Self {
+        Self {
+            title: task.title.clone(),
+            status: crate::components::kanban::column_title(&task.status),
+            priority: priority_style(&task.priority).0,
+        }
+    }
+}
+
+/// The one-line card: title, status and priority, and nothing else. The
+/// right padding leaves room for the card's menu button.
+#[component]
+fn CompactTaskCard(task: Task) -> impl IntoView {
+    let line = CompactCardLine::of(&task);
+    let full_title = line.title.clone();
+    view! {
+        <div
+            data-testid="task-card"
+            data-density="compact"
+            class="flex items-center gap-2 rounded-lg px-2.5 py-1.5 pr-8 bg-[#12121a] border border-white/[0.06] cursor-pointer"
+        >
+            <span data-testid="task-title" title=full_title class="flex-1 min-w-0 truncate text-[12px] font-medium text-white/90">
+                {line.title}
+            </span>
+            <span data-testid="task-card-status" class="flex-shrink-0 text-[10px] text-white/45">{line.status}</span>
+            <span class="flex-shrink-0"><PriorityBadge priority=task.priority.clone() /></span>
+        </div>
     }
 }
 
@@ -421,14 +467,19 @@ fn CategoryBadge(category: TaskCategory) -> impl IntoView {
     }
 }
 
-#[component]
-fn PriorityBadge(priority: TaskPriority) -> impl IntoView {
-    let (label, color_class, dot_color) = match priority {
+/// A priority's label, text colour and dot colour.
+fn priority_style(priority: &TaskPriority) -> (&'static str, &'static str, &'static str) {
+    match priority {
         TaskPriority::Urgent => ("Urgent", "text-red-400", "bg-red-500"),
         TaskPriority::High => ("High", "text-orange-400", "bg-orange-500"),
         TaskPriority::Medium => ("Med", "text-yellow-400", "bg-yellow-500"),
         TaskPriority::Low => ("Low", "text-green-400", "bg-green-500"),
-    };
+    }
+}
+
+#[component]
+fn PriorityBadge(priority: TaskPriority) -> impl IntoView {
+    let (label, color_class, dot_color) = priority_style(&priority);
 
     view! {
         <span class=format!("flex items-center gap-1 text-[10px] {}", color_class)>
@@ -521,5 +572,60 @@ fn CompactPhaseIndicator(phase: TaskPhase) -> impl IntoView {
             <span class="w-1.5 h-1.5 rounded-full bg-current animate-pulse"></span>
             <span class="text-[10px] font-medium">{label}</span>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod compact_card_tests {
+    use super::*;
+
+    fn task(title: &str, status: &str, priority: &str) -> Task {
+        serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::from_u128(7), "project_id": uuid::Uuid::from_u128(99),
+            "title": title, "description": null, "status": status, "model": "claude-x",
+            "planning_mode": true, "dependencies": [], "workspace_id": null, "jj_change_id": null,
+            "category": "feature", "priority": priority, "complexity": "moderate",
+            "impact": "medium", "security_severity": "none", "phase": "coding",
+            "phase_progress": 0, "overall_progress": 40, "subtasks": [], "sequence_number": 1,
+            "position": 0, "branch_name": "feature/compact",
+            "github_issue_url": null, "gitlab_issue_url": null, "linear_ticket_id": null,
+            "pr_url": null, "qa_signoff": null, "human_review": { "arrivals": 0, "entries": [] },
+            "stuck_since": null,
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_compact_card_shows_the_title_the_column_status_and_the_priority() {
+        let line = CompactCardLine::of(&task("Tidy the board", "in_progress", "high"));
+        assert_eq!(
+            line,
+            CompactCardLine { title: "Tidy the board".into(), status: "In Progress", priority: "High" }
+        );
+    }
+
+    #[test]
+    fn a_compact_card_names_the_status_as_the_board_titles_its_column() {
+        for (status, title) in [
+            ("backlog", "Backlog"),
+            ("queue", "Queue"),
+            ("ai_review", "AI Review"),
+            ("human_review", "Human Review"),
+            ("pr_created", "PR Open"),
+            ("done", "Done"),
+            ("error", "Error"),
+        ] {
+            assert_eq!(CompactCardLine::of(&task("t", status, "low")).status, title);
+        }
+    }
+
+    #[test]
+    fn a_compact_card_uses_the_same_priority_label_as_the_detailed_badge() {
+        for (priority, label) in [("urgent", "Urgent"), ("high", "High"), ("medium", "Med"), ("low", "Low")] {
+            let task = task("t", "backlog", priority);
+            assert_eq!(CompactCardLine::of(&task).priority, label);
+            assert_eq!(priority_style(&task.priority).0, label);
+        }
     }
 }

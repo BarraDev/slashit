@@ -11,6 +11,7 @@ use crate::models::task::{
 use crate::components::{TaskCard, TaskDrawer, TaskEditModal, TaskEditMode, toast, TaskContextMenu, DiffModal};
 use crate::components::close_without_merge_dialog::{CloseWithoutMergeDialog, PendingClose};
 use crate::components::new_work_pause::{provide_new_work_pause, NewWorkPauseNotice};
+use crate::components::board_prefs::{BoardLayout, BoardPrefs, BoardPrefsToggle, CardDensity};
 use crate::components::attention::{attention_order, next_after, reveal_card, BoardAttention, Deliveries};
 use crate::components::task_live::{activity_from_event, changes_task_record, ActivityUpdate, LiveRuns};
 use crate::models::AgentEvent;
@@ -328,6 +329,10 @@ pub fn Kanban(
     // The task whose drawer is open, if any.
     let drawer_task = RwSignal::new(None::<Uuid>);
 
+    // Board or List, Detailed or Compact cards: kept across reloads.
+    let board_prefs = BoardPrefs::load();
+    provide_context(board_prefs);
+
     // A Task the Issues page asked to open. Only the board of its Project takes it.
     if let Some(OpenTaskRequest(request)) = use_context::<OpenTaskRequest>() {
         let board_project = project_id.clone();
@@ -643,6 +648,8 @@ pub fn Kanban(
                         }}
                     </div>
                 </div>
+                <div class="flex items-center gap-3">
+                <BoardPrefsToggle prefs=board_prefs />
                 <button
                     data-testid="new-task-button"
                     on:click=on_create_click
@@ -653,10 +660,21 @@ pub fn Kanban(
                     </svg>
                     "New Task"
                 </button>
+                </div>
             </div>
 
-            // Kanban columns
-            <div class="flex gap-4 overflow-x-auto pb-4 snap-x snap-mandatory">
+            // Kanban columns. On the board they fill the height left below the
+            // header and each scrolls on its own; as a list they stack and the
+            // list scrolls.
+            <div
+                data-testid="kanban-columns"
+                data-layout=move || if board_prefs.layout.get() == BoardLayout::List { "list" } else { "board" }
+                class=move || if board_prefs.layout.get() == BoardLayout::List {
+                    "flex-1 min-h-0 flex flex-col gap-4 overflow-y-auto pb-4"
+                } else {
+                    "flex-1 min-h-0 flex gap-4 overflow-x-auto pb-4 snap-x snap-mandatory"
+                }
+            >
                 {COLUMNS.iter().map(|column| {
                     let status = column.status.clone();
                     let tasks = tasks_signal;
@@ -2618,6 +2636,10 @@ fn KanbanColumn(
     let status_for_class = status.clone();
     let status_for_testid = format!("{:?}", status).to_lowercase();
     let column_bg = column_clone.bg_class;
+    let list_layout = {
+        let prefs = use_context::<BoardPrefs>();
+        move || prefs.is_some_and(|p| p.layout.get() == BoardLayout::List)
+    };
     let empty_icon = column_clone.empty_icon;
     let empty_msg = column_clone.empty_message;
 
@@ -2626,8 +2648,13 @@ fn KanbanColumn(
             data-testid=format!("column-{}", status_for_testid)
             class=move || {
                 let is_drag_over = drag_over_column.get() == Some(status_for_class.clone());
+                let size = if list_layout() {
+                    "w-full flex-shrink-0"
+                } else {
+                    "min-w-[240px] w-[240px] h-full min-h-0 flex-shrink-0 snap-start"
+                };
                 format!(
-                    "min-w-[240px] w-[240px] flex-shrink-0 snap-start rounded-xl border-2 transition-all duration-300 flex flex-col max-h-[calc(100vh-180px)] {} {}",
+                    "{size} rounded-xl border-2 transition-all duration-300 flex flex-col {} {}",
                     if is_drag_over {
                         format!("border-white/30 {} scale-[1.01] shadow-xl", column_bg)
                     } else {
@@ -2692,7 +2719,7 @@ fn KanbanColumn(
             </div>
 
             // Column content - compact spacing
-            <div class="p-2 flex-1 overflow-y-auto">
+            <div class=move || if list_layout() { "p-2" } else { "p-2 flex-1 min-h-0 overflow-y-auto" }>
                 <div class="space-y-1">
                     {move || {
                         if column_is_empty.get() {
@@ -2897,6 +2924,10 @@ fn KanbanTaskCard(
         .map(|live| Signal::derive(move || live.0.with(|m| m.get(&task_uuid).cloned())));
     let live_run = use_context::<LiveRunsContext>()
         .map(|live| Signal::derive(move || live.0.with(|r| r.status(&task_uuid))));
+    let compact = {
+        let prefs = use_context::<BoardPrefs>();
+        move || prefs.is_some_and(|p| p.density.get() == CardDensity::Compact)
+    };
 
     // Check if this task is selected
     let is_selected = move || selected_tasks.get().contains(&task_uuid);
@@ -3183,7 +3214,12 @@ fn KanbanTaskCard(
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 5v.01M12 12v.01M12 19v.01M12 6a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2z" />
                     </svg>
                 </button>
-                <TaskCard task=task.clone() activity=live_activity run=live_run />
+                {
+                    let task = task.clone();
+                    move || view! {
+                        <TaskCard task=task.clone() activity=live_activity run=live_run compact=compact() />
+                    }
+                }
                 </div>
                 // Action tabs below the card. They share the draggable element, so
                 // hover and drag styling move with the card; the drag ghost excludes them.
